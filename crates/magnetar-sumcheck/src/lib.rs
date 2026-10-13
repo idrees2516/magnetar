@@ -29,12 +29,18 @@
 //! outer arguments in lockstep, sharing instance challenges (§5.3).
 
 #![forbid(unsafe_code)]
+// Proof-system style: loops indexed over Boolean-cube coordinates and
+// multi-input reductions are the domain's normal shape.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod engine;
 pub mod public;
+pub mod sparse;
 
 pub use engine::{SumcheckProver, SumcheckVerifier};
 pub use public::{PublicFactor, SumEqFactor, TableFactor};
+pub use sparse::{SparseFactor, SparseProver, SparseSpec};
 
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 
@@ -184,15 +190,15 @@ fn interpolate(values: &[Gf128]) -> Vec<Gf128> {
             // poly *= (X + xj)  →  shift coefficients up.
             let mut next = vec![ZERO; poly.len() + 1];
             for (k, &c) in poly.iter().enumerate() {
-                next[k + 1] = next[k + 1] + c; // X·c
-                next[k] = next[k] + mul(c, xj); // xj·c
+                next[k + 1] += c; // X·c
+                next[k] += mul(c, xj); // xj·c
             }
             poly = next;
             denom = mul(denom, nodes[i] + xj);
         }
         let scale = mul(val, magnetar_field::inv(denom));
         for (k, &c) in poly.iter().enumerate() {
-            acc[k] = acc[k] + mul(scale, c);
+            acc[k] += mul(scale, c);
         }
     }
     acc
@@ -214,7 +220,7 @@ mod tests {
                     let mut acc = ZERO;
                     let mut xp = ONE;
                     for &c in &coeffs {
-                        acc = acc + mul(c, xp);
+                        acc += mul(c, xp);
                         xp = mul(xp, Gf128(i as u128));
                     }
                     acc
@@ -238,7 +244,7 @@ mod extra_tests {
                     let mut acc = ZERO;
                     let mut xp = ONE;
                     for &c in &coeffs {
-                        acc = acc + mul(c, xp);
+                        acc += mul(c, xp);
                         xp = mul(xp, Gf128(i as u128));
                     }
                     acc

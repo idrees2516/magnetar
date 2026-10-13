@@ -14,6 +14,10 @@
 //! * the transcript ratchets its state after every squeeze.
 
 #![forbid(unsafe_code)]
+// Proof-system style: loops indexed over Boolean-cube coordinates and
+// multi-input reductions are the domain's normal shape.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
 use blake3::Hasher as Blake3Hasher;
 use sha3::{Digest, Sha3_256};
@@ -176,6 +180,10 @@ pub struct MerkleTree {
 }
 
 impl MerkleTree {
+    /// The tree's domain-separation label.
+    pub fn domain(&self) -> &[u8] {
+        &self.domain
+    }
     /// Build a tree over `leaves` (each 16 bytes, little-endian field
     /// elements) under a domain-separation string.
     pub fn build(domain: &str, leaves: &[magnetar_field::Gf128]) -> Self {
@@ -185,7 +193,7 @@ impl MerkleTree {
             "Merkle leaves must be a power of two"
         );
         let dom = domain.as_bytes().to_vec();
-        let mut level: Vec<[u8; DIGEST]> = leaves
+        let level: Vec<[u8; DIGEST]> = leaves
             .iter()
             .enumerate()
             .map(|(i, &x)| {

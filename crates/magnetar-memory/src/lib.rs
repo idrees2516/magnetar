@@ -33,11 +33,10 @@
 //!
 //! ## BinaryTwist (mutable, p reads + one write)
 //!
-//! The three identities of §4.4:
-//! * reconstruction `V̂al = M̂₀ + Σ_{j'} LT(j',j)·ŵfa·Înc`,
-//! * read values `r̂v_s = Σ_k r̂a_s·V̂al`,
-//! * write value `ŵv = Σ_k ŵfa·(V̂al + Înc)`,
-//! plus the separate sum-to-one argument (the identities are homogeneous,
+//! The three identities of §4.4: reconstruction
+//! `V̂al = M̂₀ + Σ_{j'} LT(j',j)·ŵfa·Înc`, read values
+//! `r̂v_s = Σ_k r̂a_s·V̂al`, and write value
+//! `ŵv = Σ_k ŵfa·(V̂al + Înc)`, plus the separate sum-to-one argument (the identities are homogeneous,
 //! so an all-zero address must be ruled out explicitly). The sum-checks run
 //! over the joint (address, value-bit, cycle) spaces as in the paper.
 //!
@@ -47,12 +46,24 @@
 //! protocol and verifier are identical).
 
 #![forbid(unsafe_code)]
+// Proof-system style: loops indexed over Boolean-cube coordinates and
+// multi-input reductions are the domain's normal shape.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
+pub mod claims;
+pub mod discharge;
 pub mod shout;
 pub mod twist;
 
+pub use claims::{PcsPoint, SelectorPcsClaims, ShoutPcsClaims, TwistPcsClaims};
+pub use discharge::{
+    prove_bus_shout, prove_psi_claim, prove_selector_shout, verify_bus_shout, verify_psi_claim,
+    verify_selector_shout, BusShoutProof, BusShoutSpec, PsiProof, SelectorCheckSpec,
+    SelectorShoutProof, SelectorShoutSpec,
+};
 pub use shout::{prove_shout, verify_shout, ShoutInstance, ShoutProof};
-pub use twist::{prove_twist, verify_twist, TwistInstance, TwistProof};
+pub use twist::{prove_twist, verify_twist, TwistInstance, TwistProof, TwistWitness};
 
 use magnetar_field::Gf128;
 
@@ -95,7 +106,7 @@ impl AddressComponent {
         for cycle in 0..(1usize << self.cycle_vars) {
             let mut acc = magnetar_field::ZERO;
             for addr in 0..(1usize << self.addr_vars) {
-                acc = acc + magnetar_field::mul(eq[addr], self.table[self.index_with(addr, cycle)]);
+                acc += magnetar_field::mul(eq[addr], self.table[self.index_with(addr, cycle)]);
             }
             row[cycle] = acc;
         }
@@ -111,8 +122,7 @@ impl AddressComponent {
         for addr in 0..(1usize << self.addr_vars) {
             let mut acc = magnetar_field::ZERO;
             for cycle in 0..(1usize << self.cycle_vars) {
-                acc =
-                    acc + magnetar_field::mul(eq[cycle], self.table[self.index_with(addr, cycle)]);
+                acc += magnetar_field::mul(eq[cycle], self.table[self.index_with(addr, cycle)]);
             }
             col[addr] = acc;
         }
@@ -154,9 +164,9 @@ pub fn sample_refined_points(
     t: &mut magnetar_hash::Transcript,
     addr_vars: usize,
 ) -> (Vec<Gf128>, Vec<Gf128>, Gf128) {
-    use magnetar_field::{inv, mul, square, Gf128, ONE, ZERO};
-    let mut c_product = ZERO;
+    use magnetar_field::{inv, mul, square, ONE, ZERO};
     let (mut r, mut r_prime);
+    let mut c_product;
     loop {
         r = t.challenge_field_vec("onehot-r", addr_vars);
         let mut ok = true;

@@ -33,12 +33,12 @@ fn cmd_fib(rounds: u32) {
         enc_i(1, 0, 0, 2, 0x13), // x2 = 1
     ];
     for _ in 0..rounds.max(1) {
-        program.push((0u32 << 25) | (2 << 20) | (1 << 15) | (0 << 12) | (3 << 7) | 0x33); // x3 = x1 + x2
-        program.push((0u32 << 25) | (0 << 20) | (2 << 15) | (0 << 12) | (1 << 7) | 0x33); // x1 = x2
+        program.push((2u32 << 20) | (1 << 15) | (3 << 7) | 0x33); // x3 = x1 + x2
+        program.push((2u32 << 15) | (1 << 7) | 0x33); // x1 = x2 (rs2=x2, funct7=0)
         program.push(enc_i(0, 3, 0, 2, 0x13)); // x2 = x3
     }
     // Move the result to a0 (x10) and halt.
-    program.push((0u32 << 25) | (0 << 20) | (3 << 15) | (0 << 12) | (10 << 7) | 0x33); // x10 = x3
+    program.push((3 << 15) | (10 << 7) | 0x33); // x10 = x3 (rs2=x0)
     program.push(0x0000_0073); // ecall: halt
 
     // Run the interpreter to get the output.
@@ -63,6 +63,9 @@ fn cmd_fib(rounds: u32) {
     let verify_ms = t1.elapsed().as_millis();
 
     println!("prove: {prove_ms} ms, verify: {verify_ms} ms, accepted: {ok}");
+    // The measured cost model (the research roadmap's first build item).
+    let stats = magnetar_zkvm::stats::proof_stats(&pk, &proof);
+    println!("{}", stats.report());
     if !ok {
         std::process::exit(1);
     }

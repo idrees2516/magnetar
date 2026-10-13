@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://idrees2516.github.io/magnetar/sitemap.xml

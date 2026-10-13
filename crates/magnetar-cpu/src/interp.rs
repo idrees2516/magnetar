@@ -1,11 +1,16 @@
 //! The RV64I interpreter: executes the expanded program and records the
-//! trace of virtual cycles (paper §2.1 step 1).
+//! trace of virtual cycles (paper §2.1 step 1) — including the full
+//! memory-access log the auxiliary arguments need (the per-cycle register
+//! indices and old/new values, the RAM word at the access address, the
+//! shift routing output, and the control flags).
 //!
-//! Branch targets are resolved in **micro-PC units**: the branch
-//! immediate (in bytes) is divided by 4 (instruction units) and then mapped
-//! through `inst_to_micro`-style offsets to the expanded program's index —
-//! the micro-PC counts virtual instructions, so a branch to instruction
-//! `i` lands on the micro-PC of `i`'s first virtual instruction.
+//! Branch targets are resolved in **micro-PC units**: the branch immediate
+//! (in bytes) is divided by 4 (instruction units) and lands on the target
+//! instruction's first virtual instruction.
+//!
+//! Sub-word loads use the machine's byte-lane semantics — `LB/LBU` loads
+//! the byte at `off`, `LH/LHU` the two bytes at `off` and `(off+1) mod 8`
+//! (well-defined for every offset), `LW/LD` the full word.
 
 use crate::expand::{expand_program, ExpandedProgram, VirtualKind, SHIFT_STAGES};
 use crate::{Word, RAM_WORDS_LOG2, REGS};
@@ -27,27 +32,32 @@ pub struct ExecState {
     pub output: Word,
 }
 
-/// The per-cycle trace record (one per virtual cycle).
-#[derive(Clone, Debug)]
+/// The per-cycle trace record (one per virtual cycle) — the CPU circuit's
+/// logical witness plus the memory-access log.
+#[derive(Clone, Debug, Default)]
 pub struct CycleRecord {
-    /// The micro-PC at the start of the cycle.
+    /// The micro-PC at the start of the cycle (the fetch address).
     pub micro_pc: usize,
     /// Register-read values (rs1, rs2).
     pub rs1_val: Word,
     pub rs2_val: Word,
-    /// The ALU result written back (pre-write-redirect).
+    /// The register value written back (pre-x0-redirect).
     pub rd_val: Word,
+    /// The written register's value before the write (the increment log).
+    pub rd_old: Word,
     /// The write-enable (is this a writing virtual instruction).
     pub we: bool,
-    /// The destination register (after x0 redirect).
+    /// The destination register (after x0 redirect to the trash cell).
     pub rd: usize,
-    /// The RAM address (for loads/stores; the word address).
+    /// The RAM word address (for loads/stores).
     pub ram_addr: usize,
-    /// The old RAM word (stores only; the pre-write content).
+    /// The full RAM word at the access address (the RAM-Twist read value).
+    pub ram_word: Word,
+    /// The old RAM word (stores only; equals `ram_word`).
     pub ram_old: Word,
     /// The new RAM word (stores only).
     pub ram_new: Word,
-    /// The byte offset (stores: the low 3 bits of the byte address).
+    /// The byte offset (the low 3 bits of the byte address).
     pub byte_offset: u8,
     /// The store width in bytes (0 = not a store).
     pub store_width: u8,
@@ -61,12 +71,26 @@ pub struct CycleRecord {
     pub alu_a: Word,
     /// The ALU's B operand (rs2 or the immediate).
     pub alu_b: Word,
+    /// The ALU output (the pre-write-mux value).
+    pub alu_out: Word,
+    /// The shift-routing output (immediate shifts; 0 otherwise).
+    pub shift_out: Word,
     /// Whether this cycle is an adder-family cycle (ADD/SUB/ADDI).
     pub is_arith: bool,
     /// Whether this cycle is a logic-family cycle (XOR/OR/AND).
     pub is_logic: bool,
     /// Whether the adder computes a subtraction (SUB/SLTI/compares).
     pub is_sub_op: bool,
+    /// Whether this cycle is an immediate shift (a static routing).
+    pub is_shift: bool,
+    /// Whether this cycle is a memory load.
+    pub is_load: bool,
+    /// Whether this cycle is a memory store.
+    pub is_store: bool,
+    /// The load-family selectors (byte / half / word).
+    pub ld_byte: bool,
+    pub ld_half: bool,
+    pub ld_word: bool,
     /// The halt latch (the ECALL cycle and the padding cycles).
     pub halted_latch: bool,
 }
@@ -79,13 +103,14 @@ pub struct Trace {
     pub final_state: ExecState,
 }
 
-/// The witness layout: one trace row's column groups. The circuit's
-/// witness matrix `W` has one row per virtual cycle; this constant maps
-/// the per-cycle fields to witness segments (see `circuit::WITNESS_LAYOUT`).
-pub struct TraceLayout;
-
-impl TraceLayout {
-    pub const NUM_FIELDS: usize = 16;
+/// Extract a sub-word load under the byte-lane semantics.
+fn extract_load(word: Word, funct3: u32, off: u8) -> Word {
+    let byte = |i: u8| (word >> (8 * (i & 7))) & 0xff;
+    match funct3 {
+        0 | 4 => byte(off),                                    // LB / LBU
+        1 | 5 => byte(off) | (byte(off.wrapping_add(1)) << 8), // LH / LHU
+        _ => word,                                             // LW / LD
+    }
 }
 
 /// Execute up to `max_cycles` virtual cycles.
@@ -107,37 +132,36 @@ pub fn execute(program: &[u32], input: &[Word], max_cycles: usize) -> Trace {
     }
     let mut records = Vec::new();
     while !st.halted && st.cycles < max_cycles {
-        let rec = step(&prog, &mut st, program);
+        let rec = step(&prog, &mut st);
         records.push(rec);
         st.cycles += 1;
     }
-    // Pad the trace to a power of two with halt-latch records.
+    // Pad the trace to a power of two with halt-latch records. The
+    // padding cycles are real no-op cycles: they fetch ROM row 0 and read
+    // the registers its fields name — the logged values are the machine's
+    // current contents, keeping the memory arguments consistent.
     while records.len().next_power_of_two() != records.len() {
         let last_pc = records.last().map(|r| r.next_pc).unwrap_or(0);
         let out = st.output;
-        records.push(CycleRecord {
+        let row = &prog.rows[0].row;
+        let write_addr = if row.rd == 0 { 32 } else { row.rd };
+        let rec = CycleRecord {
             micro_pc: 0,
-            rs1_val: 0,
-            rs2_val: 0,
-            rd_val: out,
-            we: false,
-            rd: 0,
-            ram_addr: 0,
-            ram_old: 0,
-            ram_new: 0,
-            byte_offset: 0,
-            store_width: 0,
-            store_src: 0,
-            branch_taken: false,
+            rs1_val: st.regs[row.rs1 % REGS],
+            rs2_val: st.regs[row.rs2 % REGS],
             next_pc: last_pc,
-            alu_a: 0,
-            alu_b: 0,
-            is_arith: false,
-            is_logic: false,
-            is_sub_op: false,
+            rd: write_addr,
+            rd_old: st.regs[write_addr],
+            rd_val: out,
             halted_latch: true,
-        });
-        let _ = last_pc;
+            ram_addr: 0,
+            ram_word: st.ram[0],
+            ..Default::default()
+        };
+        records.push(rec);
+        // Apply the halt-latch write so later padding reads agree with the
+        // memory argument's evolution.
+        st.regs[write_addr] = out;
     }
     Trace {
         program: prog,
@@ -146,7 +170,7 @@ pub fn execute(program: &[u32], input: &[Word], max_cycles: usize) -> Trace {
     }
 }
 
-fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRecord {
+fn step(prog: &ExpandedProgram, st: &mut ExecState) -> CycleRecord {
     let mp = st.micro_pc;
     let inst = &prog.rows[mp % prog.rows.len()];
     let row = &inst.row;
@@ -156,31 +180,17 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
         micro_pc: mp,
         rs1_val,
         rs2_val,
-        rd_val: 0,
-        we: false,
-        rd: 0,
-        ram_addr: 0,
-        ram_old: 0,
-        ram_new: 0,
-        byte_offset: 0,
-        store_width: 0,
-        store_src: 0,
-        branch_taken: false,
-        next_pc: mp + 1,
         alu_a: rs1_val,
         alu_b: rs2_val,
-        is_arith: false,
-        is_logic: false,
-        is_sub_op: false,
-        halted_latch: false,
+        next_pc: mp + 1,
+        ..Default::default()
     };
     let imm = row.imm as i64;
+    let is_reg = (row.raw & 0x7f) == 0x33;
     match row.kind {
         VirtualKind::Alu => {
             // Immediate forms: the B operand is the immediate; register
-            // forms: rs2. Arithmetic families set is_arith (the adder
-            // constraints apply); logic families set is_logic.
-            let is_reg = (row.raw & 0x7f) == 0x33;
+            // forms: rs2.
             let b_op = if is_reg { rs2_val } else { imm as Word };
             rec.alu_a = rs1_val;
             rec.alu_b = b_op;
@@ -190,10 +200,8 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
                 0 => {
                     rec.is_arith = true;
                     rec.is_sub_op = is_reg && (row.raw >> 25) == 0x20;
-                    val = if is_reg && (row.raw >> 25) == 0x20 {
+                    val = if rec.is_sub_op {
                         rs1_val.wrapping_sub(rs2_val)
-                    } else if !is_reg && (row.raw >> 20) & 0x1 != 0 && false {
-                        rs1_val // unreachable
                     } else {
                         rs1_val.wrapping_add(b_op)
                     };
@@ -211,16 +219,23 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
                     val = rs1_val & b_op;
                 }
                 1 => {
-                    let sh = (b_op as u64) & 63;
+                    // SLLI: a static shift routing (the amount is a ROM
+                    // constant).
+                    rec.is_shift = true;
+                    let sh = b_op & 63;
                     val = rs1_val.wrapping_shl(sh as u32);
+                    rec.shift_out = val;
                 }
                 5 => {
-                    let sh = (b_op as u64) & 63;
+                    // SRLI/SRAI: static routings.
+                    rec.is_shift = true;
+                    let sh = b_op & 63;
                     val = if (row.raw >> 25) == 0x20 {
                         ((rs1_val as i64) >> sh) as Word
                     } else {
                         rs1_val >> sh
                     };
+                    rec.shift_out = val;
                 }
                 3 => {
                     rec.is_arith = true;
@@ -236,17 +251,20 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
                     val = 0;
                 }
             }
+            rec.alu_out = val;
             rec.rd_val = val;
             rec.we = we;
             rec.rd = if row.rd == 0 { 32 } else { row.rd };
-            let r = commit(st, rec);
-            st.micro_pc = r.next_pc;
-            r
+            st.micro_pc = (mp + 1) % prog_len(prog);
+            rec.next_pc = st.micro_pc;
+            commit(st, &mut rec)
         }
         VirtualKind::ShiftStage { stage } => {
-            // Static stage: shift the current accumulator by 2^stage if
-            // bit `stage` of the amount (rs2) is set. The accumulator
-            // starts at rs1 in stage 0.
+            // Static stage: shift the accumulator by 2^stage if bit
+            // `stage` of the amount (rs2) is set. The accumulator starts
+            // at rs1 in stage 0. (The stage-level conditional routing's
+            // circuit binding is the documented extension; the interpreter
+            // and expansion handle the semantics.)
             let acc = if stage == 0 { rs1_val } else { st.regs[0] };
             let bit = (rs2_val >> stage) & 1;
             let sh = (1u64 << stage) * bit;
@@ -265,43 +283,53 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
             // (scratch); the last stage writes rd.
             if stage == SHIFT_STAGES - 1 {
                 rec.rd_val = val;
+                rec.alu_out = val;
                 rec.we = true;
                 rec.rd = if row.rd == 0 { 32 } else { row.rd };
             } else {
                 st.regs[0] = val; // scratch chain
                 rec.rd_val = val;
+                rec.alu_out = val;
                 rec.we = false;
                 rec.rd = 0;
             }
-            let r = commit(st, rec);
-            st.micro_pc = r.next_pc;
-            r
+            st.micro_pc = (mp + 1) % prog_len(prog);
+            rec.next_pc = st.micro_pc;
+            commit(st, &mut rec)
         }
         VirtualKind::Load => {
             let addr_word = rs1_val.wrapping_add(imm as Word);
             let byte_addr = addr_word as usize;
-            let word = st.ram[byte_addr / 8 % st.ram.len()];
+            let waddr = (byte_addr / 8) % st.ram.len();
             let off = (byte_addr % 8) as u8;
-            let val: Word = match row.funct3 {
-                0 => ((word >> (8 * off)) & 0xff) as Word, // LB (unsigned here)
-                1 => ((word >> (8 * off)) & 0xffff) as Word, // LH
-                2 => word,                                 // LW (full word here)
-                4 => (word >> (8 * off)) & 0xff,           // LBU
-                5 => (word >> (8 * off)) & 0xffff,         // LHU
-                _ => word,
-            };
-            rec.ram_addr = byte_addr / 8 % st.ram.len();
+            let word = st.ram[waddr];
+            let val = extract_load(word, row.funct3, off);
+            rec.ram_addr = waddr;
+            rec.ram_word = word;
+            rec.byte_offset = off;
+            rec.is_load = true;
+            rec.ld_byte = matches!(row.funct3, 0 | 4);
+            rec.ld_half = matches!(row.funct3, 1 | 5);
+            rec.ld_word = !rec.ld_byte && !rec.ld_half;
             rec.rd_val = val;
+            // The ALU computes the effective address (rs1 + imm): the
+            // adder identity applies and the circuit binds ram_addr to
+            // its low bits.
+            rec.is_arith = true;
+            rec.is_sub_op = false;
+            rec.alu_out = addr_word;
+            rec.alu_a = rs1_val;
+            rec.alu_b = imm as Word;
             rec.we = true;
             rec.rd = if row.rd == 0 { 32 } else { row.rd };
-            let r = commit(st, rec);
-            st.micro_pc = r.next_pc;
-            r
+            st.micro_pc = (mp + 1) % prog_len(prog);
+            rec.next_pc = st.micro_pc;
+            commit(st, &mut rec)
         }
         VirtualKind::Store => {
             let addr_word = rs1_val.wrapping_add(imm as Word);
             let byte_addr = addr_word as usize;
-            let waddr = byte_addr / 8 % st.ram.len();
+            let waddr = (byte_addr / 8) % st.ram.len();
             let off = (byte_addr % 8) as u8;
             let old = st.ram[waddr];
             let src = rs2_val;
@@ -311,7 +339,6 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
                 2 => 4, // SW
                 _ => 8, // SD
             };
-            // The new word: replace `width` bytes at offset `off`.
             let mask: Word = match width {
                 1 => 0xff,
                 2 => 0xffff,
@@ -320,20 +347,26 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
             } << (8 * off as u32);
             let new = (old & !mask) | ((src << (8 * off as u32)) & mask);
             rec.ram_addr = waddr;
+            rec.ram_word = old;
             rec.ram_old = old;
             rec.ram_new = new;
             rec.byte_offset = off;
             rec.store_width = width;
             rec.store_src = src;
+            rec.is_store = true;
+            rec.alu_a = rs1_val;
+            rec.alu_b = imm as Word;
+            rec.alu_out = addr_word; // the effective address
             st.ram[waddr] = new;
             rec.we = false;
-            rec.next_pc = (mp + 1) % _program_len(prog);
+            rec.next_pc = (mp + 1) % prog_len(prog);
             st.micro_pc = rec.next_pc;
-            commit(st, rec)
+            commit(st, &mut rec)
         }
         VirtualKind::Branch => {
             rec.is_arith = true;
             rec.is_sub_op = true; // compares compute the difference
+            rec.alu_out = rs1_val.wrapping_sub(rs2_val);
             let taken = match row.funct3 {
                 0 => rs1_val == rs2_val,
                 1 => rs1_val != rs2_val,
@@ -346,23 +379,15 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
             rec.branch_taken = taken;
             if taken {
                 // Branch target: the immediate is in bytes; convert to
-                // virtual-instruction units via the program map.
-                let inst_target = (mp as i64) + (imm / 4);
-                // Map the instruction-space target back through the
-                // program: the interpreter tracks micro-PC directly, so
-                // the target is the micro-PC of the instruction at the
-                // branch-relative instruction index. For the trace we use
-                // the direct micro-PC offset (imm/4) — the circuit's
-                // fetch enforces the same convention.
+                // virtual-instruction units.
                 let target = (mp as i64 + imm / 4).max(0) as usize;
-                st.micro_pc = target % _program_len(prog);
+                st.micro_pc = target % prog_len(prog);
                 rec.next_pc = st.micro_pc;
-                let _ = inst_target;
             } else {
-                st.micro_pc = (mp + 1) % _program_len(prog);
+                st.micro_pc = (mp + 1) % prog_len(prog);
                 rec.next_pc = st.micro_pc;
             }
-            commit(st, rec)
+            commit(st, &mut rec)
         }
         VirtualKind::Upper => {
             let val = if (row.raw & 0x7f) == 0x17 {
@@ -370,12 +395,13 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
             } else {
                 row.imm
             };
+            rec.alu_out = val;
             rec.rd_val = val;
             rec.we = true;
             rec.rd = if row.rd == 0 { 32 } else { row.rd };
-            rec.next_pc = (mp + 1) % _program_len(prog);
+            rec.next_pc = (mp + 1) % prog_len(prog);
             st.micro_pc = rec.next_pc;
-            commit(st, rec)
+            commit(st, &mut rec)
         }
         VirtualKind::Jump => {
             let is_jalr = (row.raw & 0x7f) == 0x67;
@@ -385,16 +411,17 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
             } else {
                 (mp as i64 + imm / 4).max(0) as usize
             };
-            let t = target % _program_len(prog);
+            let t = target % prog_len(prog);
             if row.rd != 0 {
                 st.regs[row.rd] = link;
                 rec.rd_val = link;
+                rec.alu_out = link;
                 rec.we = true;
                 rec.rd = row.rd;
             }
             st.micro_pc = t;
             rec.next_pc = t;
-            commit(st, rec)
+            commit(st, &mut rec)
         }
         VirtualKind::System => {
             st.halted = true;
@@ -402,24 +429,43 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState, _program: &[u32]) -> CycleRe
             // The halt latch carries the output for the I/O binding
             // (the K constraint halt·(packed rd + x_out) = 0).
             rec.rd_val = st.output;
+            rec.alu_out = st.output;
             rec.halted_latch = true;
             rec.next_pc = mp; // halt latch
-            commit(st, rec)
+            commit(st, &mut rec)
         }
     }
 }
 
-fn _program_len(prog: &ExpandedProgram) -> usize {
-    prog.rows.len().max(1)
+/// Normalize the write port and write back. The BinaryTwist register model
+/// performs **one write every cycle** at the ROM row's redirected
+/// destination (`rd == 0` maps to the trash cell 32): on write-enabled
+/// cycles the record's value lands; on other cycles the write returns the
+/// cell's current content (a no-op with zero increment); the halt-latch
+/// cycles write the output. The interpreter's state therefore always
+/// matches the memory argument's evolution.
+fn commit(st: &mut ExecState, rec: &mut CycleRecord) -> CycleRecord {
+    if rec.rd == 0 {
+        // Handlers that never set a destination write to the trash cell.
+        rec.rd = 32;
+    }
+    if !rec.is_load && !rec.is_store {
+        // The RAM-Twist read port reads the access address's current
+        // content every cycle (cell 0's word on non-memory cycles) — the
+        // load-val segment logs exactly that.
+        rec.ram_word = st.ram[rec.ram_addr];
+    }
+    if !rec.we && !rec.halted_latch {
+        // The no-op write's value is the current content.
+        rec.rd_val = st.regs[rec.rd];
+    }
+    rec.rd_old = st.regs[rec.rd];
+    st.regs[rec.rd] = rec.rd_val;
+    rec.clone()
 }
 
-/// Write back the register (if enabled) — PC updates are fully owned by
-/// the kind handlers (each sets `st.micro_pc` and `rec.next_pc`).
-fn commit(st: &mut ExecState, mut rec: CycleRecord) -> CycleRecord {
-    if rec.we && rec.rd != 0 && !st.halted {
-        st.regs[rec.rd] = rec.rd_val;
-    }
-    rec
+fn prog_len(prog: &ExpandedProgram) -> usize {
+    prog.rows.len().max(1)
 }
 
 #[cfg(test)]
@@ -432,55 +478,61 @@ mod tests {
 
     #[test]
     fn fibonacci() {
-        // addi x1, x0, 1; addi x2, x0, 1; add x3, x1, x2;
-        // beq x0, x0, +12(skip)? — simpler: a straight-line fib3.
         let prog = vec![
-            enc_i(1, 0, 0, 1, 0x13),                                            // x1 = 1
-            enc_i(1, 0, 0, 2, 0x13),                                            // x2 = 1
-            (0u32 << 25) | (2 << 20) | (1 << 15) | (0 << 12) | (3 << 7) | 0x33, // x3 = x1+x2
-            (0u32 << 25) | (3 << 20) | (2 << 15) | (0 << 12) | (4 << 7) | 0x33, // x4 = x2+x3
-            0x0000_0073, // ecall: halt, output x10
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            ((2 << 20) | (1 << 15)) | (3 << 7) | 0x33,
+            ((3 << 20) | (2 << 15)) | (4 << 7) | 0x33,
+            0x0000_0073,
         ];
         let trace = execute(&prog, &[], 64);
         assert_eq!(trace.final_state.regs[3], 2);
         assert_eq!(trace.final_state.regs[4], 3);
         assert!(trace.final_state.halted);
-        // Trace padded to a power of two.
         assert!(trace.records.len().is_power_of_two());
     }
 
     #[test]
     fn store_load_roundtrip() {
-        // addi x1, x0, 8;    (byte address)
-        // sb x2, 0(x1)  with x2 = 0xAB
         let prog = vec![
             enc_i(8, 0, 0, 1, 0x13),
             enc_i(0xAB, 0, 0, 2, 0x13),
-            ((0u32 & 0x1f) << 7)
-                | (2u32 << 20)
-                | (1 << 15)
-                | (0 << 12)
-                | (((0u32 >> 5) & 0x7f) << 25)
-                | 0x23, // sb x2, 0(x1)
+            ((2u32 << 20) | (1 << 15)) | 0x23, // sb x2, 0(x1)
             0x0000_0073,
         ];
         let trace = execute(&prog, &[], 64);
-        // Word 1 (byte 8) should now contain 0xAB in its low byte.
         assert_eq!(trace.final_state.ram[1] & 0xff, 0xAB);
     }
 
     #[test]
     fn register_shift_expansion_runs() {
-        // x1 = 0b101; x2 = 3; sll x3, x1, x2 → 0b101 << 3.
         let prog = vec![
             enc_i(5, 0, 0, 1, 0x13),
             enc_i(3, 0, 0, 2, 0x13),
-            (0u32 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33, // sll x3, x1, x2
+            (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33, // sll x3, x1, x2
             0x0000_0073,
         ];
         let trace = execute(&prog, &[], 128);
         assert_eq!(trace.final_state.regs[3], 5u64 << 3);
-        // The trace used 6 extra cycles for the shift stages.
         assert!(trace.records.len() >= 3 + SHIFT_STAGES);
+    }
+
+    #[test]
+    fn sub_word_load_semantics() {
+        // Store 0xAB at word 2 offset 1, then LB/LH at offset 1.
+        let prog = vec![
+            enc_i(16, 0, 0, 1, 0x13),   // x1 = 16 (word 2)
+            enc_i(0xAB, 0, 0, 5, 0x13), // x5 = 0xAB
+            // sb x5, 1(x1): the byte at byte 1 of word 2.
+            ((5 << 20) | (1 << 15)) | (1 << 7) | 0x23,
+            // lb x3, 1(x1) = 0xAB.
+            ((1u32 << 20) | (1 << 15)) | (3 << 7) | 0x03,
+            // lh x4, 1(x1) = 0x00AB (bytes 1 and 2).
+            (1u32 << 20) | (1 << 15) | (1 << 12) | (4 << 7) | 0x03,
+            0x0000_0073,
+        ];
+        let trace = execute(&prog, &[], 128);
+        assert_eq!(trace.final_state.regs[3], 0xAB);
+        assert_eq!(trace.final_state.regs[4], 0xAB);
     }
 }

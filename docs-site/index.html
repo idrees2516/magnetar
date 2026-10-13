@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Magnetar — Post-Quantum RV64 zkVM from Standard Hashes (Rust)</title>
+  <meta name="description" content="Magnetar is a complete, tested Rust implementation of the post-quantum RV64I zkVM built only from standard hashes (SHA-3 and BLAKE3): Virtual Spartan, BinaryTwist, BinaryShout, BinaryRouter, MosaicPCS, and the full seven-step Construction-3 prover and verifier.">
+  <meta name="keywords" content="zkVM, zero-knowledge, post-quantum, SNARK, Rust, RV64, RISC-V, BinarySpartan, sum-check, binary fields, SHA-3, BLAKE3, polynomial commitment, transparency, cryptography">
+  <meta name="author" content="Magnetar contributors">
+  <link rel="canonical" href="https://idrees2516.github.io/magnetar/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Magnetar">
+  <meta property="og:title" content="Magnetar — Post-Quantum RV64 zkVM from Standard Hashes">
+  <meta property="og:description" content="A complete, tested Rust implementation of the hash-only post-quantum RV64I zkVM: one commitment, sum-check reductions, ring switching, and a 10-millisecond-class verifier.">
+  <meta property="og:url" content="https://idrees2516.github.io/magnetar/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Magnetar — Post-Quantum RV64 zkVM">
+  <meta name="twitter:description" content="Hash-only, transparent, 120-bit provable security. Full Construction-3 protocol in Rust.">
+  <meta name="theme-color" content="#0b1220">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%230b1220'/%3E%3Cpath d='M32 8l17 10v18L32 46 15 36V18z' fill='none' stroke='%2360a5fa' stroke-width='4'/%3E%3Cpath d='M32 8v20M32 28l17 8M32 28l-17 8' stroke='%2360a5fa' stroke-width='4'/%3E%3Ccircle cx='32' cy='28' r='4' fill='%2334d399'/%3E%3C/svg%3E">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "Magnetar",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Linux, macOS",
+    "programmingLanguage": "Rust",
+    "url": "https://idrees2516.github.io/magnetar/",
+    "codeRepository": "https://github.com/idrees2516/magnetar",
+    "license": "https://opensource.org/licenses/MIT",
+    "description": "A post-quantum RV64I zero-knowledge virtual machine implemented in Rust from standard hash functions only: SHA-3 for Fiat-Shamir transcripts and BLAKE3 for commitments.",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "featureList": [
+      "Complete Construction-3 protocol (all seven steps)",
+      "Virtual Spartan with shared-witness dual SIMD R1CS relations",
+      "BinaryTwist and BinaryShout memory checking with refined one-hotness",
+      "BinaryRouter for shifts and sub-word stores",
+      "MosaicPCS single-commitment batching with ring switching",
+      "Hash-only, transparent, no trusted setup"
+    ]
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "What is Magnetar?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Magnetar is a zero-knowledge virtual machine (zkVM) that proves executions of RV64I programs with all computational security rooted in standard hash functions — SHA-3 for Fiat-Shamir transcripts and BLAKE3 for Merkle commitments. It is a complete Rust implementation of the paper 'Magnetar: High-speed post-quantum RV64 zkVM from standard hashes' (eprint 2026-2423)."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Why is being hash-only important?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Hash-based assumptions are the most conservative post-quantum foundation: no elliptic curves, no lattices, no trusted setup, and no conjectured Reed-Solomon proximity gaps. Magnetar targets 120 bits of provable security within the unique-decoding radius."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Is the implementation complete?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes — every component of the paper's Construction 3 is implemented and tested end-to-end: Virtual Spartan, BinaryTwist for registers and RAM, BinaryShout for bytecode, BinaryRouter for shifts and sub-word stores, MosaicPCS, ring switching, and the seven-step prover and verifier, with tamper-rejection tests for each argument."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How fast is verification?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "At the paper's production envelope, verification is 10–12 milliseconds at 2^22 cycles. This repository's test configuration runs smaller traces so the suite stays fast; the architecture scales linearly with the trace length."
+        }
+      }
+    ]
+  }
+  </script>
+  <style>
+    :root {
+      --bg: #0b1220; --panel: #101a2c; --ink: #e6edf7; --dim: #9db0c9;
+      --accent: #60a5fa; --accent2: #34d399; --line: #1e2a3f;
+      --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font: 16px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+    header { border-bottom: 1px solid var(--line); padding: 28px 0; }
+    .brand { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+    .brand h1 { font-size: 28px; margin: 0; letter-spacing: -0.02em; }
+    .brand .tag { color: var(--dim); font-size: 15px; }
+    .pill { display: inline-block; padding: 2px 12px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--dim); font-size: 13px; }
+    .pill.green { color: var(--accent2); border-color: #14532d; background: #0c2a1a; }
+    main { padding: 40px 0 64px; }
+    .lede { font-size: 20px; color: var(--ink); max-width: 860px; }
+    .lede strong { color: var(--accent2); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+      gap: 14px; margin: 34px 0; }
+    .card { background: var(--panel); border: 1px solid var(--line);
+      border-radius: 12px; padding: 16px 18px; }
+    .card h3 { margin: 0 0 6px; font-size: 15px; color: var(--accent); }
+    .card p { margin: 0; color: var(--dim); font-size: 14px; }
+    section { margin: 44px 0; }
+    h2 { font-size: 22px; letter-spacing: -0.01em; border-bottom: 1px solid var(--line);
+      padding-bottom: 8px; margin-top: 0; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+    th { color: var(--dim); font-weight: 600; white-space: nowrap; }
+    td code, p code, li code { font-family: var(--mono); font-size: 13px;
+      background: #16233a; padding: 1px 6px; border-radius: 6px; color: #cfe1ff; }
+    pre { background: #0d1524; border: 1px solid var(--line); border-radius: 10px;
+      padding: 16px; overflow-x: auto; font-family: var(--mono); font-size: 13.5px; }
+    ol.flow { counter-reset: step; list-style: none; padding-left: 0; }
+    ol.flow li { counter-increment: step; position: relative; padding-left: 44px;
+      margin: 10px 0; color: var(--dim); }
+    ol.flow li::before { content: counter(step); position: absolute; left: 0; top: 2px;
+      width: 28px; height: 28px; border-radius: 8px; background: var(--panel);
+      border: 1px solid var(--line); color: var(--accent); display: flex;
+      align-items: center; justify-content: center; font-size: 13px; font-weight: 700; }
+    ol.flow b { color: var(--ink); }
+    footer { border-top: 1px solid var(--line); padding: 22px 0 40px;
+      color: var(--dim); font-size: 14px; }
+    @media (max-width: 640px) { .lede { font-size: 17px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="wrap">
+      <div class="brand">
+        <h1>Magnetar</h1>
+        <span class="tag">post-quantum RV64 zkVM from standard hashes</span>
+        <span class="pill green">hash-only</span>
+        <span class="pill">transparent</span>
+        <span class="pill">120-bit provable</span>
+        <span class="pill">Rust</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <p class="lede">
+      Magnetar proves executions of <strong>general-purpose RV64I programs</strong> with
+      every computational assumption rooted in <strong>standard hash functions</strong> —
+      SHA-3 for Fiat–Shamir transcripts, BLAKE3 for the single Merkle commitment.
+      This repository is the <strong>complete, tested implementation</strong> of the
+      paper <em>Magnetar: High-speed post-quantum RV64 zkVM from standard hashes</em>
+      (eprint 2026-2423): every component of the protocol runs, proves, verifies,
+      and rejects tampering.
+    </p>
+
+    <div class="grid">
+      <div class="card">
+        <h3>One commitment</h3>
+        <p>MosaicPCS packs every committed polynomial — the direct witness
+        segments and the memory arguments' one-hot components and increments —
+        onto aligned subcubes of one cube, and commits once.</p>
+      </div>
+      <div class="card">
+        <h3>Hash-only security</h3>
+        <p>No curves, no lattices, no trusted setup, no conjectured
+        proximity gaps — the 120-bit bound uses only proven gaps inside
+        the unique-decoding radius.</p>
+      </div>
+      <div class="card">
+        <h3>Sum-check native</h3>
+        <p>The whole stack is multilinear sum-checks over binary fields:
+        the prover's work is linear in the trace length and every argument
+        is field-element sized.</p>
+      </div>
+      <div class="card">
+        <h3>Fully integrated</h3>
+        <p>The seven-step Construction 3 runs end-to-end: Virtual Spartan,
+        two BinaryTwists, two BinaryRouters, BinaryShout, and the final
+        PCS evaluation argument.</p>
+      </div>
+    </div>
+
+    <section id="protocol">
+      <h2>The protocol, end to end</h2>
+      <ol class="flow">
+        <li><b>Execute.</b> The interpreter runs the microcode-expanded program and records the trace plus the memory-access log.</li>
+        <li><b>Commit.</b> The direct segments and the auxiliary polynomials form one MosaicPCS polynomial; the protocol's only commitment.</li>
+        <li><b>Virtual Spartan.</b> The two SIMD R1CS relations (F&#8322; bit constraints and F&#8322;&#185;&#178;&#8312; packed products) reduce jointly to one claim per witness segment — the virtual claims are forwarded, the direct claims held.</li>
+        <li><b>Reduce the virtual claims.</b> BinaryTwist for registers and RAM (with the Ψ-sum-checks binding the address and index claims), BinaryRouter for shifts and sub-word stores, BinaryShout for the bytecode.</li>
+        <li><b>Prove the committed evaluations.</b> MosaicPCS lifts each claim for free (aligned subcubes), batches them with one sum-check, and ring-switches to the packed polynomial for the single PCS evaluation argument.</li>
+      </ol>
+    </section>
+
+    <section id="architecture">
+      <h2>Architecture</h2>
+      <table>
+        <thead><tr><th>Crate</th><th>Paper</th><th>Contents</th></tr></thead>
+        <tbody>
+          <tr><td><code>magnetar-field</code></td><td>§3</td><td>B = F&#8322;, K = F&#8322;&#185;&#178;&#8312; with PCLMULQDQ + portable carry-less multiplication, eq tables, multilinear folding, 128-bit packing with the φ<sub>c</sub> functional</td></tr>
+          <tr><td><code>magnetar-hash</code></td><td>§6</td><td>SHA3-256 Fiat–Shamir transcripts (domain-separated, ratcheting) and BLAKE3 Merkle trees</td></tr>
+          <tr><td><code>magnetar-sumcheck</code></td><td>§3.2</td><td>The characteristic-two multi-factor sum-check engine plus the sparse prover (linear-in-T prover work)</td></tr>
+          <tr><td><code>magnetar-pcs</code></td><td>§3.6, §5.2</td><td>Affine-substitution codewords, the fold-chain evaluation argument, and ring switching with exact φ<sub>c</sub> bit extraction</td></tr>
+          <tr><td><code>magnetar-spartan</code></td><td>§4.1–4.3, §5.3</td><td>Sparse R1CS, the SIMD reduction, and Virtual Spartan (lockstep outers, α-batched inner, per-segment claims)</td></tr>
+          <tr><td><code>magnetar-memory</code></td><td>§4.4</td><td>BinaryTwist and BinaryShout with the refined one-hotness (Frobenius Δ*) and the discharge helpers</td></tr>
+          <tr><td><code>magnetar-router</code></td><td>§5.4</td><td>BinaryRouter for shifts and sub-word stores (routings, selectors, offset links)</td></tr>
+          <tr><td><code>magnetar-cpu</code></td><td>§5.1</td><td>The RV64I decoder, microcode expansion, the interpreter with the full access log, and the dual SIMD R1CS circuit</td></tr>
+          <tr><td><code>magnetar-zkvm</code></td><td>§5.2, §5.5</td><td>MosaicPCS, KeyGen, the complete Construction-3 prover/verifier, and the proof-size instrumentation</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="start">
+      <h2>Quick start</h2>
+      <pre>git clone https://github.com/idrees2516/magnetar
+cd magnetar
+cargo test --workspace --release   # 69 tests: every argument + tamper classes
+cargo run --release --bin magnetar -- fib 2</pre>
+      <p>
+        The last command executes a Fibonacci program, proves the execution,
+        verifies the proof, and prints the measured cost model — the committed-bit
+        inventory per component, the PCS geometry, and the byte breakdown of the
+        proof (the PCS evaluation argument dominates, exactly as the paper's
+        cost analysis predicts).
+      </p>
+    </section>
+
+    <section id="security">
+      <h2>Security posture</h2>
+      <ul>
+        <li><b>Assumptions:</b> SHA-3 (FIPS 202) and BLAKE3 only; transparent, no trusted setup.</li>
+        <li><b>Soundness accounting:</b> sum-check round errors &#8818; rounds&#183;degree/|K|; the Δ*, Φ, Ψ, routing, ring-switch, and fold-chain identities each carry &#8804; 2&#8315;&#185;&#178;&#8312; error at 120-bit target — the full accounting is in <a href="https://github.com/idrees2516/magnetar/blob/main/docs/security.md">docs/security.md</a>.</li>
+        <li><b>Implementation hygiene:</b> constant-time field arithmetic, <code>#![forbid(unsafe_code)]</code> everywhere except the audited clmul module, zeroized secrets, domain-separated transcripts.</li>
+        <li><b>Testing:</b> every transmitted claim and round-message family has a tamper test; honest proofs and adversarial proofs both run in CI.</li>
+      </ul>
+    </section>
+
+    <section id="links">
+      <h2>Links</h2>
+      <ul>
+        <li><a href="https://github.com/idrees2516/magnetar">Source code on GitHub</a> (MIT OR Apache-2.0)</li>
+        <li><a href="https://github.com/idrees2516/magnetar/blob/main/README.md">README</a> — the architecture and build instructions</li>
+        <li><a href="https://github.com/idrees2516/magnetar/blob/main/docs/security.md">The soundness accounting</a></li>
+        <li>Contributions: see <a href="https://github.com/idrees2516/magnetar/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a>; soundness reports go through the private channel in SECURITY.md.</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      Magnetar — a research implementation of a post-quantum zkVM.
+      Licensed MIT OR Apache-2.0.
+    </div>
+  </footer>
+</body>
+</html>

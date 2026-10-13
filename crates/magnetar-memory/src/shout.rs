@@ -87,13 +87,13 @@ fn build_phi(
     for (tt, &al) in alphas.iter().enumerate() {
         for k in 0..(1usize << a) {
             if (k >> tt) & 1 == 1 {
-                phi[k] = phi[k] + al;
+                phi[k] += al;
             }
         }
     }
     for (h, gh) in gammas.iter().enumerate() {
         for k in 0..(1usize << a) {
-            phi[k] = phi[k] + mul(*gh, val[h][k]);
+            phi[k] += mul(*gh, val[h][k]);
         }
     }
     phi
@@ -109,10 +109,10 @@ fn build_lhs(
 ) -> Gf128 {
     let mut lhs = alpha0;
     for (al, vc) in alphas.iter().zip(raf.iter()) {
-        lhs = lhs + mul(*al, *vc);
+        lhs += mul(*al, *vc);
     }
     for (gh, vc) in gammas.iter().zip(rv.iter()) {
-        lhs = lhs + mul(*gh, *vc);
+        lhs += mul(*gh, *vc);
     }
     lhs
 }
@@ -181,7 +181,8 @@ pub fn prove_shout(
     // Δ* one-hotness per component.
     let mut onehot = Vec::with_capacity(d);
     for (i, comp) in components.iter().enumerate() {
-        onehot.push(prove_onehot(comp, t, &format!("shout-onehot-{i}")));
+        let (oh, _) = prove_onehot(comp, t, &format!("shout-onehot-{i}"));
+        onehot.push(oh);
     }
     ShoutProof {
         phi_rounds,
@@ -192,7 +193,13 @@ pub fn prove_shout(
 
 /// Prove the Δ* one-hotness for one component:
 /// `Σ_j eq(ρ, j)·[Â(r, j)³ + C·Â(r', j)] = 0`.
-pub fn prove_onehot(comp: &AddressComponent, t: &mut Transcript, label: &str) -> OneHotProof {
+/// Returns the proof and the final **cycle point** (for the caller to
+/// place the two evaluation claims on the component).
+pub fn prove_onehot(
+    comp: &AddressComponent,
+    t: &mut Transcript,
+    label: &str,
+) -> (OneHotProof, Vec<Gf128>) {
     let (r, r_prime, c_product) = sample_refined_points(t, comp.addr_vars);
     let rho = t.challenge_field_vec(&format!("{label}-rho"), comp.cycle_vars);
     let row_r = comp.row_at(&r);
@@ -222,15 +229,19 @@ pub fn prove_onehot(comp: &AddressComponent, t: &mut Transcript, label: &str) ->
         rounds.push(msg.0.clone());
         prover.absorb_and_fold(t, label);
     }
+    let r_cycle = prover.challenges();
     let (claims, _) = prover.finish();
-    OneHotProof {
-        rounds,
-        v_at_r: claims[0],
-        v_at_rp: claims[1],
-        r,
-        r_prime,
-        c_product,
-    }
+    (
+        OneHotProof {
+            rounds,
+            v_at_r: claims[0],
+            v_at_rp: claims[1],
+            r,
+            r_prime,
+            c_product,
+        },
+        r_cycle,
+    )
 }
 
 /// Verify a BinaryShout proof. Returns the component evaluation claims the
@@ -253,11 +264,7 @@ pub fn verify_shout(
     let lhs = build_lhs(alpha0, &alphas, &gammas, &inst.raf_claims, &inst.rv_claims);
     // Φ sum-check replay; the dense claim is the product of the component
     // claims (address virtualization is thereby enforced).
-    let f_claim: Gf128 = proof
-        .component_claims
-        .iter()
-        .copied()
-        .fold(ONE, |x, y| mul(x, y));
+    let f_claim: Gf128 = proof.component_claims.iter().copied().fold(ONE, mul);
     let pub_phi: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
         vec![Box::new(TableFactor::new(phi))];
     let terms = vec![Term {
@@ -310,14 +317,14 @@ pub fn verify_shout(
     Ok(claims)
 }
 
-/// Verify one Δ* proof (checks the sum-check; the two evaluation claims are
-/// returned to the caller via the proof structure and checked against the
-/// commitment by the zkvm layer).
+/// Verify one Δ* proof: replays the sum-check and returns the final
+/// **cycle point** (the challenges, in binding order) — the caller needs
+/// it to place the two evaluation claims on the committed component.
 pub fn verify_onehot(
     oh: &OneHotProof,
     t: &mut Transcript,
     label: &str,
-) -> Result<(), &'static str> {
+) -> Result<Vec<Gf128>, &'static str> {
     let (r, r_prime, c_product) = sample_refined_points(t, oh.r.len());
     if r != oh.r || r_prime != oh.r_prime || c_product != oh.c_product {
         return Err("onehot: refined points mismatch");
@@ -344,7 +351,7 @@ pub fn verify_onehot(
     }
     v.finish(&[oh.v_at_r, oh.v_at_rp])
         .map_err(|_| "onehot: terminal failed")?;
-    Ok(())
+    Ok(v.challenges().to_vec())
 }
 
 #[cfg(test)]
@@ -413,17 +420,17 @@ mod tests {
         assert_eq!(claims.len(), 2 * d + d);
         // Tamper: a value claim.
         let mut inst2 = inst.clone();
-        inst2.rv_claims[0] = inst2.rv_claims[0] + ONE;
+        inst2.rv_claims[0] += ONE;
         let mut tv = Transcript::new("shout", &[b"t"]);
         assert!(verify_shout(&inst2, d, &proof, &mut tv).is_err());
         // Tamper: component claim (breaks the product identity).
         let mut p = proof.clone();
-        p.component_claims[0] = p.component_claims[0] + ONE;
+        p.component_claims[0] += ONE;
         let mut tv = Transcript::new("shout", &[b"t"]);
         assert!(verify_shout(&inst, d, &p, &mut tv).is_err());
         // Tamper: one-hot message.
         let mut p = proof.clone();
-        p.onehot[0].rounds[0][1] = p.onehot[0].rounds[0][1] + ONE;
+        p.onehot[0].rounds[0][1] += ONE;
         let mut tv = Transcript::new("shout", &[b"t"]);
         assert!(verify_shout(&inst, d, &p, &mut tv).is_err());
         // Non-one-hot component must be rejected: duplicate hot in a cycle.

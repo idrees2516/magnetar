@@ -13,6 +13,7 @@
 //! run over the joint (k, o, j) space; factors are padded across variables
 //! they do not depend on (padding leaves the MLE unchanged).
 
+use crate::claims::{PcsPoint, TwistPcsClaims};
 use crate::{AddressComponent, OneHotProof};
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
@@ -73,8 +74,15 @@ pub struct PortRun {
 #[derive(Clone, Debug)]
 pub struct ReconRun {
     pub rounds: Vec<Vec<Gf128>>,
+    /// The full-address product terminal claim (checked against the
+    /// product of `wfa_component_claims` — address virtualization).
     pub wfa_claim: Gf128,
+    /// The per-component claims at the recon's point: `Â^w_i(r_k^{(i)},
+    /// r_c)` (proven against the commitment by the zkvm layer).
+    pub wfa_component_claims: Vec<Gf128>,
     pub inc_claim: Gf128,
+    /// The recon's random cycle point (binding order = variable order).
+    pub r_cycle: Vec<Gf128>,
 }
 
 /// A BinaryTwist proof.
@@ -145,7 +153,7 @@ fn materialize_val(
                     let inc_bit = inc[o | (jp << ell)];
                     for j in (jp + usize::from(!inclusive))..cycles {
                         let idx = k + o * cells + j * cells * bits;
-                        val[idx] = val[idx] + inc_bit;
+                        val[idx] += inc_bit;
                     }
                 }
             }
@@ -242,7 +250,7 @@ fn run_reconstruction(
     for jp in 0..(1usize << n) {
         let mut acc = ZERO;
         for j in 0..(1usize << n) {
-            acc = acc + mul(eq_j[j], lt[jp + j * (1usize << n)]);
+            acc += mul(eq_j[j], lt[jp + j * (1usize << n)]);
         }
         lt_col[jp] = acc;
     }
@@ -257,7 +265,7 @@ fn run_reconstruction(
                 let slice = (k >> (i * ad)) & ((1usize << ad) - 1);
                 prod = mul(prod, comp.table[comp.index_with(slice, jp)]);
             }
-            acc = acc + prod;
+            acc += prod;
         }
         wfa_row[jp] = acc;
     }
@@ -266,7 +274,7 @@ fn run_reconstruction(
     for jp in 0..(1usize << n) {
         let mut acc = ZERO;
         for o in 0..(1usize << ell) {
-            acc = acc + mul(eq_v[o], inc[o | (jp << ell)]);
+            acc += mul(eq_v[o], inc[o | (jp << ell)]);
         }
         inc_row[jp] = acc;
     }
@@ -288,16 +296,37 @@ fn run_reconstruction(
         rounds.push(msg.0.clone());
         p.absorb_and_fold(t, label);
     }
+    let r_c = p.challenges();
     let (claims, _) = p.finish();
+    // The per-component claims at the recon's point (address
+    // virtualization): `Â^w_i(r_k^{(i)}, r_c)`.
+    let wfa_component_claims: Vec<Gf128> = wfa_comps
+        .iter()
+        .enumerate()
+        .map(|(i, comp)| {
+            let slice: Vec<Gf128> = (0..ad).map(|b| r_k[i * ad + b]).collect();
+            comp.eval_at(&slice, &r_c)
+        })
+        .collect();
+    for (i, &cv) in wfa_component_claims.iter().enumerate() {
+        t.absorb_field(&format!("{label}-wfacomp-{i}"), &[cv]);
+    }
     ReconRun {
         rounds,
         wfa_claim: claims[0],
+        wfa_component_claims,
         inc_claim: claims[1],
+        r_cycle: r_c,
     }
 }
 
-/// Prove BinaryTwist.
-pub fn prove_twist(inst: &TwistInstance, wit: &TwistWitness, t: &mut Transcript) -> TwistProof {
+/// Prove BinaryTwist. Returns the proof and the PCS claims it leaves open
+/// (the caller proves them against the Mosaic commitment).
+pub fn prove_twist(
+    inst: &TwistInstance,
+    wit: &TwistWitness,
+    t: &mut Transcript,
+) -> (TwistProof, TwistPcsClaims) {
     let (a, ell, n, p) = (inst.a, inst.ell, inst.n, inst.p);
     let joint_vars = a + ell + n;
     let d = wit.d();
@@ -413,9 +442,11 @@ pub fn prove_twist(inst: &TwistInstance, wit: &TwistWitness, t: &mut Transcript)
     // Sum-to-one per (port, component).
     let mut st1 = Vec::new();
     let mut st1_claims = Vec::new();
+    let mut st1_pcs: Vec<Vec<PcsPoint>> = Vec::new();
     for (port, comps) in wit.ports.iter().enumerate() {
         let mut rounds_per = Vec::new();
         let mut claims_per = Vec::new();
+        let mut pcs_per = Vec::new();
         for (i, comp) in comps.iter().enumerate() {
             let rho = t.challenge_field_vec(&format!("twist-st1-{port}-{i}-rho"), n);
             let eq_rho = magnetar_field::EqBits::build(&rho).values;
@@ -443,12 +474,15 @@ pub fn prove_twist(inst: &TwistInstance, wit: &TwistWitness, t: &mut Transcript)
                 rounds.push(msg.0.clone());
                 pr.absorb_and_fold(t, &format!("twist-st1-{port}-{i}"));
             }
+            let st1_pt = pr.challenges();
             let (cclaims, _) = pr.finish();
             rounds_per.push(rounds);
             claims_per.push(cclaims[0]);
+            pcs_per.push(PcsPoint::new(st1_pt, cclaims[0]));
         }
         st1.push(rounds_per);
         st1_claims.push(claims_per);
+        st1_pcs.push(pcs_per);
     }
     for (port, claims) in st1_claims.iter().enumerate() {
         for (i, v) in claims.iter().enumerate() {
@@ -457,38 +491,127 @@ pub fn prove_twist(inst: &TwistInstance, wit: &TwistWitness, t: &mut Transcript)
     }
     // Δ* per (port, component).
     let mut onehot = Vec::new();
+    let mut onehot_pts = Vec::new();
     for (port, comps) in wit.ports.iter().enumerate() {
         let mut per = Vec::new();
+        let mut per_pts = Vec::new();
         for (i, comp) in comps.iter().enumerate() {
-            per.push(crate::shout::prove_onehot(
-                comp,
-                t,
-                &format!("twist-onehot-{port}-{i}"),
-            ));
+            let (oh, cyc_pt) =
+                crate::shout::prove_onehot(comp, t, &format!("twist-onehot-{port}-{i}"));
+            per.push(oh);
+            per_pts.push(cyc_pt);
         }
         onehot.push(per);
+        onehot_pts.push(per_pts);
     }
-    TwistProof {
-        read_runs,
-        write_run,
-        read_recons,
-        write_recon,
-        read_component_claims,
-        write_component_claims,
-        st1,
-        st1_claims,
-        onehot,
-    }
+    // Assemble the PCS claims.
+    let mk_comp_pt = |r_joint: &[Gf128], i: usize, ad: usize, a: usize, n: usize| {
+        let mut pt = r_joint[i * ad..(i + 1) * ad].to_vec();
+        pt.extend_from_slice(&r_joint[a + ell..a + ell + n]);
+        pt
+    };
+    let read_addr: Vec<Vec<PcsPoint>> = (0..p)
+        .map(|s| {
+            let run = &read_runs[s];
+            (0..d)
+                .map(|i| {
+                    PcsPoint::new(
+                        mk_comp_pt(&run.r_joint, i, ad, a, n),
+                        read_component_claims[s][i],
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let write_addr: Vec<PcsPoint> = (0..d)
+        .map(|i| {
+            PcsPoint::new(
+                mk_comp_pt(&write_run.r_joint, i, ad, a, n),
+                write_component_claims[i],
+            )
+        })
+        .collect();
+    let all_recons: Vec<&ReconRun> = read_recons
+        .iter()
+        .chain(std::iter::once(&write_recon))
+        .collect();
+    let all_runs: Vec<&PortRun> = read_runs
+        .iter()
+        .chain(std::iter::once(&write_run))
+        .collect();
+    let recon_wfa: Vec<Vec<PcsPoint>> = all_recons
+        .iter()
+        .zip(all_runs.iter())
+        .map(|(recon, run)| {
+            (0..d)
+                .map(|i| {
+                    let mut pt = run.r_joint[i * ad..(i + 1) * ad].to_vec();
+                    pt.extend_from_slice(&recon.r_cycle);
+                    PcsPoint::new(pt, recon.wfa_component_claims[i])
+                })
+                .collect()
+        })
+        .collect();
+    let inc: Vec<PcsPoint> = all_recons
+        .iter()
+        .zip(all_runs.iter())
+        .map(|(recon, run)| {
+            let mut pt = run.r_joint[a..a + ell].to_vec();
+            pt.extend_from_slice(&recon.r_cycle);
+            PcsPoint::new(pt, recon.inc_claim)
+        })
+        .collect();
+    let onehot_claims: Vec<Vec<[PcsPoint; 2]>> = onehot
+        .iter()
+        .zip(onehot_pts.iter())
+        .map(|(per, pts)| {
+            per.iter()
+                .zip(pts.iter())
+                .map(|(oh, cyc)| {
+                    let mut pt_r = oh.r.clone();
+                    pt_r.extend_from_slice(cyc);
+                    let mut pt_rp = oh.r_prime.clone();
+                    pt_rp.extend_from_slice(cyc);
+                    [
+                        PcsPoint::new(pt_r, oh.v_at_r),
+                        PcsPoint::new(pt_rp, oh.v_at_rp),
+                    ]
+                })
+                .collect()
+        })
+        .collect();
+    (
+        TwistProof {
+            read_runs,
+            write_run,
+            read_recons,
+            write_recon,
+            read_component_claims,
+            write_component_claims,
+            st1,
+            st1_claims,
+            onehot,
+        },
+        TwistPcsClaims {
+            read_addr,
+            write_addr,
+            recon_wfa,
+            inc,
+            st1: st1_pcs,
+            onehot: onehot_claims,
+        },
+    )
 }
 
-/// Verify a BinaryTwist proof. The returned claims (components, Inc, etc.)
-/// must be proven against the commitment by the caller (the zkvm layer).
+/// Verify a BinaryTwist proof. Returns the claims left for the PCS (the
+/// components and increments), which the caller proves against the Mosaic
+/// commitment.
 pub fn verify_twist(
     inst: &TwistInstance,
     d: usize,
     proof: &TwistProof,
     t: &mut Transcript,
-) -> Result<(), &'static str> {
+) -> Result<TwistPcsClaims, &'static str> {
     let (a, ell, n, p) = (inst.a, inst.ell, inst.n, inst.p);
     let joint_vars = a + ell + n;
     let ad = a / d;
@@ -517,7 +640,7 @@ pub fn verify_twist(
         let ra_claim: Gf128 = proof.read_component_claims[s]
             .iter()
             .copied()
-            .fold(ONE, |x, y| mul(x, y));
+            .fold(ONE, mul);
         let recon = &proof.read_recons[s];
         // The reconstruction's Val claim: recompute via its own sum-check
         // below; here we need the terminal value: the recon proves
@@ -526,7 +649,7 @@ pub fn verify_twist(
         // point (public!).
         let r_k: Vec<Gf128> = run.r_joint[..a].to_vec();
         let r_v: Vec<Gf128> = run.r_joint[a..a + ell].to_vec();
-        let m0_at = magnetar_field::eval_mle(&inst.m0, &[r_k, r_v].concat());
+        let _m0_at = magnetar_field::eval_mle(&inst.m0, &[r_k, r_v].concat());
         // Replay the read sum-check; the transmitted Val claim is checked
         // against the terminal identity and then reconstructed.
         let mut v = SumcheckVerifier::new(
@@ -545,6 +668,9 @@ pub fn verify_twist(
         }
         v.finish(&[ra_claim, run.val_claim])
             .map_err(|_| "twist: read terminal failed")?;
+        for (i, &cv) in proof.read_component_claims[s].iter().enumerate() {
+            t.absorb_field(&format!("twist-comp-{s}-{i}"), &[cv]);
+        }
         // Verify the reconstruction of this Val claim.
         verify_recon(
             &proof.read_recons[s],
@@ -558,9 +684,6 @@ pub fn verify_twist(
             &format!("twist-recon-{s}"),
             t,
         )?;
-        for (i, &cv) in proof.read_component_claims[s].iter().enumerate() {
-            t.absorb_field(&format!("twist-comp-{s}-{i}"), &[cv]);
-        }
         t.absorb_field(
             &format!("twist-recon-claims-{s}"),
             &[recon.wfa_claim, recon.inc_claim],
@@ -568,11 +691,7 @@ pub fn verify_twist(
     }
     // Write run.
     {
-        let ra_claim: Gf128 = proof
-            .write_component_claims
-            .iter()
-            .copied()
-            .fold(ONE, |x, y| mul(x, y));
+        let ra_claim: Gf128 = proof.write_component_claims.iter().copied().fold(ONE, mul);
         let mut v = SumcheckVerifier::new(
             joint_vars,
             inst.wv_claim,
@@ -585,6 +704,9 @@ pub fn verify_twist(
         }
         v.finish(&[ra_claim, proof.write_run.val_claim])
             .map_err(|_| "twist: write terminal failed")?;
+        for (i, &cv) in proof.write_component_claims.iter().enumerate() {
+            t.absorb_field(&format!("twist-wcomp-{i}"), &[cv]);
+        }
         verify_recon(
             &proof.write_recon,
             &inst.m0,
@@ -597,16 +719,15 @@ pub fn verify_twist(
             "twist-wrecon",
             t,
         )?;
-        for (i, &cv) in proof.write_component_claims.iter().enumerate() {
-            t.absorb_field(&format!("twist-wcomp-{i}"), &[cv]);
-        }
         t.absorb_field(
             "twist-wrecon-claims",
             &[proof.write_recon.wfa_claim, proof.write_recon.inc_claim],
         );
     }
     // Sum-to-one.
+    let mut st1_pcs: Vec<Vec<PcsPoint>> = Vec::new();
     for (port, rounds_per) in proof.st1.iter().enumerate() {
+        let mut pcs_per = Vec::new();
         for (i, rounds) in rounds_per.iter().enumerate() {
             let rho = t.challenge_field_vec(&format!("twist-st1-{port}-{i}-rho"), n);
             let eq_rho = magnetar_field::EqBits::build(&rho).values;
@@ -624,16 +745,19 @@ pub fn verify_twist(
                 public: vec![0],
             }];
             let mut v = SumcheckVerifier::new(kj_vars, ONE, &pubf2, terms2, BindOrder::Increasing);
+            let mut chs = Vec::with_capacity(kj_vars);
             for msg in rounds {
-                v.round_capturing(
+                chs.push(v.round_capturing(
                     &magnetar_sumcheck::RoundMsg(msg.clone()),
                     t,
                     &format!("twist-st1-{port}-{i}"),
-                )?;
+                )?);
             }
             v.finish(&[proof.st1_claims[port][i]])
                 .map_err(|_| "twist: st1 terminal failed")?;
+            pcs_per.push(PcsPoint::new(chs, proof.st1_claims[port][i]));
         }
+        st1_pcs.push(pcs_per);
     }
     for (port, claims) in proof.st1_claims.iter().enumerate() {
         for (i, v) in claims.iter().enumerate() {
@@ -641,12 +765,93 @@ pub fn verify_twist(
         }
     }
     // Δ*.
+    let mut onehot_claims = Vec::new();
     for (port, per) in proof.onehot.iter().enumerate() {
+        let mut per_claims = Vec::new();
         for (i, oh) in per.iter().enumerate() {
-            crate::shout::verify_onehot(oh, t, &format!("twist-onehot-{port}-{i}"))?;
+            let cyc_pt = crate::shout::verify_onehot(oh, t, &format!("twist-onehot-{port}-{i}"))?;
+            let mut pt_r = oh.r.clone();
+            pt_r.extend_from_slice(&cyc_pt);
+            let mut pt_rp = oh.r_prime.clone();
+            pt_rp.extend_from_slice(&cyc_pt);
+            per_claims.push([
+                PcsPoint::new(pt_r, oh.v_at_r),
+                PcsPoint::new(pt_rp, oh.v_at_rp),
+            ]);
         }
+        onehot_claims.push(per_claims);
     }
-    Ok(())
+    // Assemble the claims (mirroring the prover's layout).
+    let mk_comp_pt = |r_joint: &[Gf128], i: usize, ad: usize, a: usize, n: usize| {
+        let mut pt = r_joint[i * ad..(i + 1) * ad].to_vec();
+        pt.extend_from_slice(&r_joint[a + ell..a + ell + n]);
+        pt
+    };
+    let read_addr: Vec<Vec<PcsPoint>> = (0..p)
+        .map(|s| {
+            let run = &proof.read_runs[s];
+            (0..d)
+                .map(|i| {
+                    PcsPoint::new(
+                        mk_comp_pt(&run.r_joint, i, ad, a, n),
+                        proof.read_component_claims[s][i],
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    let write_addr: Vec<PcsPoint> = (0..d)
+        .map(|i| {
+            PcsPoint::new(
+                mk_comp_pt(&proof.write_run.r_joint, i, ad, a, n),
+                proof.write_component_claims[i],
+            )
+        })
+        .collect();
+    let recon_wfa: Vec<Vec<PcsPoint>> = proof
+        .read_recons
+        .iter()
+        .chain(std::iter::once(&proof.write_recon))
+        .zip(
+            proof
+                .read_runs
+                .iter()
+                .chain(std::iter::once(&proof.write_run)),
+        )
+        .map(|(recon, run)| {
+            (0..d)
+                .map(|i| {
+                    let mut pt = run.r_joint[i * ad..(i + 1) * ad].to_vec();
+                    pt.extend_from_slice(&recon.r_cycle);
+                    PcsPoint::new(pt, recon.wfa_component_claims[i])
+                })
+                .collect()
+        })
+        .collect();
+    let inc: Vec<PcsPoint> = proof
+        .read_recons
+        .iter()
+        .chain(std::iter::once(&proof.write_recon))
+        .zip(
+            proof
+                .read_runs
+                .iter()
+                .chain(std::iter::once(&proof.write_run)),
+        )
+        .map(|(recon, run)| {
+            let mut pt = run.r_joint[a..a + ell].to_vec();
+            pt.extend_from_slice(&recon.r_cycle);
+            PcsPoint::new(pt, recon.inc_claim)
+        })
+        .collect();
+    Ok(TwistPcsClaims {
+        read_addr,
+        write_addr,
+        recon_wfa,
+        inc,
+        st1: st1_pcs,
+        onehot: onehot_claims,
+    })
 }
 
 /// Verify one reconstruction sum-check: the claim is
@@ -673,7 +878,7 @@ fn verify_recon(
     for jp in 0..(1usize << n) {
         let mut acc = ZERO;
         for j in 0..(1usize << n) {
-            acc = acc + mul(eq_j[j], lt[jp + j * (1usize << n)]);
+            acc += mul(eq_j[j], lt[jp + j * (1usize << n)]);
         }
         lt_col[jp] = acc;
     }
@@ -691,16 +896,21 @@ fn verify_recon(
     }
     v.finish(&[recon.wfa_claim, recon.inc_claim])
         .map_err(|_| "twist: recon terminal failed")?;
+    // Address virtualization: the full-address terminal must equal the
+    // product of the per-component claims at the recon's point.
+    let product = recon.wfa_component_claims.iter().copied().fold(ONE, mul);
+    if product != recon.wfa_claim {
+        return Err("twist: recon address virtualization failed");
+    }
+    for (i, &cv) in recon.wfa_component_claims.iter().enumerate() {
+        t.absorb_field(&format!("{label}-wfacomp-{i}"), &[cv]);
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn rg(rng: &mut dyn rand::RngCore) -> Gf128 {
-        Gf128(rand::Rng::gen::<u128>(rng))
-    }
 
     #[test]
     fn lt_tables() {
@@ -757,10 +967,10 @@ mod tests {
                         if hot {
                             let bit = inc[o | (jp << ell)];
                             if jp < j {
-                                want_s = want_s + bit;
+                                want_s += bit;
                             }
                             if jp <= j {
-                                want_i = want_i + bit;
+                                want_i += bit;
                             }
                         }
                     }

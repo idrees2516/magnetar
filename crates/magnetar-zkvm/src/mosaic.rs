@@ -2,17 +2,22 @@
 //! multilinear polynomial over the hash-based PCS, so each proof carries
 //! one commitment and one evaluation argument.
 //!
-//! Layout: the bit-witness `G: {0,1}^ℓ → B` (the witness matrix in
-//! row-major layout: columns low, cycles high) is packed over the **top 7**
-//! index bits: `P_G(u) = Σ_b β_b·G(u, b)`, `u ∈ {0,1}^{ℓ−7}`. The
-//! commitment is the Merkle root of the affine-substitution codeword of
-//! `P_G`; the `(x, ε=0)` slice is exactly the packed table.
+//! **Component layout**: every committed polynomial — the direct witness
+//! segments and the auxiliary polynomials of the memory-checking arguments
+//! (the one-hot address components and the increments) — is a bit-valued
+//! `p_i: {0,1}^{ℓ_i} → B` placed on a disjoint, **aligned subcube** of one
+//! larger cube `{0,1}^ℓ` (declared order, offsets aligned to the
+//! component's size, exactly as `SegmentLayout` does for the witness).
+//! `G` agrees with `p_i` on the i-th subcube and is zero outside the union.
 //!
-//! Discharge: one **batching sum-check** over the ℓ variables binding the
-//! 7 packing variables first (`HighBitsFirst`), whose terminal
-//! `Ĝ(r*) = v''` is then reduced by **ring switching** — the c\*-folded
-//! table's own fold chain, anchored to the main commitment with exact
-//! `φ_{c*}` bit-extraction checks at random `(x, 0)` positions.
+//! **Lift** (Equation 4): a claim `p̂_i(r) = v` becomes `Ĝ(r ∥ s_i) = v` by
+//! appending the fixed Boolean suffix `s_i` — no adapter sum-check.
+//!
+//! **Discharge**: one batching sum-check over the `ℓ` variables (binding
+//! the 7 packing variables first via `HighBitsFirst`), whose terminal is
+//! reduced by **ring switching** — the c\*-folded table's own fold chain,
+//! anchored to the main commitment with exact `φ_{c*}` bit-extraction
+//! checks at random `(x, ε=0)` positions.
 
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 use magnetar_hash::MerkleTree;
@@ -28,6 +33,93 @@ use magnetar_sumcheck::{
     BindOrder, SumcheckSpec, Term,
 };
 
+/// One committed component's placement.
+#[derive(Clone, Debug)]
+pub struct ComponentSpec {
+    pub name: String,
+    /// The component's variable count (its table has `2^vars` bits).
+    pub vars: usize,
+}
+
+/// The Mosaic component layout: declared order, aligned offsets.
+#[derive(Clone, Debug)]
+pub struct MosaicLayout {
+    pub components: Vec<ComponentSpec>,
+    /// Total cube variables `ℓ`.
+    pub ell: usize,
+    /// `offsets[i]` = the component's start bit-index in the cube.
+    pub offsets: Vec<usize>,
+}
+
+impl MosaicLayout {
+    pub fn build(components: Vec<ComponentSpec>) -> Self {
+        assert!(!components.is_empty());
+        let mut offsets = Vec::with_capacity(components.len());
+        let mut cursor = 0usize;
+        for c in &components {
+            let align = 1usize << c.vars;
+            let aligned = cursor.div_ceil(align) * align;
+            offsets.push(aligned);
+            cursor = aligned + align;
+        }
+        let ell = (cursor.next_power_of_two().trailing_zeros() as usize).max(1);
+        MosaicLayout {
+            components,
+            ell,
+            offsets,
+        }
+    }
+
+    /// The component's local variable count.
+    pub fn vars(&self, i: usize) -> usize {
+        self.components[i].vars
+    }
+
+    /// The fixed Boolean suffix `s_i` (the high `ℓ − ℓ_i` coordinates of
+    /// the component's subcube).
+    pub fn suffix(&self, i: usize) -> Vec<bool> {
+        let lv = self.vars(i);
+        let off = self.offsets[i];
+        let n = self.ell - lv;
+        let s = off >> lv;
+        (0..n).map(|b| (s >> b) & 1 == 1).collect()
+    }
+
+    /// The index of a component by name.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.components.iter().position(|c| c.name == name)
+    }
+}
+
+/// A claim on one component: `p̂_i(point) = value` with the point in the
+/// component's local (little-endian) coordinates.
+#[derive(Clone, Debug)]
+pub struct MosaicClaim {
+    pub component: usize,
+    pub point: Vec<Gf128>,
+    pub value: Gf128,
+}
+
+impl MosaicClaim {
+    pub fn new(component: usize, point: Vec<Gf128>, value: Gf128) -> Self {
+        MosaicClaim {
+            component,
+            point,
+            value,
+        }
+    }
+
+    /// Lift to the global point: local ∥ Boolean suffix.
+    pub fn lifted_point(&self, layout: &MosaicLayout) -> Vec<Gf128> {
+        let suffix = layout.suffix(self.component);
+        let mut pt = self.point.clone();
+        for b in suffix {
+            pt.push(Gf128(b as u128));
+        }
+        pt
+    }
+}
+
 /// A Mosaic commitment: the packed codeword, its tree, and the statement.
 #[derive(Clone, Debug)]
 pub struct MosaicCommitment {
@@ -39,11 +131,31 @@ pub struct MosaicCommitment {
     pub ell: usize,
 }
 
-/// Commit the bit-witness matrix (row-major: columns low, cycles high;
-/// total bits = `2^ℓ`).
-pub fn commit_mosaic(params: &PcsParams, bits: &[bool]) -> MosaicCommitment {
-    let ell = bits.len().trailing_zeros() as usize;
+/// Assemble the G bit table from the per-component bit tables (zero
+/// outside the union of the subcubes).
+fn assemble_g(layout: &MosaicLayout, tables: &[Vec<bool>]) -> Vec<bool> {
+    let mut g = vec![false; 1usize << layout.ell];
+    for (i, t) in tables.iter().enumerate() {
+        let lv = layout.vars(i);
+        let off = layout.offsets[i];
+        debug_assert_eq!(t.len(), 1usize << lv);
+        for (j, &b) in t.iter().enumerate() {
+            g[off + j] = b;
+        }
+    }
+    g
+}
+
+/// Commit the Mosaic: `tables[i]` is component `i`'s bit table.
+pub fn commit_mosaic(
+    params: &PcsParams,
+    layout: &MosaicLayout,
+    tables: &[Vec<bool>],
+) -> MosaicCommitment {
+    assert_eq!(tables.len(), layout.components.len());
+    let ell = layout.ell;
     assert!(ell >= 7, "witness must have at least 7 variables");
+    let bits = assemble_g(layout, tables);
     // Pack over the top 7 bits: P(u) = Σ_b β_b G(u, b) with u the low
     // ℓ−7 bits.
     let n = ell - 7;
@@ -51,7 +163,6 @@ pub fn commit_mosaic(params: &PcsParams, bits: &[bool]) -> MosaicCommitment {
     for u in 0..(1usize << n) {
         let mut v: u128 = 0;
         for b in 0..128usize {
-            // The full index: u + (b << n).
             if bits[u | (b << n)] {
                 v |= 1u128 << b;
             }
@@ -87,30 +198,26 @@ pub struct MosaicProof {
     pub ring: RingProof,
 }
 
-/// Prove the Mosaic discharge for a set of claims on the bit-witness.
-///
-/// Each claim is `(point, value)` with `Ĝ(point) = value` (points in
-/// original ℓ-coordinate order, little-endian).
+/// Prove the Mosaic discharge for a set of component claims.
 pub fn prove_mosaic(
     params: &PcsParams,
+    layout: &MosaicLayout,
     cm: &MosaicCommitment,
-    claims: &[(Vec<Gf128>, Gf128)],
+    claims: &[MosaicClaim],
     t: &mut Transcript,
 ) -> MosaicProof {
     let ell = cm.ell;
-    // α-batching of the claims.
+    // α-batching of the (lifted) claims.
     let alphas = t.challenge_field_vec("mosaic-alpha", claims.len());
     let mut lhs = ZERO;
     let mut items = Vec::with_capacity(claims.len());
-    for ((pt, v), &a) in claims.iter().zip(alphas.iter()) {
-        lhs = lhs + mul(a, *v);
-        items.push((a, pt.clone()));
+    for (c, &a) in claims.iter().zip(alphas.iter()) {
+        lhs += mul(a, c.value);
+        items.push((a, c.lifted_point(layout)));
     }
     // Batching sum-check: Σ_x [Σ_i α_i eq(p_i, x)]·G(x) = lhs over the ℓ
     // variables, binding the top 7 first.
     let g_table: Vec<Gf128> = {
-        // The G bit table as K values over the full ℓ-cube.
-        // Reconstructed from the packed table.
         let mut g = vec![ZERO; 1usize << ell];
         for u in 0..(1usize << (ell - 7)) {
             let bits = magnetar_field::unpack_bits(cm.packed[u]);
@@ -177,16 +284,17 @@ pub fn verify_mosaic(
     params: &PcsParams,
     cm_stmt: &PcsStatement,
     ell: usize,
-    claims: &[(Vec<Gf128>, Gf128)],
+    layout: &MosaicLayout,
+    claims: &[MosaicClaim],
     proof: &MosaicProof,
     t: &mut Transcript,
 ) -> Result<(), &'static str> {
     let alphas = t.challenge_field_vec("mosaic-alpha", claims.len());
     let mut lhs = ZERO;
     let mut items = Vec::with_capacity(claims.len());
-    for ((pt, v), &a) in claims.iter().zip(alphas.iter()) {
-        lhs = lhs + mul(a, *v);
-        items.push((a, pt.clone()));
+    for (c, &a) in claims.iter().zip(alphas.iter()) {
+        lhs += mul(a, c.value);
+        items.push((a, c.lifted_point(layout)));
     }
     if proof.batch_rounds.len() != ell {
         return Err("mosaic: round count mismatch");
@@ -229,7 +337,4 @@ pub fn verify_mosaic(
         &proof.ring,
         t,
     )
-    .map_err(|e| match e {
-        e => e,
-    })
 }

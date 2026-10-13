@@ -1,6 +1,6 @@
 //! Sparse matrices and SIMD R1CS structures (paper Definitions 3–4).
 
-use magnetar_field::{eq_char2, mul, Gf128, ONE, ZERO};
+use magnetar_field::{mul, Gf128, ONE, ZERO};
 
 /// A sparse matrix over `K` in (row, col, value) entry form.
 ///
@@ -48,7 +48,7 @@ impl SparseMatrix {
         debug_assert_eq!(z.len(), self.cols);
         let mut out = vec![ZERO; self.rows];
         for &(r, c, v) in &self.entries {
-            out[r] = out[r] + mul(v, z[c]);
+            out[r] += mul(v, z[c]);
         }
         out
     }
@@ -66,7 +66,7 @@ impl SparseMatrix {
         let eq_row = magnetar_field::EqBits::build(r_row).values;
         let mut table = vec![ZERO; self.cols];
         for &(r, c, v) in &self.entries {
-            table[c] = table[c] + mul(v, eq_row[r]);
+            table[c] += mul(v, eq_row[r]);
         }
         let _ = lc;
         table
@@ -78,7 +78,7 @@ impl SparseMatrix {
         let eq_col = magnetar_field::EqBits::build(r_col).values;
         let mut acc = ZERO;
         for &(r, c, v) in &self.entries {
-            acc = acc + mul(v, mul(eq_row[r], eq_col[c]));
+            acc += mul(v, mul(eq_row[r], eq_col[c]));
         }
         acc
     }
@@ -94,7 +94,7 @@ impl SparseMatrix {
             let z_u = &joint_z[u * self.cols..(u + 1) * self.cols];
             let out_u = &mut out[u * self.rows..(u + 1) * self.rows];
             for &(r, c, v) in &self.entries {
-                out_u[r] = out_u[r] + mul(v, z_u[c]);
+                out_u[r] += mul(v, z_u[c]);
             }
         }
         out
@@ -154,9 +154,9 @@ impl SimdInstance {
             // j' = 0 contributes eq(r_low, 0).
             let mut term = eq_low[0];
             for (j, &xv) in x.iter().enumerate() {
-                term = term + mul(eq_low[j + 1], xv);
+                term += mul(eq_low[j + 1], xv);
             }
-            acc = acc + mul(w_u, term);
+            acc += mul(w_u, term);
         }
         acc
     }
@@ -167,7 +167,7 @@ pub fn fold_instances(per_instance: &[Gf128], r_inst: &[Gf128]) -> Gf128 {
     let eq = magnetar_field::EqBits::build(r_inst).values;
     let mut acc = ZERO;
     for (u, &v) in per_instance.iter().enumerate() {
-        acc = acc + mul(eq[u], v);
+        acc += mul(eq[u], v);
     }
     acc
 }
@@ -175,6 +175,7 @@ pub fn fold_instances(per_instance: &[Gf128], r_inst: &[Gf128]) -> Gf128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
         Gf128(rng.gen::<u128>())
@@ -182,7 +183,6 @@ mod tests {
 
     #[test]
     fn apply_and_mle_agree() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         // Random sparse matrix, random z: apply == MLE-based identity at
         // Boolean points is not direct; check eval_mle_table against
@@ -208,7 +208,7 @@ mod tests {
             let mut acc = ZERO;
             for &(er, ec, v) in &m.entries {
                 if er == r {
-                    acc = acc + mul(v, z[ec]);
+                    acc += mul(v, z[ec]);
                 }
             }
             assert_eq!(az[r], acc);
@@ -237,7 +237,6 @@ mod tests {
 
     #[test]
     fn public_fold_matches_definition() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         let q = 4;
         let m = 8;
@@ -256,10 +255,9 @@ mod tests {
             for j2 in 0..(m / 2) {
                 // column = m/2 + j2 → msb (bit 2) = 1, low bits = j2.
                 let val = if j2 == 0 { ONE } else { x[j2 - 1] };
-                want = want + mul(mul(eq_inst[u], eq_low[j2]), val);
+                want += mul(mul(eq_inst[u], eq_low[j2]), val);
             }
         }
         assert_eq!(inst.fold_public_part(&r_inst, &r_low), want);
-        let _ = eq_char2;
     }
 }

@@ -21,6 +21,10 @@
 //!   `Ŵ(r_inst, r_col) = Σ_i eq(q_i, b_i)·Ŵ_i(r_inst, r_i)`.
 
 #![forbid(unsafe_code)]
+// Proof-system style: loops indexed over Boolean-cube coordinates and
+// multi-input reductions are the domain's normal shape.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod r1cs;
 pub mod virtual_spartan;

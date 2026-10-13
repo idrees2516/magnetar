@@ -74,7 +74,7 @@ impl PublicFactor for SumEqFactor {
         for (alpha, point) in &self.items {
             let eq = magnetar_field::EqBits::build(point).values;
             for (t, e) in table.iter_mut().zip(eq.iter()) {
-                *t = *t + mul(*alpha, *e);
+                *t += mul(*alpha, *e);
             }
         }
         table
@@ -86,7 +86,7 @@ impl PublicFactor for SumEqFactor {
             for (&r, &x) in p.iter().zip(point.iter()) {
                 e = mul(e, ONE + r + x);
             }
-            acc = acc + mul(*alpha, e);
+            acc += mul(*alpha, e);
         }
         acc
     }
@@ -126,7 +126,6 @@ mod tests {
 
     #[test]
     fn eq_factor_materialize_matches_eval() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         fn rg(rng: &mut impl rand::Rng) -> Gf128 {
             Gf128(rng.gen::<u128>())
@@ -146,7 +145,6 @@ mod tests {
 
     #[test]
     fn sum_eq_matches_sum_of_eq() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         fn rg(rng: &mut impl rand::Rng) -> Gf128 {
             Gf128(rng.gen::<u128>())
@@ -167,7 +165,7 @@ mod tests {
         for i in 0..(1 << nv) {
             let mut want = ZERO;
             for ((alpha, _), s) in items.iter().zip(singles.iter()) {
-                want = want + mul(*alpha, s[i]);
+                want += mul(*alpha, s[i]);
             }
             assert_eq!(table[i], want, "i = {i}");
         }
@@ -175,7 +173,6 @@ mod tests {
 
     #[test]
     fn table_factor_eval() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         fn rg(rng: &mut impl rand::Rng) -> Gf128 {
             Gf128(rng.gen::<u128>())

@@ -4,7 +4,7 @@
 //! and `γ_j ∈ K^n` derived from a public seed. Encoding via the
 //! δ-shifted Möbius transform in `O(n·2^{n+k})`.
 
-use magnetar_field::{mul, Gf128, ONE, ZERO};
+use magnetar_field::{mul, Gf128, ZERO};
 use magnetar_hash::blake3_domain;
 
 /// Public parameters of the code: `n` table variables, `k` extension
@@ -52,7 +52,7 @@ impl CodeParams {
         for (j, &e) in eps_bits.iter().enumerate() {
             if e {
                 for i in 0..self.n {
-                    out[i] = out[i] + self.gammas[j][i];
+                    out[i] += self.gammas[j][i];
                 }
             }
         }
@@ -235,7 +235,6 @@ mod tests {
 
     #[test]
     fn monomial_transforms_roundtrip() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         for n in [1usize, 2, 3, 5] {
             let values: Vec<Gf128> = (0..(1 << n)).map(|_| rg(&mut rng)).collect();
@@ -247,7 +246,6 @@ mod tests {
 
     #[test]
     fn shifted_evaluation_identity() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         // C(x, eps) must equal eval_mle(T, x + L(eps)) for Boolean x, eps.
         let n = 3;
@@ -273,7 +271,6 @@ mod tests {
 
     #[test]
     fn fold_identity_substitution() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         let n = 3;
         let k = 2;
@@ -303,7 +300,6 @@ mod tests {
 
     #[test]
     fn full_fold_tail_equals_eval() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         let n = 4;
         let k = 2;

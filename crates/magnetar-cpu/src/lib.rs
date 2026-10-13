@@ -16,6 +16,10 @@
 //! execution (§2.1 step 1).
 
 #![forbid(unsafe_code)]
+// Proof-system style: loops indexed over Boolean-cube coordinates and
+// multi-input reductions are the domain's normal shape.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod circuit;
 pub mod decode;

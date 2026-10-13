@@ -16,6 +16,10 @@
 //! multiplication fast path uses `PCLMULQDQ` with a portable fallback.
 
 #![deny(unsafe_code)]
+// Proof-system style: loops indexed over Boolean-cube coordinates and
+// multi-input reductions are the domain's normal shape.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 #![forbid(clippy::undocumented_unsafe_blocks)]
 // The single exception: `gf128::clmul` contains guarded `unsafe` intrinsics.
 // It is a dedicated module with `#[allow(unsafe_code)]` and audited SAFETY

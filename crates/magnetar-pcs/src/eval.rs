@@ -353,7 +353,6 @@ mod tests {
     }
 
     fn run_case(n: usize, k: usize, queries: usize) {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         let params = PcsParams {
             k,
@@ -380,7 +379,6 @@ mod tests {
 
     #[test]
     fn tamper_rejected() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         let params = PcsParams {
             k: 2,
@@ -406,26 +404,26 @@ mod tests {
 
         // Tampered terminal.
         let mut p = proof.clone();
-        p.terminal_claim = p.terminal_claim + Gf128(1);
+        p.terminal_claim += Gf128(1);
         let mut tv = base();
         assert!(verify_eval(&stmt, &params, &r, y, &p, &mut tv).is_err());
 
         // Tampered tail entry.
         let mut p = proof.clone();
-        p.tail[1].0 = p.tail[1].0 + Gf128(1);
+        p.tail[1].0 += Gf128(1);
         let mut tv = base();
         assert!(verify_eval(&stmt, &params, &r, y, &p, &mut tv).is_err());
 
         // Tampered query value (breaks either the Merkle path or the fold
         // relation, depending on position).
         let mut p = proof.clone();
-        p.queries[0].levels[0].a = p.queries[0].levels[0].a + Gf128(1);
+        p.queries[0].levels[0].a += Gf128(1);
         let mut tv = base();
         assert!(verify_eval(&stmt, &params, &r, y, &p, &mut tv).is_err());
 
         // Tampered round message.
         let mut p = proof.clone();
-        p.rounds[0][1] = p.rounds[0][1] + Gf128(1);
+        p.rounds[0][1] += Gf128(1);
         let mut tv = base();
         assert!(verify_eval(&stmt, &params, &r, y, &p, &mut tv).is_err());
 

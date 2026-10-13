@@ -51,7 +51,7 @@ pub fn decode(raw: u32) -> Inst {
     let rs2 = ((raw >> 20) & 0x1f) as usize;
     let funct7 = raw >> 25;
     // Immediates.
-    let i_imm = sext(((raw >> 20) & 0xfff), 12);
+    let i_imm = sext((raw >> 20) & 0xfff, 12);
     let s_imm = sext((((raw >> 25) & 0x7f) << 5) | ((raw >> 7) & 0x1f), 12);
     let b_imm = sext(
         (((raw >> 31) & 1) << 12)
@@ -60,7 +60,7 @@ pub fn decode(raw: u32) -> Inst {
             | (((raw >> 8) & 0xf) << 1),
         13,
     );
-    let u_imm = ((raw & 0xffff_f000) as u32 as i64) as i64;
+    let u_imm = (raw & 0xffff_f000) as i64;
     let j_imm = sext(
         (((raw >> 31) & 1) << 20)
             | (((raw >> 12) & 0xff) << 12)
@@ -153,18 +153,11 @@ mod tests {
     fn decodes_branch_and_jump_immediates() {
         // BEQ x1, x2, +8: imm[12]=0, imm[10:5]=0, imm[4:1]=0100 (bits
         // 11:8), imm[11]=0.
-        let raw = (0b0 << 31)
-            | (0b000000 << 25)
-            | (2 << 20)
-            | (1 << 15)
-            | (0 << 12)
-            | (0b0100 << 8)
-            | (0 << 7)
-            | 0x63;
+        let raw = (((2 << 20) | (1 << 15)) | (0b0100 << 8)) | 0x63;
         assert_eq!(decode(raw).imm, 8);
         // JAL x1, +16: imm[20]=0, imm[10:1]=0000001000 (8), imm[11]=0,
         // imm[19:12]=0.
-        let raw = (0b0 << 31) | (8u32 << 21) | (0b0 << 20) | (0 << 12) | (0b0 << 7) | 0x6f;
+        let raw = (8u32 << 21) | 0x6f;
         assert_eq!(decode(raw).imm, 16);
     }
 
@@ -185,7 +178,7 @@ mod tests {
         assert_eq!(i.opcode, Opcode::Store);
         assert_eq!(i.imm, 12);
         // SB x1, -4(x2)
-        let raw = ((0x1cu32) << 7) | (2 << 15) | (0 << 12) | (0x7f << 25) | 0x23;
+        let raw = (((0x1cu32) << 7) | (2 << 15)) | (0x7f << 25) | 0x23;
         assert_eq!(decode(raw).imm, -4);
     }
 

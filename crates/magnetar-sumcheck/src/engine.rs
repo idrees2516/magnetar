@@ -126,12 +126,12 @@ impl SumcheckProver {
                     let n = 1u128 << self.remaining_vars();
                     // n mod 2 == 0 for ≥1 vars; only nonzero when n == 1.
                     if n == 1 {
-                        total = total + coeff;
+                        total += coeff;
                     }
                 }
                 Some(p) => {
                     for &v in &p {
-                        total = total + mul(coeff, v);
+                        total += mul(coeff, v);
                     }
                 }
             }
@@ -163,7 +163,7 @@ impl SumcheckProver {
         let mut mr = ZERO;
         let mut xp = Gf128(1);
         for &c in &msg.0 {
-            mr = mr + mul(c, xp);
+            mr += mul(c, xp);
             xp = mul(xp, r);
         }
         self.running = mr;
@@ -264,7 +264,7 @@ impl<'a> SumcheckVerifier<'a> {
         // Characteristic-two check: Σ_{j≥1} c_j = running.
         let mut s = ZERO;
         for &c in &msg.0[1..] {
-            s = s + c;
+            s += c;
         }
         if s != self.running {
             return Err("round sum check failed");
@@ -279,7 +279,7 @@ impl<'a> SumcheckVerifier<'a> {
         let mut mr = ZERO;
         let mut xp = Gf128(1);
         for &c in &msg.0 {
-            mr = mr + mul(c, xp);
+            mr += mul(c, xp);
             xp = mul(xp, r);
         }
         self.running = mr;
@@ -309,7 +309,7 @@ impl<'a> SumcheckVerifier<'a> {
         }
         let mut s = ZERO;
         for &c in &msg.0[1..] {
-            s = s + c;
+            s += c;
         }
         if s != self.running {
             return Err("round sum check failed");
@@ -317,7 +317,7 @@ impl<'a> SumcheckVerifier<'a> {
         let mut mr = ZERO;
         let mut xp = Gf128(1);
         for &c in &msg.0 {
-            mr = mr + mul(c, xp);
+            mr += mul(c, xp);
             xp = mul(xp, r);
         }
         self.running = mr;
@@ -358,7 +358,7 @@ impl<'a> SumcheckVerifier<'a> {
                     .ok_or("missing dense evaluation claim")?;
                 prod = mul(prod, *v);
             }
-            total = total + prod;
+            total += prod;
         }
         if total != self.running {
             return Err("terminal identity check failed");
@@ -370,7 +370,7 @@ impl<'a> SumcheckVerifier<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::public::{EqFactor, TableFactor};
+    use crate::public::EqFactor;
     use magnetar_field::Gf128;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn engine_roundtrip_simple() {
         // g(x) = eq(τ, x) · T(x), T a random bit table, claim = Σ eq·T.
-        use rand::Rng;
+
         let mut rng = rand::thread_rng();
         let m = 4;
         let tau: Vec<Gf128> = (0..m).map(|_| rg(&mut rng)).collect();
@@ -392,7 +392,7 @@ mod tests {
         let eqt = magnetar_field::EqBits::build(&tau).values;
         let mut claim = ZERO;
         for i in 0..(1 << m) {
-            claim = claim + mul(eqt[i], table[i]);
+            claim += mul(eqt[i], table[i]);
         }
         let spec = SumcheckSpec {
             num_vars: m,
@@ -444,7 +444,6 @@ mod tests {
 
     #[test]
     fn tamper_detected() {
-        use rand::Rng;
         let mut rng = rand::thread_rng();
         let m = 5;
         let table: Vec<Gf128> = (0..(1 << m)).map(|_| rg(&mut rng)).collect();
@@ -452,7 +451,7 @@ mod tests {
         let eqt = magnetar_field::EqBits::build(&tau).values;
         let mut claim = ZERO;
         for i in 0..(1 << m) {
-            claim = claim + mul(eqt[i], table[i]);
+            claim += mul(eqt[i], table[i]);
         }
         let spec = SumcheckSpec {
             num_vars: m,
@@ -475,7 +474,7 @@ mod tests {
         }
         let (mut claims, _) = prover.finish();
         // Tamper with the final dense claim.
-        claims[0] = claims[0] + Gf128(1);
+        claims[0] += Gf128(1);
         let mut tv = magnetar_hash::Transcript::new("tamper", &[]);
         let pubf: Vec<Box<dyn crate::public::PublicFactor + Send + Sync>> =
             vec![Box::new(EqFactor::new(Vec::new()))];
@@ -512,14 +511,14 @@ mod tests {
     fn high_bits_first_order() {
         // Check BindOrder::HighBitsFirst maps challenges back correctly by
         // folding a table whose value depends on variable order.
-        use rand::Rng;
+
         let mut rng = rand::thread_rng();
         let m = 6;
         let table: Vec<Gf128> = (0..(1 << m)).map(|_| rg(&mut rng)).collect();
         // Summand: 1 · T(x) — claim = Σ T.
         let mut claim = ZERO;
         for &v in &table {
-            claim = claim + v;
+            claim += v;
         }
         let spec = SumcheckSpec {
             num_vars: m,

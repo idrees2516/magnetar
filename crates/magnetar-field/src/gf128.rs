@@ -8,9 +8,13 @@
 //! Bit extraction is free in this basis: the bits of the `u128` *are* the
 //! polynomial coefficients, which is the property ring switching exploits.
 
+// The workspace's single `unsafe` exception (the crate denies
+// `unsafe_code`): guarded, audited clmul intrinsics. This inner attribute
+// must sit at the top of the module.
+#![cfg_attr(target_arch = "x86_64", allow(unsafe_code))]
+
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_code)]
-use std::arch::x86_64::*;
+use std::arch::x86_64::{_mm_clmulepi64_si128, _mm_extract_epi64, _mm_set_epi64x};
 
 /// The additive identity.
 pub const ZERO: Gf128 = Gf128(0);
@@ -27,6 +31,8 @@ impl std::fmt::Debug for Gf128 {
     }
 }
 
+// Addition in characteristic two is XOR.
+#[allow(clippy::suspicious_arithmetic_impl)]
 impl std::ops::Add for Gf128 {
     type Output = Gf128;
     #[inline(always)]
@@ -34,12 +40,15 @@ impl std::ops::Add for Gf128 {
         Gf128(self.0 ^ rhs.0)
     }
 }
+#[allow(clippy::suspicious_op_assign_impl)] // XOR is the characteristic-two +=
 impl std::ops::AddAssign for Gf128 {
     #[inline(always)]
     fn add_assign(&mut self, rhs: Self) {
         self.0 ^= rhs.0;
     }
 }
+// Subtraction equals addition in characteristic two.
+#[allow(clippy::suspicious_arithmetic_impl)]
 impl std::ops::Sub for Gf128 {
     type Output = Gf128;
     #[inline(always)]
@@ -73,8 +82,7 @@ fn fast_path_available() -> bool {
         {
             // `_mm_extract_epi64` needs SSE4.1; every PCLMULQDQ CPU in
             // practice ships SSE4.1, but verify both to stay correct.
-            std::arch::is_x86_feature_detected!("pclmulqdq")
-                && std::arch::is_x86_feature_detected!("sse4.1")
+            std::is_x86_feature_detected!("pclmulqdq") && std::is_x86_feature_detected!("sse4.1")
         }
         #[cfg(not(target_arch = "x86_64"))]
         {

@@ -24,7 +24,7 @@
 //! Output: one `SegmentClaim` per non-padding segment — direct segments go
 //! to MosaicPCS, virtual segments to their owning arguments.
 
-use crate::r1cs::{fold_instances, SparseMatrix};
+use crate::r1cs::SparseMatrix;
 use crate::SegmentClaim;
 use magnetar_field::{eval_mle, mul, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
@@ -127,6 +127,11 @@ impl SegmentLayout {
     pub fn is_empty(&self) -> bool {
         self.specs.is_empty()
     }
+
+    /// The index of a segment by name.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.specs.iter().position(|s| s.name == name)
+    }
 }
 
 /// The Virtual Spartan proof (non-interactive via Fiat–Shamir).
@@ -189,9 +194,9 @@ fn separate_round(
 }
 
 fn outer_spec(
-    a: &SparseMatrix,
-    b: &SparseMatrix,
-    c: &SparseMatrix,
+    _a: &SparseMatrix,
+    _b: &SparseMatrix,
+    _c: &SparseMatrix,
     az: Vec<Gf128>,
     bz: Vec<Gf128>,
     cz: Vec<Gf128>,
@@ -353,7 +358,7 @@ pub fn prove_virtual_spartan(
         for y in 0..half {
             let mut acc = ZERO;
             for u in 0..q {
-                acc = acc + mul(eq_inst[u], joint_z[u * m + y]);
+                acc += mul(eq_inst[u], joint_z[u * m + y]);
             }
             wf[y] = acc;
         }
@@ -373,7 +378,7 @@ pub fn prove_virtual_spartan(
         for (j, st) in seg_table.iter_mut().enumerate() {
             let mut acc = ZERO;
             for u in 0..q {
-                acc = acc + mul(eq_inst[u], joint_z[u * m + base + j]);
+                acc += mul(eq_inst[u], joint_z[u * m + base + j]);
             }
             *st = acc;
         }
@@ -429,7 +434,7 @@ fn build_m_combo(
     for (mat, r_row, alpha) in parts {
         let table = mat.eval_mle_table(r_row);
         for (c, v) in combo.iter_mut().zip(table.iter()) {
-            *c = *c + mul(alpha, *v);
+            *c += mul(alpha, *v);
         }
     }
     combo
@@ -442,7 +447,7 @@ fn fold_joint_at_instances(joint_z: &[Gf128], q: usize, m: usize, r_inst: &[Gf12
     for y in 0..m {
         let mut acc = ZERO;
         for u in 0..q {
-            acc = acc + mul(eq[u], joint_z[u * m + y]);
+            acc += mul(eq[u], joint_z[u * m + y]);
         }
         out[y] = acc;
     }
@@ -595,9 +600,9 @@ pub fn verify_virtual_spartan(
     for (u, x) in public.iter().enumerate() {
         let mut term = eq_low[0];
         for (j, &xv) in x.iter().enumerate() {
-            term = term + mul(eq_low[j + 1], xv);
+            term += mul(eq_low[j + 1], xv);
         }
-        public_fold = public_fold + mul(eq_inst[u], term);
+        public_fold += mul(eq_inst[u], term);
     }
     // Segment combination: Σ_i eq(q_i, b_i)·v_i.
     let mut seg_sum = ZERO;
@@ -612,7 +617,7 @@ pub fn verify_virtual_spartan(
         for (j, &qv) in q_pt.iter().enumerate() {
             e = mul(e, eq_char2_pub(qv, (b >> j) & 1 == 1));
         }
-        seg_sum = seg_sum + mul(e, proof.segment_values[i]);
+        seg_sum += mul(e, proof.segment_values[i]);
         let _ = lv;
     }
     let lhs = mul(ONE + msb, seg_sum) + mul(msb, public_fold);
@@ -729,22 +734,22 @@ mod tests {
         }
         // Tamper: segment value.
         let mut p = proof.clone();
-        p.segment_values[0] = p.segment_values[0] + ONE;
+        p.segment_values[0] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
         assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
         // Tamper: terminal value.
         let mut p = proof.clone();
-        p.terminals[0] = p.terminals[0] + ONE;
+        p.terminals[0] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
         assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
         // Tamper: inner message.
         let mut p = proof.clone();
-        p.inner[0][1] = p.inner[0][1] + ONE;
+        p.inner[0][1] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
         assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
         // Tamper: outer row message.
         let mut p = proof.clone();
-        p.outer_bin[0][1] = p.outer_bin[0][1] + ONE;
+        p.outer_bin[0][1] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
         assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
     }

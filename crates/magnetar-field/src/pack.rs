@@ -47,7 +47,7 @@ pub fn phi_c(p: Gf128, c: &[Gf128; 128]) -> Gf128 {
     let mut acc = ZERO;
     for (b, &cb) in c.iter().enumerate() {
         if (p.0 >> b) & 1 == 1 {
-            acc = acc + cb;
+            acc += cb;
         }
     }
     acc
@@ -128,7 +128,7 @@ mod tests {
             let mut want = ZERO;
             for (b, &bit) in bits.iter().enumerate() {
                 if bit {
-                    want = want + c[b];
+                    want += c[b];
                 }
             }
             assert_eq!(phi_c(p, &c), want);

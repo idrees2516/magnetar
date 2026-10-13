@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn ring_roundtrip_and_tamper() {
         use magnetar_field::eq_table;
-        use rand::Rng;
+
         let mut rng = rand::thread_rng();
         let params = PcsParams {
             k: 2,
@@ -394,7 +394,7 @@ mod tests {
             for b in 0..128usize {
                 let b_bits: Vec<bool> = (0..7).map(|j| (b >> j) & 1 == 1).collect();
                 let eb = eq_table(&r_b, &b_bits);
-                y = y + magnetar_field::mul(
+                y += magnetar_field::mul(
                     eq_a[u],
                     magnetar_field::mul(eb, Gf128(bits[u * 128 + b] as u128)),
                 );
@@ -415,17 +415,17 @@ mod tests {
         );
         // Tampered terminal.
         let mut p = proof.clone();
-        p.terminal_claim = p.terminal_claim + Gf128(1);
+        p.terminal_claim += Gf128(1);
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
         // Tampered anchor (phi_c mismatch).
         let mut p = proof.clone();
-        p.anchors[0].c_value = p.anchors[0].c_value + Gf128(1);
+        p.anchors[0].c_value += Gf128(1);
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
         // Tampered query fold value.
         let mut p = proof.clone();
-        p.queries[0].levels[0].a = p.queries[0].levels[0].a + Gf128(1);
+        p.queries[0].levels[0].a += Gf128(1);
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
     }

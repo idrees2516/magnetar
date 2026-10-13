@@ -219,9 +219,7 @@ mod tests {
     fn expansion_counts() {
         // ADDI: 1 virtual; SLL (register): 6 stages; JAL: 1.
         let addi = crate::decode::decode(0x00100093); // addi x1, x0, 1
-        let sll = crate::decode::decode(
-            (0u32 << 25) | (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33,
-        );
+        let sll = crate::decode::decode((2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33);
         let jal = crate::decode::decode(0x008000ef); // jal x1, +8
         let prog = expand_program(&[addi.raw, sll.raw, jal.raw]);
         assert_eq!(prog.len, 1 + SHIFT_STAGES + 1);

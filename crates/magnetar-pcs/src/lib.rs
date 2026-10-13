@@ -50,6 +50,10 @@
 //! the *main* commitment by exact `φ_c` bit-extraction checks.
 
 #![forbid(unsafe_code)]
+// Proof-system style: loops indexed over Boolean-cube coordinates and
+// multi-input reductions are the domain's normal shape.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::too_many_arguments)]
 
 pub mod code;
 pub mod eval;

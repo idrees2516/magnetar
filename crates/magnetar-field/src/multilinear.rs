@@ -115,7 +115,7 @@ mod tests {
             let eq = EqBits::build(&point);
             let mut want = Gf128(0);
             for i in 0..(1 << nv) {
-                want = want + mul(values[i], eq.values[i]);
+                want += mul(values[i], eq.values[i]);
             }
             assert_eq!(got, want, "nv = {nv}");
         }

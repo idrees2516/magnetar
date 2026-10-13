@@ -56,12 +56,53 @@ Merkle-authenticated data or an exact bit extraction.
 * Secret witness data is zeroized nowhere required to be persistent;
   proofs contain only public-coin responses.
 
+## The virtual-claim discharge (step 4) — the identity inventory
+
+Every reduction below is a sum-check whose round checks carry ≤
+8/2^128 each; the listed identity is what binds the reduction's output
+claims to committed data:
+
+* **Ψ-sum-checks** (registers' indices, RAM addresses, the micro-PC):
+  `c = Σ_{k,j} eq(r_cycle,j)·Ψ(k)·Π_i ra_i(k^{(i)},j)` with public
+  `Ψ`. The register-index claims are checked *again* inside the bytecode
+  Shout's Φ sum-check against the ROM's slices, and the RAM/pc claims
+  are checked by exact equality against the committed segments' Virtual
+  Spartan claims — the single eq-folded claim per port avoids the
+  combination leak of per-bit claims (a per-bit lie that preserves the
+  Φ combination but shifts the segment identity is caught by the
+  equality check).
+* **Bytecode Shout** (one joint (k, o, j) sum-check): the summand
+  `eq(r_val,o)·eq(r_cycle,j)·[α₀ + w(o)·bus(o,k)]·Π ra_i` checks the
+  fetched bus, the three register-index slices (with the
+  slice-position-derived eq weights), and the folded non-emptiness
+  (α₀ forces `Σ_k Π_i ra_i = 1` at the folded point) in one identity;
+  Δ\* per component bounds the Hamming weight.
+* **Selector checks** (per routing factor, over (k, h_f, j)): the
+  summand covers **every** joint variable — a factor replicated over
+  idle variables contributes `2^idle · v = 0` over the Boolean cube in
+  characteristic two, so the per-factor design is a correctness
+  requirement, not a convenience.
+* **Routers**: the sparse prover evaluates each factor in its own
+  variable space; the verifier replays the same round checks and
+  evaluates the public routing tensor itself. The store router's
+  offset-bit claims are solved from the eq-link terminals
+  (`â_k = terminal + 1 + r_{a_k}`) and lift to the off segment at the
+  Boolean unit points.
+* **Reconstruction (Val) sum-checks in Twist**: the write-address
+  terminal is now checked against the product of the per-component
+  claims at the reconstruction's point (address virtualization) — this
+  closes what was previously an unbound terminal.
+
 ## Known scope notes
 
 * The interpreter materializes the Val history in BinaryTwist
   (O(K·L·T) time — the paper's prover work — with a space tradeoff the
   paper's production prover avoids by streaming).
-* The end-to-end zkvm wiring currently closes Construction 3's steps
-  1–3 and 5; the auxiliary arguments (Twist/Shout/Router) are
-  implemented and tested per-component and compose through the same
-  claim flow (documented in the README).
+* The cross-step micro-PC constraints are omitted exactly as the
+  paper's Remark 4 omits them from the formal protocol; the
+  decode-vs-flag correlation and the register-shift stage-select are
+  documented engineering extensions (the interpreter and expansion
+  implement their semantics; the circuit-level constraints are future
+  work).
+* Test traces are 2^3–2^5 cycles so CI stays fast; the trace-length
+  parameter is a KeyGen input and the architecture scales linearly.
