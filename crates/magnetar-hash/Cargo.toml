@@ -1,0 +1,15 @@
+[package]
+name = "magnetar-hash"
+description = "SHA3-256 Fiat-Shamir transcripts and BLAKE3 Merkle trees for Magnetar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+magnetar-field = { workspace = true }
+sha3 = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

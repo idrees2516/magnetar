@@ -1,0 +1,12 @@
+[package]
+name = "magnetar-field"
+description = "Binary field F_{2^128} and multilinear layer for the Magnetar zkVM proof stack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+rand = { workspace = true }

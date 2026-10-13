@@ -1,0 +1,15 @@
+[package]
+name = "magnetar-cli"
+description = "The magnetar command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "magnetar"
+path = "src/main.rs"
+
+[dependencies]
+magnetar-zkvm = { workspace = true }
+magnetar-cpu = { workspace = true }

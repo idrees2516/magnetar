@@ -1,0 +1,15 @@
+[package]
+name = "magnetar-pcs"
+description = "Hash-based multilinear polynomial commitments and ring switching for Magnetar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+magnetar-field = { workspace = true }
+magnetar-hash = { workspace = true }
+magnetar-sumcheck = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

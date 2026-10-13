@@ -1,0 +1,21 @@
+[package]
+name = "magnetar-zkvm"
+description = "MosaicPCS and the end-to-end Magnetar protocol (Construction 3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+magnetar-field = { workspace = true }
+magnetar-hash = { workspace = true }
+magnetar-sumcheck = { workspace = true }
+magnetar-pcs = { workspace = true }
+magnetar-spartan = { workspace = true }
+magnetar-memory = { workspace = true }
+magnetar-router = { workspace = true }
+magnetar-cpu = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

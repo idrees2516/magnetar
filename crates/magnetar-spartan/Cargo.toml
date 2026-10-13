@@ -1,0 +1,15 @@
+[package]
+name = "magnetar-spartan"
+description = "Spartan over binary fields: R1CS, SIMD reduction (Construction 1) and Virtual Spartan (Construction 2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+magnetar-field = { workspace = true }
+magnetar-hash = { workspace = true }
+magnetar-sumcheck = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }

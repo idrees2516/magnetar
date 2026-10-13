@@ -1,0 +1,188 @@
+//! Verifier-evaluable multilinear factors for the sum-check engine.
+//!
+//! A public factor is a multilinear the *verifier* can evaluate at the final
+//! challenge point in sub-linear time (the paper's "the verifier evaluates
+//! the multilinear extensions of A, B, C on its own", Remark 3, and the
+//! BatchedEq factor of MosaicPCS §5.2). The prover materializes the same
+//! factor as a dense table to fold during the rounds.
+
+use magnetar_field::{mul, Gf128, ONE, ZERO};
+
+/// A verifier-evaluable multilinear over a fixed number of variables.
+pub trait PublicFactor: std::fmt::Debug {
+    fn num_vars(&self) -> usize;
+
+    /// Materialize the factor's values over the whole Boolean cube
+    /// (little-endian, variable 0 = LSB) — used by the prover's folding.
+    fn materialize(&self) -> Vec<Gf128>;
+
+    /// Evaluate at an arbitrary point (little-endian variable order).
+    fn eval_at(&self, point: &[Gf128]) -> Gf128;
+}
+
+/// `eq(r, ·)` — the multilinear equality factor (paper §3.1).
+#[derive(Clone, Debug)]
+pub struct EqFactor {
+    pub point: Vec<Gf128>,
+}
+
+impl EqFactor {
+    pub fn new(point: Vec<Gf128>) -> Self {
+        EqFactor { point }
+    }
+}
+
+impl PublicFactor for EqFactor {
+    fn num_vars(&self) -> usize {
+        self.point.len()
+    }
+    fn materialize(&self) -> Vec<Gf128> {
+        magnetar_field::EqBits::build(&self.point).values
+    }
+    fn eval_at(&self, point: &[Gf128]) -> Gf128 {
+        let mut acc = ONE;
+        for (&r, &x) in self.point.iter().zip(point.iter()) {
+            // eq(r, x) = 1 + r + x  (characteristic two).
+            acc = mul(acc, ONE + r + x);
+        }
+        acc
+    }
+}
+
+/// `Σ_i α_i · eq(p_i, ·)` — the MosaicPCS batching factor (paper §5.2):
+/// the verifier's α-combination of the lifted claims' equality functions.
+#[derive(Clone, Debug)]
+pub struct SumEqFactor {
+    /// (coefficient, point) pairs. All points have the same length.
+    pub items: Vec<(Gf128, Vec<Gf128>)>,
+}
+
+impl SumEqFactor {
+    pub fn new(items: Vec<(Gf128, Vec<Gf128>)>) -> Self {
+        debug_assert!(items.windows(2).all(|w| w[0].1.len() == w[1].1.len()));
+        SumEqFactor { items }
+    }
+}
+
+impl PublicFactor for SumEqFactor {
+    fn num_vars(&self) -> usize {
+        self.items.first().map(|i| i.1.len()).unwrap_or(0)
+    }
+    fn materialize(&self) -> Vec<Gf128> {
+        let nv = self.num_vars();
+        let mut table = vec![ZERO; 1 << nv];
+        for (alpha, point) in &self.items {
+            let eq = magnetar_field::EqBits::build(point).values;
+            for (t, e) in table.iter_mut().zip(eq.iter()) {
+                *t = *t + mul(*alpha, *e);
+            }
+        }
+        table
+    }
+    fn eval_at(&self, point: &[Gf128]) -> Gf128 {
+        let mut acc = ZERO;
+        for (alpha, p) in &self.items {
+            let mut e = ONE;
+            for (&r, &x) in p.iter().zip(point.iter()) {
+                e = mul(e, ONE + r + x);
+            }
+            acc = acc + mul(*alpha, e);
+        }
+        acc
+    }
+}
+
+/// A plain table both parties materialize (e.g. the α-combination of the
+/// R1CS matrix polynomials in the inner sum-check, §4.1 step 5 — the
+/// verifier builds it in `O(nnz)`).
+#[derive(Clone, Debug)]
+pub struct TableFactor {
+    pub table: Vec<Gf128>,
+    pub num_vars: usize,
+}
+
+impl TableFactor {
+    pub fn new(table: Vec<Gf128>) -> Self {
+        let num_vars = table.len().trailing_zeros() as usize;
+        TableFactor { table, num_vars }
+    }
+}
+
+impl PublicFactor for TableFactor {
+    fn num_vars(&self) -> usize {
+        self.num_vars
+    }
+    fn materialize(&self) -> Vec<Gf128> {
+        self.table.clone()
+    }
+    fn eval_at(&self, point: &[Gf128]) -> Gf128 {
+        magnetar_field::eval_mle(&self.table, point)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eq_factor_materialize_matches_eval() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        fn rg(rng: &mut impl rand::Rng) -> Gf128 {
+            Gf128(rng.gen::<u128>())
+        }
+        for nv in [1usize, 3, 5] {
+            let point: Vec<Gf128> = (0..nv).map(|_| rg(&mut rng)).collect();
+            let f = EqFactor::new(point.clone());
+            let table = f.materialize();
+            for (i, &v) in table.iter().enumerate() {
+                let bits: Vec<Gf128> = (0..nv).map(|k| Gf128(((i >> k) & 1) as u128)).collect();
+                assert_eq!(v, f.eval_at(&bits), "nv={nv} i={i}");
+            }
+            // Random point: eval = Π eq factors — cross-check with EqBits at
+            // Boolean points only (MLE uniqueness implies consistency).
+        }
+    }
+
+    #[test]
+    fn sum_eq_matches_sum_of_eq() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        fn rg(rng: &mut impl rand::Rng) -> Gf128 {
+            Gf128(rng.gen::<u128>())
+        }
+        let nv = 4;
+        let items: Vec<(Gf128, Vec<Gf128>)> = (0..3)
+            .map(|_| {
+                let p: Vec<Gf128> = (0..nv).map(|_| rg(&mut rng)).collect();
+                (rg(&mut rng), p)
+            })
+            .collect();
+        let f = SumEqFactor::new(items.clone());
+        let table = f.materialize();
+        let singles: Vec<Vec<Gf128>> = items
+            .iter()
+            .map(|(_, p)| magnetar_field::EqBits::build(p).values)
+            .collect();
+        for i in 0..(1 << nv) {
+            let mut want = ZERO;
+            for ((alpha, _), s) in items.iter().zip(singles.iter()) {
+                want = want + mul(*alpha, s[i]);
+            }
+            assert_eq!(table[i], want, "i = {i}");
+        }
+    }
+
+    #[test]
+    fn table_factor_eval() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        fn rg(rng: &mut impl rand::Rng) -> Gf128 {
+            Gf128(rng.gen::<u128>())
+        }
+        let table: Vec<Gf128> = (0..16).map(|_| rg(&mut rng)).collect();
+        let f = TableFactor::new(table.clone());
+        let point: Vec<Gf128> = (0..4).map(|_| rg(&mut rng)).collect();
+        assert_eq!(f.eval_at(&point), magnetar_field::eval_mle(&table, &point));
+    }
+}

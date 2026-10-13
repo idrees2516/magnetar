@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/magnetar-field",
+    "crates/magnetar-hash",
+    "crates/magnetar-sumcheck",
+    "crates/magnetar-pcs",
+    "crates/magnetar-spartan",
+    "crates/magnetar-memory",
+    "crates/magnetar-router",
+    "crates/magnetar-cpu",
+    "crates/magnetar-zkvm",
+    "crates/magnetar-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/magnetar-zkvm/magnetar"
+keywords = ["zkvm", "zero-knowledge", "risc-v", "post-quantum", "snark"]
+categories = ["cryptography"]
+
+[workspace.dependencies]
+magnetar-field = { path = "crates/magnetar-field" }
+magnetar-hash = { path = "crates/magnetar-hash" }
+magnetar-sumcheck = { path = "crates/magnetar-sumcheck" }
+magnetar-pcs = { path = "crates/magnetar-pcs" }
+magnetar-spartan = { path = "crates/magnetar-spartan" }
+magnetar-memory = { path = "crates/magnetar-memory" }
+magnetar-router = { path = "crates/magnetar-router" }
+magnetar-cpu = { path = "crates/magnetar-cpu" }
+magnetar-zkvm = { path = "crates/magnetar-zkvm" }
+
+# Standard, well-scrutinized hash implementations (RustCrypto / BLAKE3 team).
+sha3 = { version = "0.10", default-features = false }
+blake3 = { version = "1.5", default-features = false, features = ["std"] }
+# Parallel proving.
+rayon = { version = "1.10" }
+# Serialization / errors / hygiene.
+serde = { version = "1.0", features = ["derive"] }
+bincode = { version = "2.0", features = ["serde", "std"] }
+zeroize = { version = "1.8" }
+anyhow = { version = "1.0" }
+thiserror = { version = "1.0" }
+hex = { version = "0.4" }
+# Test-only.
+rand = { version = "0.8" }
+criterion = { version = "0.5" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+
+[profile.test]
+opt-level = 2

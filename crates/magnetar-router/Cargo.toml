@@ -1,0 +1,15 @@
+[package]
+name = "magnetar-router"
+description = "BinaryRouter: sum-check arguments for bit routings (shifts, sub-word stores)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+magnetar-field = { workspace = true }
+magnetar-hash = { workspace = true }
+magnetar-sumcheck = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
