@@ -16,7 +16,7 @@
 //! independent chunk proofs would occupy at the chunk code rate — so the
 //! dual-rate schedule's saving is a printed number, not a claim.
 
-use crate::protocol::{KeyGen, Proof, SegmentProof};
+use crate::protocol::{KeyGen, Proof, SegmentProof, VerifyingKey};
 
 /// The measured cost model of one proof.
 #[derive(Clone, Debug)]
@@ -359,5 +359,160 @@ pub fn proof_stats(pk: &KeyGen, proof: &Proof) -> ProofStats {
         bytes_per_segment,
         bytes_eval_argument,
         bytes_standalone_counterfactual: standalone,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tree-IVC aggregate measurement.
+// ---------------------------------------------------------------------------
+
+use crate::ivc::AggregateProof;
+
+/// The measured cost model of a tree-IVC aggregate: where the bytes go and
+/// what claim-batching saves (the roadmap H2 aggregation measurement, now
+/// with the continuity layer).
+#[derive(Clone, Debug)]
+pub struct AggregateStats {
+    /// The chunk count `k`.
+    pub chunks: usize,
+    /// Cycles per chunk (`2^n`).
+    pub chunk_cycles: usize,
+    /// Total proven cycles.
+    pub total_cycles: usize,
+    /// The merged commitment's committed bits.
+    pub committed_bits: usize,
+    /// The per-chunk step 3-6 transcripts, summed over the `k` chunks.
+    pub core_layer_bytes: usize,
+    /// The boundary identities: the final-state identity sum-checks, the
+    /// transmitted image values, and the continuity claims.
+    pub identity_layer_bytes: usize,
+    /// The single shared MosaicPCS evaluation argument (batching
+    /// sum-check + ring switch) — paid once instead of `k` times.
+    pub eval_layer_bytes: usize,
+    /// The public boundary data (register files and micro-PCs per chunk).
+    pub boundary_public_bytes: usize,
+    /// Everything the verifier reads: the proof plus the public boundary.
+    pub bytes_total: usize,
+    /// The evaluation argument at the **per-chunk** geometry (the merged
+    /// cube is `log2 k` deeper; the exact count a standalone chunk proof's
+    /// evaluation layer would carry).
+    pub chunk_eval_layer_bytes: usize,
+    /// `k` separate proofs' evaluation layers in total.
+    pub separate_eval_bytes: usize,
+    /// The claim-batching saving: `separate − shared`.
+    pub eval_saving_bytes: usize,
+}
+
+impl AggregateStats {
+    /// A compact human-readable report.
+    pub fn report(&self) -> String {
+        let mut s = String::new();
+        s.push_str(&format!(
+            "chunks: {} x {} cycles = {} cycles total\n",
+            self.chunks, self.chunk_cycles, self.total_cycles
+        ));
+        s.push_str(&format!(
+            "merged commitment: {} bits ({:.1} KiB)\n",
+            self.committed_bits,
+            self.committed_bits as f64 / 8192.0
+        ));
+        s.push_str(&format!(
+            "aggregate: {} bytes ({:.1} KiB) = core {} ({:.0}%) + identities {} ({:.0}%) + eval {} ({:.0}%) + boundary public {}\n",
+            self.bytes_total,
+            self.bytes_total as f64 / 1024.0,
+            self.core_layer_bytes,
+            100.0 * self.core_layer_bytes as f64 / self.bytes_total as f64,
+            self.identity_layer_bytes,
+            100.0 * self.identity_layer_bytes as f64 / self.bytes_total as f64,
+            self.eval_layer_bytes,
+            100.0 * self.eval_layer_bytes as f64 / self.bytes_total as f64,
+            self.boundary_public_bytes,
+        ));
+        s.push_str(&format!(
+            "claim-batching: the eval layer is paid ONCE — {} bytes shared vs {} bytes for {} separate proofs (saving {} bytes, {:.1}x)\n",
+            self.eval_layer_bytes,
+            self.separate_eval_bytes,
+            self.chunks,
+            self.eval_saving_bytes,
+            self.separate_eval_bytes as f64 / self.eval_layer_bytes as f64
+        ));
+        s
+    }
+}
+
+/// Count a MosaicPCS discharge's bytes **as if** the cube had `ell`
+/// variables instead of the merged `proof.ell` — the per-chunk geometry a
+/// standalone proof would carry (the batching sum-check is `ell` rounds;
+/// the ring chain and every path are `log2(merged/chunk)` levels shallower).
+fn eval_layer_bytes_at(proof: &AggregateProof, ell: usize) -> usize {
+    let r = &proof.mosaic.ring;
+    let n = (ell as isize - 7).max(0) as usize;
+    let depth_delta = proof.ell.saturating_sub(ell);
+    let mut fe = proof
+        .mosaic
+        .batch_rounds
+        .iter()
+        .take(ell)
+        .map(|m| m.len())
+        .sum::<usize>()
+        + 1;
+    fe += (r.level_roots.len().saturating_sub(depth_delta)) * (32 / 16);
+    for q in &r.queries {
+        for lv in q.levels.iter().take(n) {
+            fe += 2
+                + (lv.a_path.len().saturating_sub(depth_delta)
+                    + lv.b_path.len().saturating_sub(depth_delta))
+                    * (32 / 16);
+        }
+    }
+    for (_v, path) in &r.tail {
+        fe += 1 + path.len().saturating_sub(depth_delta) * (32 / 16);
+    }
+    for a in &r.anchors {
+        fe += 1
+            + (a.main_path.len().saturating_sub(depth_delta)
+                + a.c_path.len().saturating_sub(depth_delta))
+                * (32 / 16);
+    }
+    fe * 16
+}
+
+/// Measure a tree-IVC aggregate's cost model.
+pub fn aggregate_stats(vk: &VerifyingKey, proof: &AggregateProof) -> AggregateStats {
+    let k = proof.chunks.len();
+    let mut core_bytes = 0usize;
+    for ch in &proof.chunks {
+        let mut total = 0usize;
+        count_fields_segment(&ch.core, &mut |_, n| total += n * 16);
+        core_bytes += total;
+    }
+    // The boundary identities: the two sum-checks per chunk plus the
+    // transmitted (final, init) values and the continuity claims.
+    let mut identity_bytes = 0usize;
+    for ch in &proof.chunks {
+        let id_n = |i: &crate::ivc::StateIdentityProof| -> usize {
+            i.rounds.iter().map(|m| m.len()).sum::<usize>() + 2
+        };
+        identity_bytes += (id_n(&ch.ram_state) + id_n(&ch.reg_state)) * 16;
+    }
+    identity_bytes += proof.ram_state_values.len() * 2 * 16;
+    identity_bytes += proof.cont_values.len() * 2 * 16;
+    let eval_bytes = eval_layer_bytes_at(proof, proof.ell);
+    let chunk_eval = eval_layer_bytes_at(proof, vk.mosaic.ell);
+    let boundary_bytes = k * (2 * crate::ivc::BOUNDARY_WORDS + 2) * 8 + 32 + 8;
+    let total = core_bytes + identity_bytes + eval_bytes + boundary_bytes;
+    AggregateStats {
+        chunks: k,
+        chunk_cycles: vk.trace_len,
+        total_cycles: k * vk.trace_len,
+        committed_bits: 1usize << proof.ell,
+        core_layer_bytes: core_bytes,
+        identity_layer_bytes: identity_bytes,
+        eval_layer_bytes: eval_bytes,
+        boundary_public_bytes: boundary_bytes,
+        bytes_total: total,
+        chunk_eval_layer_bytes: chunk_eval,
+        separate_eval_bytes: chunk_eval * k,
+        eval_saving_bytes: (chunk_eval * k).saturating_sub(eval_bytes),
     }
 }

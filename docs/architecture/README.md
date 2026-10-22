@@ -55,3 +55,4 @@ the composition. If you are adding a feature: start at `protocol.md`, find
 the step your feature touches, and follow the claim chain downward. If you
 are benchmarking: `cost-model.md` is the map of what the instrumented CLI
 prints.
+- [The tree-IVC layer](../ivc.md) — chunked proving with state continuity and claim-batching (the roadmap H2 aggregation with the continuity arguments)

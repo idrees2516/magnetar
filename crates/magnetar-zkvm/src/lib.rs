@@ -35,12 +35,16 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod ivc;
 pub mod mosaic;
 pub mod protocol;
 pub mod rom;
 pub mod stats;
 
 pub use mosaic::{MosaicClaim, MosaicCommitment, MosaicLayout, MosaicProof};
-pub use protocol::{keygen, keygen_with, prove, verify, KeyGen, Proof, PublicInput, VerifyingKey};
+pub use protocol::{
+    keygen, keygen_aggregate, keygen_chunked, keygen_chunked_with, keygen_with, prove, prove_multi,
+    verify, verify_multi, KeyGen, Proof, PublicInput, VerifyingKey,
+};
 pub use rom::RomTables;
 pub use stats::{proof_stats, ProofStats};

@@ -105,6 +105,74 @@ pub struct PublicInput {
 /// The single-segment proof carries one of these; the aggregated proof
 /// carries one per segment, all discharged against the ONE commitment.
 #[derive(Clone)]
+
+/// The per-chunk proving/verifying context: everything that differs
+/// between a fresh statement segment and a tree-IVC chunk.
+///
+/// * `output` — the halt-latch output binding (the last chunk's claimed
+///   output; interior chunks publish 0).
+/// * `input_words` — chunk 0's public input words (interior chunks:
+///   empty); they populate the circuit's public columns after the output.
+/// * `ram_words` — the chunk's entry RAM image in words (the memory
+///   argument's `M0` source). Chunk 0's image is the public input; an
+///   interior chunk's image is the previous chunk's exit state, carried
+///   by the committed `ram-init` component (not verifier-known).
+/// * `ram_m0_public` — whether the entry RAM image is verifier-known.
+///   When false the RAM Twist transmits its `M0` claims and the
+///   final-state identity binds them to the commitment.
+/// * `regs_m0` — the register file's public entry image as a bit table
+///   over `(k, o)` (64 cells x 64 bits; x0 and cells 33..64 are zero).
+pub struct ChunkCtx<'a> {
+    pub output: u64,
+    pub input_words: &'a [u64],
+    pub ram_words: &'a [u64],
+    pub ram_m0_public: bool,
+    pub regs_m0: Vec<Gf128>,
+}
+
+impl<'a> ChunkCtx<'a> {
+    /// The fresh-statement context (a public input image, a zero register
+    /// file) — what a single-chunk or aggregated segment runs with.
+    pub fn fresh(pub_in: &'a PublicInput) -> Self {
+        ChunkCtx {
+            output: pub_in.output,
+            input_words: &pub_in.input,
+            ram_words: &pub_in.input,
+            ram_m0_public: true,
+            regs_m0: vec![ZERO; 1 << 12],
+        }
+    }
+}
+
+/// Build the RAM image bit table over `(k, o)` (address low, bit high)
+/// from the word image.
+pub(crate) fn ram_image_bits(words: &[u64]) -> Vec<Gf128> {
+    let mut t0 = vec![ZERO; 1usize << 14];
+    for (k, &w) in words.iter().enumerate() {
+        if k < (1usize << 8) {
+            for o in 0..64usize {
+                t0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
+            }
+        }
+    }
+    t0
+}
+
+/// Build the register-file image bit table over `(k, o)` (cell low, bit
+/// high) from the boundary words `x0..x31` plus the trash cell (word 32).
+pub(crate) fn regs_image_bits(words: &[u64]) -> Vec<Gf128> {
+    let mut t0 = vec![ZERO; 1usize << 12];
+    for (k, &w) in words.iter().enumerate() {
+        if k < 64 {
+            for o in 0..64usize {
+                t0[k | (o << 6)] = Gf128(((w >> o) & 1) as u128);
+            }
+        }
+    }
+    t0
+}
+
+#[derive(Clone, Debug)]
 pub struct SegmentProof {
     /// Virtual Spartan's proof.
     pub vs: VirtualSpartanProof,
@@ -194,6 +262,33 @@ const SEGMENTS: &[(&str, usize, bool)] = &[
     ("eqaux", 64, true),
 ];
 
+/// Derive the keys for the tree-IVC chunked layout: every chunk commits
+/// its entry and exit RAM images (`ram-init` / `ram-final`) alongside the
+/// standard components, so the aggregate can chain memory across chunks.
+/// The chunk count is dynamic (the program runs until halt), so the
+/// per-chunk layout carries no segment-index dimension.
+pub fn keygen_chunked(program: Vec<u32>, trace_len: usize) -> (KeyGen, VerifyingKey) {
+    keygen_chunked_with(program, trace_len, AMOUNT_BITS, PcsParams::default())
+}
+
+/// The chunked keygen with explicit parameters.
+pub fn keygen_chunked_with(
+    program: Vec<u32>,
+    trace_len: usize,
+    amount_bits: usize,
+    pcs: PcsParams,
+) -> (KeyGen, VerifyingKey) {
+    let mut out = keygen_with(program, trace_len, amount_bits, pcs);
+    out.0.mosaic = MosaicLayout::build(mosaic_components(
+        trace_len.trailing_zeros() as usize,
+        out.0.rom.a_rom,
+        0,
+        true,
+    ));
+    out.1.mosaic = out.0.mosaic.clone();
+    out
+}
+
 /// Derive the keys from the public program.
 pub fn keygen(program: Vec<u32>, trace_len: usize) -> (KeyGen, VerifyingKey) {
     keygen_with(program, trace_len, AMOUNT_BITS, PcsParams::default())
@@ -236,7 +331,7 @@ pub fn keygen_with(
     let rom = RomTables::build(&expanded.rows, amount_bits);
     let n = trace_len.trailing_zeros() as usize;
     let a_rom = rom.a_rom;
-    let mosaic = MosaicLayout::build(mosaic_components(n, a_rom, 0));
+    let mosaic = MosaicLayout::build(mosaic_components(n, a_rom, 0, false));
     let shift_tensor = build_shift_tensor(64, amount_bits);
     let store_tensor = build_store_tensor(64);
     let pk = KeyGen {
@@ -315,7 +410,7 @@ pub fn keygen_aggregate(
     let rom = RomTables::build(&expanded.rows, amount_bits);
     let n = trace_len.trailing_zeros() as usize;
     let a_rom = rom.a_rom;
-    let mosaic = MosaicLayout::build(mosaic_components(n, a_rom, idx_bits));
+    let mosaic = MosaicLayout::build(mosaic_components(n, a_rom, idx_bits, false));
     let shift_tensor = build_shift_tensor(64, amount_bits);
     let store_tensor = build_store_tensor(64);
     let pk = KeyGen {
@@ -349,7 +444,12 @@ pub fn keygen_aggregate(
 
 /// The Mosaic component list (the direct segments then the auxiliary
 /// polynomials), at a trace length `2^n`.
-fn mosaic_components(n: usize, a_rom: usize, idx_bits: usize) -> Vec<crate::mosaic::ComponentSpec> {
+fn mosaic_components(
+    n: usize,
+    a_rom: usize,
+    idx_bits: usize,
+    chunked: bool,
+) -> Vec<crate::mosaic::ComponentSpec> {
     use crate::mosaic::ComponentSpec;
     // With claim aggregation, every component's subcube gains the segment
     // index dimension: the component's table becomes the concatenation of
@@ -383,27 +483,39 @@ fn mosaic_components(n: usize, a_rom: usize, idx_bits: usize) -> Vec<crate::mosa
         // The bytecode BinaryShout's fetch-address component.
         seg("fetch-ra", a_rom),
     ];
+    if chunked {
+        // The tree-IVC state components: the chunk's entry/exit RAM images
+        // as bit tables over (k, o) — 14 vars, no cycle dimension.
+        v.push(ComponentSpec {
+            name: "ram-init".to_string(),
+            vars: 14,
+        });
+        v.push(ComponentSpec {
+            name: "ram-final".to_string(),
+            vars: 14,
+        });
+    }
     let _ = &mut v;
     v
 }
 
 /// One prover-side witness bundle.
-struct WitnessData {
-    joint_z: Vec<Gf128>,
+pub(crate) struct WitnessData {
+    pub(crate) joint_z: Vec<Gf128>,
     /// The direct component tables (bits), in Mosaic order.
-    direct_tables: Vec<Vec<bool>>,
+    pub(crate) direct_tables: Vec<Vec<bool>>,
     /// The register Twist's witness.
-    reg_wit: TwistWitness,
+    pub(crate) reg_wit: TwistWitness,
     /// The RAM Twist's witness.
-    ram_wit: TwistWitness,
+    pub(crate) ram_wit: TwistWitness,
     /// The fetch component.
-    fetch_comp: magnetar_memory::AddressComponent,
+    pub(crate) fetch_comp: magnetar_memory::AddressComponent,
 }
 
 /// Assemble the witness from the trace.
-fn build_witness(
+pub(crate) fn build_witness(
     pk: &KeyGen,
-    pub_in: &PublicInput,
+    ctx: &ChunkCtx,
     trace: &magnetar_cpu::interp::Trace,
 ) -> WitnessData {
     let q = pk.trace_len;
@@ -414,8 +526,8 @@ fn build_witness(
     // The public x vector per cycle.
     let public_x: Vec<Gf128> = {
         let mut v = vec![ZERO; m / 2 - 1];
-        v[0] = Gf128(pub_in.output as u128);
-        for (i, &w) in pub_in.input.iter().enumerate() {
+        v[0] = Gf128(ctx.output as u128);
+        for (i, &w) in ctx.input_words.iter().enumerate() {
             if 1 + i < v.len() {
                 v[1 + i] = Gf128(w as u128);
             }
@@ -657,7 +769,8 @@ pub fn prove_multi(pk: &KeyGen, pub_ins: &[PublicInput]) -> Proof {
             pk.trace_len,
             "the trace must fill the witness cube exactly"
         );
-        let wd = build_witness(pk, pub_in, &trace);
+        let ctx = ChunkCtx::fresh(pub_in);
+        let wd = build_witness(pk, &ctx, &trace);
         wds.push((trace, wd));
     }
     // ---- 2. Commit: the concatenated component tables, ONE commitment.
@@ -691,7 +804,8 @@ pub fn prove_multi(pk: &KeyGen, pub_ins: &[PublicInput]) -> Proof {
     let mut seg_proofs = Vec::with_capacity(pub_ins.len());
     let mut claims: Vec<MosaicClaim> = Vec::new();
     for (s, (trace, wd)) in wds.iter().enumerate() {
-        let (sp, local_claims) = prove_segment_body(pk, &pub_ins[s], wd, trace, &mut t);
+        let ctx = ChunkCtx::fresh(&pub_ins[s]);
+        let (sp, local_claims) = prove_segment_body(pk, &ctx, wd, trace, &mut t);
         for c in local_claims {
             claims.push(lift_claim_with_segment(c, s, pk.idx_bits));
         }
@@ -714,9 +828,9 @@ pub fn prove_multi(pk: &KeyGen, pub_ins: &[PublicInput]) -> Proof {
 /// checks), returning the segment body and its local Mosaic claims (the
 /// caller lifts them through the index dimension).
 #[allow(clippy::too_many_arguments)]
-fn prove_segment_body(
+pub(crate) fn prove_segment_body(
     pk: &KeyGen,
-    pub_in: &PublicInput,
+    ctx: &ChunkCtx,
     wd: &WitnessData,
     trace: &magnetar_cpu::interp::Trace,
     t: &mut Transcript,
@@ -749,7 +863,8 @@ fn prove_segment_body(
         ell: 6,
         n,
         p: 2,
-        m0: vec![ZERO; 1 << 12],
+        m0: ctx.regs_m0.clone(),
+        m0_public: true,
         rv_claims: vec![seg("rs1").value, seg("rs2").value],
         wv_claim: seg("rd").value,
         r_val: r_val.clone(),
@@ -779,7 +894,7 @@ fn prove_segment_body(
     // The write-value claim: the new word per cycle (stores) or the
     // current content of cell 0 (no-op writes).
     let ram_wv_claim: Gf128 = {
-        let mut cell0: u64 = pub_in.input.first().copied().unwrap_or(0);
+        let mut cell0: u64 = ctx.ram_words.first().copied().unwrap_or(0);
         let mut acc = ZERO;
         let eq_v = magnetar_field::EqBits::build(&r_val).values;
         let eq_c = magnetar_field::EqBits::build(&r_inst).values;
@@ -803,23 +918,14 @@ fn prove_segment_body(
         }
         acc
     };
-    let ram_m0: Vec<Gf128> = {
-        let mut t0 = vec![ZERO; 1usize << 14];
-        for (k, &w) in pub_in.input.iter().enumerate() {
-            if k < (1usize << 8) {
-                for o in 0..64usize {
-                    t0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
-                }
-            }
-        }
-        t0
-    };
+    let ram_m0: Vec<Gf128> = ram_image_bits(ctx.ram_words);
     let ram_inst = TwistInstance {
         a: 8,
         ell: 6,
         n,
         p: 1,
         m0: ram_m0,
+        m0_public: ctx.ram_m0_public,
         rv_claims: vec![seg("load-val").value],
         wv_claim: ram_wv_claim,
         r_val: r_val.clone(),
@@ -1308,7 +1414,7 @@ fn shift_selector_tables(
 /// The stage-selector sum-check's Mosaic inputs (symmetric on both sides:
 /// the prover's bound points and terminals, the verifier's recomputed
 /// claims).
-struct StageMosaicInputs {
+pub(crate) struct StageMosaicInputs {
     rho_k: Vec<Gf128>,
     r_j: Vec<Gf128>,
     b: Gf128,
@@ -1318,7 +1424,7 @@ struct StageMosaicInputs {
 /// Collect every Mosaic claim (the same collection on both sides; the
 /// claim values and points come from symmetric proof structures).
 #[allow(clippy::too_many_arguments)]
-fn collect_mosaic_claims(
+pub(crate) fn collect_mosaic_claims(
     layout: &SegmentLayout,
     mosaic: &MosaicLayout,
     n: usize,
@@ -1421,6 +1527,11 @@ fn collect_mosaic_claims(
     }
     for c in &ram_claims.inc {
         out.push(MosaicClaim::new(idx("ram-inc"), c.point.clone(), c.value));
+    }
+    // The transmitted entry-image claims (the tree-IVC chunks; empty when
+    // the entry image is public).
+    for c in &ram_claims.m0 {
+        out.push(MosaicClaim::new(idx("ram-init"), c.point.clone(), c.value));
     }
     for (port, per) in ram_claims.st1.iter().enumerate() {
         for c in per {
@@ -1563,7 +1674,8 @@ pub fn verify_multi(
     // Every segment's body, then the lifted claims.
     let mut claims: Vec<MosaicClaim> = Vec::new();
     for (s, (pub_in, seg)) in pub_ins.iter().zip(proof.segments.iter()).enumerate() {
-        let local = verify_segment_body(vk, pub_in, seg, &mut t)?;
+        let ctx = ChunkCtx::fresh(pub_in);
+        let local = verify_segment_body(vk, &ctx, seg, &mut t)?;
         for c in local {
             claims.push(lift_claim_with_segment(c, s, vk.idx_bits));
         }
@@ -1587,9 +1699,9 @@ pub fn verify_multi(
 
 /// Verify one segment's steps 3–6; returns the segment's local Mosaic
 /// claims (lifted by the caller).
-fn verify_segment_body(
+pub(crate) fn verify_segment_body(
     vk: &VerifyingKey,
-    pub_in: &PublicInput,
+    ctx: &ChunkCtx,
     segp: &SegmentProof,
     t: &mut Transcript,
 ) -> Result<Vec<MosaicClaim>, &'static str> {
@@ -1599,8 +1711,8 @@ fn verify_segment_body(
     let a_rom = vk.rom.a_rom;
     let public: Vec<Vec<Gf128>> = {
         let mut v = vec![ZERO; m / 2 - 1];
-        v[0] = Gf128(pub_in.output as u128);
-        for (i, &w) in pub_in.input.iter().enumerate() {
+        v[0] = Gf128(ctx.output as u128);
+        for (i, &w) in ctx.input_words.iter().enumerate() {
             if 1 + i < v.len() {
                 v[1 + i] = Gf128(w as u128);
             }
@@ -1631,7 +1743,8 @@ fn verify_segment_body(
         ell: 6,
         n,
         p: 2,
-        m0: vec![ZERO; 1 << 12],
+        m0: ctx.regs_m0.clone(),
+        m0_public: true,
         rv_claims: vec![seg("rs1").value, seg("rs2").value],
         wv_claim: seg("rd").value,
         r_val: r_val.clone(),
@@ -1659,23 +1772,14 @@ fn verify_segment_body(
         )?;
     }
     // ---- 4b. The RAM Twist.
-    let ram_m0: Vec<Gf128> = {
-        let mut t0 = vec![ZERO; 1usize << 14];
-        for (k, &w) in pub_in.input.iter().enumerate() {
-            if k < (1usize << 8) {
-                for o in 0..64usize {
-                    t0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
-                }
-            }
-        }
-        t0
-    };
+    let ram_m0: Vec<Gf128> = ram_image_bits(ctx.ram_words);
     let ram_inst = TwistInstance {
         a: 8,
         ell: 6,
         n,
         p: 1,
         m0: ram_m0,
+        m0_public: ctx.ram_m0_public,
         rv_claims: vec![seg("load-val").value],
         wv_claim: segp.ram_wv_claim,
         r_val: r_val.clone(),

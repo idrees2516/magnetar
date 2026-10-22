@@ -21,6 +21,7 @@ lever swaps in at a crate boundary without touching the protocol
 | Full Construction 3 (7-step protocol, all claims through ONE commitment) | done, 75 tests, tamper classes | `protocol.rs` |
 | Register-shift **stage-select** (the documented extension) | done — the trash-cell stage chain, the `sel_stage` ROM one-hot, the stage-selector sum-check, additive claim composition | `cpu/expand.rs`, `zkvm/rom.rs`, `memory/discharge.rs`, `protocol.rs` |
 | **Claim aggregation** (Horizon 2, "aggregation before the wrap") | done — K segments, ONE commitment, ONE evaluation argument; measured 3.46x at K=4 | `prove_multi`, `docs/architecture/mosaic.md` |
+| **Tree-IVC continuity** (Horizon 2, chunks of one execution) | done — dynamic-k chunks, boundary identities, committed RAM images, one shared commitment; measured 3.8x in the eval layer | `ivc`, `docs/ivc.md` |
 | **Dual-rate schedule** (Horizon 1/2) | done — `PcsParams::chunk()` (1/2) / `wrap()` (1/4), measured by the CLI | `pcs/eval.rs`, `cost-model.md` |
 | Measured cost model | done — committed-bit inventory, byte breakdown, the aggregation ledger, the standalone counterfactual | `stats.rs` |
 | Production hardening | done — CI (fmt, clippy `-D warnings`, tests, CLI smoke), SECURITY/CONTRIBUTING/CHANGELOG, dependabot, issue/PR templates, the indexed docs site | repo root |
@@ -61,12 +62,15 @@ end-to-end/base ratio 0.85–0.95 (vs Airbender's 0.39 recursion tax).
   shared commitment + single discharge). The byte-dominant evaluation
   argument is now paid once per batch, and the cost model prints the
   saving. What remains is the *continuity* flavor:
-* **Tree-IVC across chunks of one execution** — segment i+1's initial
-  RAM = segment i's final RAM, chained in a binary tree with
-  claim-batching at each internal node (the roadmap's recommended
-  schedule). The aggregation layout is the substrate; the missing
-  piece is the cross-segment state hand-off argument (the paper's
-  §6.2 sketch). Design note: our segments share ONE commitment, so the
+* **Tree-IVC across chunks of one execution** — **landed**
+  (`magnetar-zkvm::ivc`, `docs/ivc.md`): the cross-chunk state hand-off
+  is proven, not trusted — published register files and micro-PCs bound
+  by the final-state identity sum-check against the committed write log,
+  RAM carried by committed `ram-init`/`ram-final` image components with
+  claimed-M0 twists and per-boundary continuity checks at random points,
+  and the dynamic-k chunk merge into ONE commitment with ONE evaluation
+  argument (the eval layer paid once, measured 3.8x). What remains is
+  the recursive wrap that collapses the per-chunk step 3-6 transcripts. Design note: our segments share ONE commitment, so the
   tree schedule is a *prover memory* strategy (fold pairwise, commit
   once) rather than a proof-structure change.
 * **The verifier-guest + low-rate wrap** — the flagship: prove

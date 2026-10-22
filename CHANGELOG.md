@@ -63,6 +63,44 @@
 - `ROADMAP.md` — the implemented-status table, the horizon program, and
   the 150M-cycles/s GPU study's build order as the future plans.
 
+
+### Tree-IVC: chunks share one commitment (the continuity layer)
+
+- **The tree-IVC layer** (`magnetar-zkvm::ivc`, `docs/ivc.md`): a long
+  execution is cut into chunks at RV64I instruction boundaries
+  (`execute_chunk`; the cut never splits a register-shift stage sequence)
+  and each chunk is proven through the shared `SegmentProof` body on one
+  coordinator-ordered transcript.
+- **Boundary continuity**: the register files (x0..x31 + the trash cell)
+  and micro-PCs are published per chunk and bound by a final-state
+  identity sum-check (`exit = entry + Σ wfa·inc`, the sparse prover)
+  against the committed write log; the micro-PC by fetch-component claims
+  at the first/last cycle's Boolean points.
+- **RAM continuity without publishing the state**: each chunk commits
+  `ram-init`/`ram-final` image components; the RAM BinaryTwist gains a
+  claimed-M0 mode (its `M̂0` evaluations are transmitted and discharged
+  against `ram-init`); chunk 0's identity pins the entry image to the
+  public input; every boundary checks
+  `ram-final_b + ram-init_{b+1} = 0` at a random point.
+- **Claim-batching at the tree node**: the k chunk layouts merge into
+  one Mosaic cube (dynamic k — the merged layout concatenates the
+  per-chunk component lists) and ONE BLAKE3 commitment; a single
+  MosaicPCS evaluation argument discharges every claim of every chunk.
+  Measured: the eval layer (60% of the aggregate) is paid once — 3.8x
+  fewer bytes than k separate proofs (`magnetar chunked 32 96`).
+- **The boundary padding invariant**: the write port's one-hot targets
+  the fetched row's redirected rd (the bytecode Shout binds it to the
+  bus slice), so the frozen-PC padding writes that cell — the identity
+  write (the cell's own content, zero increment) at mid-program
+  boundaries, the latched output on halted machines. Pinned by
+  write-log consistency regressions.
+- New: `keygen_chunked`, `magnetar chunked`, and `aggregate_stats` (the
+  aggregate cost model: core/identity/eval layers + the batching saving
+  on the exact per-chunk geometry).
+- 16 new tests: cross-chunk RAM + register carryover, the public-input
+  pin, single-chunk compatibility, a five-chunk fibonacci, two write-log
+  consistency regressions, the cost model, and ten tamper classes.
+
 ## 0.2.0 (unreleased)
 
 ### The complete protocol

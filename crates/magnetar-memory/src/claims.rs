@@ -32,6 +32,12 @@ pub struct TwistPcsClaims {
     pub recon_wfa: Vec<Vec<PcsPoint>>,
     /// Increment claims from the reconstruction sum-checks: `[run]`.
     pub inc: Vec<PcsPoint>,
+    /// Transmitted initial-memory claims from the reconstruction
+    /// sum-checks: `[run]` at the run's `(r_k ‖ r_v)` point — non-empty
+    /// only when the instance's memory is not public (the tree-IVC
+    /// committed-entry-image mode; the zkvm layer discharges them against
+    /// the `ram-init` Mosaic component).
+    pub m0: Vec<PcsPoint>,
     /// Sum-to-one terminals: `[port][component]`.
     pub st1: Vec<Vec<PcsPoint>>,
     /// Δ\* terminals: `[port][component]` — the claim at `r` and at `r'`.

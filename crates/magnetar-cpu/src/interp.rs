@@ -12,7 +12,7 @@
 //! the byte at `off`, `LH/LHU` the two bytes at `off` and `(off+1) mod 8`
 //! (well-defined for every offset), `LW/LD` the full word.
 
-use crate::expand::{expand_program, ExpandedProgram, VirtualKind};
+use crate::expand::{expand_program, ExpandedProgram, VirtualKind, SHIFT_STAGES};
 use crate::{Word, RAM_WORDS_LOG2, REGS};
 
 /// Machine state (Harvard architecture: separate ROM and RAM).
@@ -213,6 +213,124 @@ pub fn execute_padded(program: &[u32], input: &[Word], max_cycles: usize, pad_to
     }
     trace.final_state = st;
     trace
+}
+
+/// Execute up to `max_cycles` virtual cycles from a given machine state —
+/// the tree-IVC chunk entry point. The trace is padded to a power of two
+/// with **frozen-PC no-op cycles**: each padding cycle fetches the ROM row
+/// at the frozen exit micro-PC (so the PC column carries the exit address
+/// the boundary argument binds), writes the trash cell (32) with the
+/// latched output, and leaves every architectural register and RAM word
+/// unchanged. The logged values are the machine's current contents, so
+/// the memory arguments stay consistent.
+pub fn execute_from(program: &[u32], start: ExecState, max_cycles: usize) -> Trace {
+    let prog = expand_program(program);
+    let mut st = start;
+    let mut records = Vec::new();
+    while !st.halted && st.cycles < max_cycles {
+        let rec = step(&prog, &mut st);
+        records.push(rec);
+        st.cycles += 1;
+    }
+    pad_frozen(&prog, &mut st, &mut records, None);
+    Trace {
+        program: prog,
+        records,
+        final_state: st,
+    }
+}
+
+/// Execute one tree-IVC chunk: run until the cycle budget is exhausted at a
+/// **safe instruction boundary** (never inside a register-shift stage
+/// sequence, whose intermediate stages chain through x0's scratch slot), or
+/// until the machine halts — then pad to exactly `pad_to` cycles.
+///
+/// The budget overrun is bounded by the longest expansion (the 6-stage
+/// register shifts), so `pad_to` must exceed the budget by that margin.
+pub fn execute_chunk(program: &[u32], start: ExecState, max_cycles: usize, pad_to: usize) -> Trace {
+    assert!(pad_to.is_power_of_two() && pad_to >= 2);
+    let prog = expand_program(program);
+    let mut st = start;
+    let mut records = Vec::new();
+    loop {
+        if st.halted {
+            break;
+        }
+        let rec = step(&prog, &mut st);
+        let at_boundary = at_instruction_boundary(&prog, &rec);
+        records.push(rec);
+        st.cycles += 1;
+        if st.cycles >= max_cycles && at_boundary {
+            break;
+        }
+    }
+    pad_frozen(&prog, &mut st, &mut records, Some(pad_to));
+    Trace {
+        program: prog,
+        records,
+        final_state: st,
+    }
+}
+
+/// Whether the cycle just executed completes its RV64I instruction: a
+/// non-shift row always does; a register-shift stage row only at its last
+/// stage (the earlier stages chain through the scratch slot).
+fn at_instruction_boundary(prog: &ExpandedProgram, rec: &CycleRecord) -> bool {
+    let row = &prog.rows[rec.micro_pc % prog.rows.len()];
+    match row.row.kind {
+        VirtualKind::ShiftStage { stage } => stage + 1 == SHIFT_STAGES,
+        _ => true,
+    }
+}
+
+/// Pad the trace to a power of two (or exactly `target`) with frozen-PC
+/// no-op cycles.
+///
+/// The write port's one-hot targets the ROM row's redirected destination
+/// (the bytecode Shout binds it to the bus's rd slice), so the padding
+/// writes **that cell**: the halt-latch padding (a halted machine) writes
+/// the latched output; a mid-program boundary padding writes the cell's
+/// current content back — a true zero-increment no-op that leaves the
+/// architectural state untouched for the next chunk.
+fn pad_frozen(
+    prog: &ExpandedProgram,
+    st: &mut ExecState,
+    records: &mut Vec<CycleRecord>,
+    target: Option<usize>,
+) {
+    let want = target.unwrap_or_else(|| records.len().next_power_of_two().max(1));
+    while records.len() < want {
+        let frozen = records.last().map(|r| r.next_pc).unwrap_or(0);
+        let row = &prog.rows[frozen % prog.rows.len()].row;
+        let write_addr = if row.rd == 0 { 32 } else { row.rd };
+        let halted = st.halted;
+        let rd_val = if halted {
+            st.output
+        } else {
+            st.regs[write_addr] // the identity write: zero increment
+        };
+        let rec = CycleRecord {
+            micro_pc: frozen,
+            rs1_val: st.regs[row.rs1 % REGS],
+            rs2_val: st.regs[row.rs2 % REGS],
+            next_pc: frozen,
+            rd: write_addr,
+            rd_old: st.regs[write_addr],
+            rd_val,
+            halted_latch: halted,
+            ram_addr: 0,
+            ram_word: st.ram[0],
+            alu_a: st.regs[row.rs1 % REGS],
+            alu_b: st.regs[row.rs2 % REGS],
+            ..Default::default()
+        };
+        records.push(rec);
+        if halted {
+            // The halt-latch write so later padding reads agree with the
+            // memory argument's evolution.
+            st.regs[write_addr] = st.output;
+        }
+    }
 }
 
 fn step(prog: &ExpandedProgram, st: &mut ExecState) -> CycleRecord {

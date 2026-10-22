@@ -3,8 +3,9 @@
 //! the dual-rate PCS schedule.
 
 use magnetar_pcs::PcsParams;
+use magnetar_zkvm::ivc::{prove_chunked, verify_chunked};
 use magnetar_zkvm::protocol::{
-    keygen, keygen_aggregate, prove, prove_multi, verify, verify_multi, PublicInput,
+    keygen, keygen_aggregate, keygen_chunked, prove, prove_multi, verify, verify_multi, PublicInput,
 };
 use std::time::Instant;
 
@@ -15,6 +16,10 @@ fn main() {
         Some("agg") => cmd_agg(
             args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4),
             args.get(3).map(|s| s.as_str()),
+        ),
+        Some("chunked") => cmd_chunked(
+            args.get(2).and_then(|s| s.parse().ok()).unwrap_or(32),
+            args.get(3).and_then(|s| s.parse().ok()).unwrap_or(96),
         ),
         Some("check") => cmd_check(),
         _ => {
@@ -140,4 +145,56 @@ fn cmd_agg(segments: usize, rate: Option<&str>) {
 fn cmd_check() {
     println!("Running the proof-stack self-test (cargo test handles this in CI).");
     println!("See `cargo test --workspace` for the full suite.");
+}
+
+fn cmd_chunked(chunk_cycles: usize, total_cycles: usize) {
+    // A straight-line Fibonacci-style body spanning several chunks: the
+    // register file carries the accumulator across every boundary.
+    let chunk_cycles = chunk_cycles.max(16).next_power_of_two();
+    let mut program = vec![
+        enc_i(1, 0, 0, 1, 0x13), // x1 = 1
+        enc_i(1, 0, 0, 2, 0x13), // x2 = 1
+    ];
+    let iters = total_cycles.max(8) / 3;
+    for _ in 0..iters {
+        program.push((2u32 << 20) | (1 << 15) | (3 << 7) | 0x33); // x3 = x1 + x2
+        program.push((2 << 15) | (1 << 7) | 0x33); // x1 = x2
+        program.push(enc_i(0, 3, 0, 2, 0x13)); // x2 = x3
+    }
+    program.push((3 << 15) | (10 << 7) | 0x33); // x10 = x3
+    program.push(0x0000_0073); // ecall
+
+    // The interpreter determines the program's true output.
+    let trace = magnetar_cpu::interp::execute(&program, &[], program.len() * 4 + 64);
+    let output = trace.final_state.output;
+
+    let (pk, vk) = keygen_chunked(program, chunk_cycles);
+    let pub_in = PublicInput {
+        input: vec![],
+        output,
+    };
+    println!("Magnetar tree-IVC — chunk size {chunk_cycles} cycles, program output = {output}");
+    let t0 = Instant::now();
+    let (proof, public) = prove_chunked(&pk, &pub_in, 64);
+    let prove_ms = t0.elapsed().as_millis();
+    let k = proof.chunks.len();
+
+    let t1 = Instant::now();
+    let v = verify_chunked(&vk, &pub_in, &public, &proof);
+    let verify_ms = t1.elapsed().as_millis();
+    if let Err(e) = &v {
+        eprintln!("verify error: {e}");
+    }
+
+    println!(
+        "{k} chunks ({k} x {chunk_cycles} = {} cycles), prove: {prove_ms} ms, verify: {verify_ms} ms, accepted: {}",
+        k * chunk_cycles,
+        v.is_ok()
+    );
+    // The measured aggregation win (the roadmap H2 cost model).
+    let stats = magnetar_zkvm::stats::aggregate_stats(&vk, &proof);
+    println!("{}", stats.report());
+    if !v.is_ok() {
+        std::process::exit(1);
+    }
 }

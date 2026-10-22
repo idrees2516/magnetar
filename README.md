@@ -75,6 +75,16 @@ field/utils/proof/arith/cpu split), one crate per component:
   components' subcubes gain the `log2(K)` index dimension) and ONE
   evaluation argument. `magnetar agg 4` proves 4 executions of a
   program against one commitment and prints the amortization ledger.
+* **Tree-IVC** — `keygen_chunked` + `prove_chunked`/`verify_chunked`
+  ([`docs/ivc.md`](docs/ivc.md)): a long execution is cut into chunks at
+  instruction boundaries; the state crosses every boundary through
+  arguments — published register files and micro-PCs bound by the
+  final-state identity sum-check, RAM carried by committed
+  `ram-init`/`ram-final` image components with claimed-M0 twists and
+  per-boundary continuity checks at random points — and the `k` chunks
+  merge into ONE Mosaic cube and ONE commitment with a single shared
+  evaluation argument. `magnetar chunked 32 96` proves 5 chunks and
+  prints the batching win (the eval layer paid once, 3.8x).
 * **Dual-rate PCS schedule** — `PcsParams::chunk()` (rate 1/2, internal
   artifacts: half the commit work, one level shorter paths) vs
   `PcsParams::wrap()` (rate 1/4, the conservative public profile);

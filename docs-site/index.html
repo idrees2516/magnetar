@@ -197,6 +197,23 @@
       </ol>
     </section>
 
+    <section id="ivc">
+      <h2>Tree-IVC: chunks share one commitment</h2>
+      <p>
+        Long executions are cut into chunks at instruction boundaries and proven on one
+        coordinator-ordered transcript. The machine state crosses every boundary through
+        arguments, not trust: register files and micro-PCs are published per chunk and bound
+        by a final-state identity sum-check against the committed write log; RAM is carried
+        by committed entry/exit image components, a claimed-M&#8320; twist mode, and per-boundary
+        continuity checks at random points. The k chunks then merge into <b>one</b> Mosaic
+        cube and <b>one</b> BLAKE3 commitment, and a <b>single</b> PCS evaluation argument
+        discharges every claim &mdash; the dominant evaluation layer is paid once instead of
+        k times (measured 3.8&times; at the test envelope). The design and its soundness
+        accounting: <a href="https://github.com/idrees2516/magnetar/blob/main/docs/ivc.md">docs/ivc.md</a>.
+      </p>
+      <pre>cargo run --release --bin magnetar -- chunked 32 96</pre>
+    </section>
+
     <section id="architecture">
       <h2>Architecture</h2>
       <table>
