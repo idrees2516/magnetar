@@ -12,7 +12,7 @@
 //! the byte at `off`, `LH/LHU` the two bytes at `off` and `(off+1) mod 8`
 //! (well-defined for every offset), `LW/LD` the full word.
 
-use crate::expand::{expand_program, ExpandedProgram, VirtualKind, SHIFT_STAGES};
+use crate::expand::{expand_program, ExpandedProgram, VirtualKind};
 use crate::{Word, RAM_WORDS_LOG2, REGS};
 
 /// Machine state (Harvard architecture: separate ROM and RAM).
@@ -81,8 +81,13 @@ pub struct CycleRecord {
     pub is_logic: bool,
     /// Whether the adder computes a subtraction (SUB/SLTI/compares).
     pub is_sub_op: bool,
-    /// Whether this cycle is an immediate shift (a static routing).
+    /// Whether this cycle is a shift-routing cycle (immediate or a
+    /// register-shift stage).
     pub is_shift: bool,
+    /// The register-shift stage's selected amount bit: bit `k` of the
+    /// amount register (rs2's value) for a stage row, `false` otherwise.
+    /// Bound by the stage-selector sum-check (`discharge`).
+    pub shamt_bit: bool,
     /// Whether this cycle is a memory load.
     pub is_load: bool,
     /// Whether this cycle is a memory store.
@@ -168,6 +173,46 @@ pub fn execute(program: &[u32], input: &[Word], max_cycles: usize) -> Trace {
         records,
         final_state: st,
     }
+}
+
+/// Execute up to `max_cycles` virtual cycles, padding the trace to exactly
+/// `pad_to` records (must be a power of two ≥ the real cycle count).
+/// The padding cycles are real no-op cycles: they fetch ROM row 0 and read
+/// the registers its fields name — the logged values are the machine's
+/// current contents, keeping the memory arguments consistent — and the
+/// halt latch carries the output (the I/O binding).
+pub fn execute_padded(program: &[u32], input: &[Word], max_cycles: usize, pad_to: usize) -> Trace {
+    assert!(pad_to.is_power_of_two());
+    let mut trace = execute(program, input, max_cycles);
+    assert!(
+        trace.records.len() <= pad_to,
+        "trace ({}) exceeds the padded bound ({pad_to})",
+        trace.records.len()
+    );
+    let mut st = trace.final_state;
+    while trace.records.len() < pad_to {
+        let last_pc = trace.records.last().map(|r| r.next_pc).unwrap_or(0);
+        let out = st.output;
+        let row = &trace.program.rows[0].row;
+        let write_addr = if row.rd == 0 { 32 } else { row.rd };
+        let rec = CycleRecord {
+            micro_pc: 0,
+            rs1_val: st.regs[row.rs1 % REGS],
+            rs2_val: st.regs[row.rs2 % REGS],
+            next_pc: last_pc,
+            rd: write_addr,
+            rd_old: st.regs[write_addr],
+            rd_val: out,
+            halted_latch: true,
+            ram_addr: 0,
+            ram_word: st.ram[0],
+            ..Default::default()
+        };
+        trace.records.push(rec);
+        st.regs[write_addr] = out;
+    }
+    trace.final_state = st;
+    trace
 }
 
 fn step(prog: &ExpandedProgram, st: &mut ExecState) -> CycleRecord {
@@ -260,12 +305,13 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState) -> CycleRecord {
             commit(st, &mut rec)
         }
         VirtualKind::ShiftStage { stage } => {
-            // Static stage: shift the accumulator by 2^stage if bit
-            // `stage` of the amount (rs2) is set. The accumulator starts
-            // at rs1 in stage 0. (The stage-level conditional routing's
-            // circuit binding is the documented extension; the interpreter
-            // and expansion handle the semantics.)
-            let acc = if stage == 0 { rs1_val } else { st.regs[0] };
+            // A static stage of a register shift: route the accumulator —
+            // stage 0 reads the source register, later stages read the
+            // trash cell (the expansion's `rs1 = 32` chain) — by `2^stage`
+            // when bit `stage` of the amount (rs2's value) is set, and by
+            // `0` (the identity routing) otherwise. The stage-selector
+            // sum-check binds the condition bit to the rs2 segment.
+            let acc = rs1_val;
             let bit = (rs2_val >> stage) & 1;
             let sh = (1u64 << stage) * bit;
             let val = match row.funct3 {
@@ -279,20 +325,19 @@ fn step(prog: &ExpandedProgram, st: &mut ExecState) -> CycleRecord {
                 }
                 _ => acc,
             };
-            // Stage chaining: the intermediate result lives in x0's slot
-            // (scratch); the last stage writes rd.
-            if stage == SHIFT_STAGES - 1 {
-                rec.rd_val = val;
-                rec.alu_out = val;
-                rec.we = true;
-                rec.rd = if row.rd == 0 { 32 } else { row.rd };
-            } else {
-                st.regs[0] = val; // scratch chain
-                rec.rd_val = val;
-                rec.alu_out = val;
-                rec.we = false;
-                rec.rd = 0;
-            }
+            rec.is_shift = true;
+            rec.shamt_bit = bit != 0;
+            rec.alu_a = acc;
+            rec.alu_b = rs2_val;
+            rec.alu_out = val;
+            rec.shift_out = val;
+            // Every stage writes: intermediate stages write the trash
+            // cell (`rd = 0` → the redirect to 32) so the accumulator
+            // chain carries; the last stage writes the instruction's
+            // true destination.
+            rec.we = true;
+            rec.rd_val = val;
+            rec.rd = if row.rd == 0 { 32 } else { row.rd };
             st.micro_pc = (mp + 1) % prog_len(prog);
             rec.next_pc = st.micro_pc;
             commit(st, &mut rec)
@@ -471,6 +516,7 @@ fn prog_len(prog: &ExpandedProgram) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::expand::SHIFT_STAGES;
 
     fn enc_i(imm: u32, rs1: u32, funct3: u32, rd: u32, op: u32) -> u32 {
         ((imm & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | op
@@ -514,7 +560,13 @@ mod tests {
         ];
         let trace = execute(&prog, &[], 128);
         assert_eq!(trace.final_state.regs[3], 5u64 << 3);
-        assert!(trace.records.len() >= 3 + SHIFT_STAGES);
+        assert!(trace.records.len().is_power_of_two());
+        // Exactly the 6 stage cycles are shift cycles (no immediate shifts
+        // in this program).
+        let stage_recs: Vec<_> = trace.records.iter().filter(|r| r.is_shift).collect();
+        assert_eq!(stage_recs.len(), SHIFT_STAGES);
+        // x0 stays hardwired zero (the chain uses the trash cell 32).
+        assert_eq!(trace.final_state.regs[0], 0);
     }
 
     #[test]

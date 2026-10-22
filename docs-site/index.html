@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Magnetar — Post-Quantum RV64 zkVM from Standard Hashes (Rust)</title>
-  <meta name="description" content="Magnetar is a complete, tested Rust implementation of the post-quantum RV64I zkVM built only from standard hashes (SHA-3 and BLAKE3): Virtual Spartan, BinaryTwist, BinaryShout, BinaryRouter, MosaicPCS, and the full seven-step Construction-3 prover and verifier.">
+  <meta name="description" content="Magnetar is a complete, tested Rust implementation of the post-quantum RV64I zkVM built only from standard hashes (SHA-3 and BLAKE3): Virtual Spartan, BinaryTwist, BinaryShout, BinaryRouter, MosaicPCS, the full seven-step Construction-3 protocol, register-shift stage-select routing, claim aggregation across segments, and a dual-rate hash-based commitment schedule.">
   <meta name="keywords" content="zkVM, zero-knowledge, post-quantum, SNARK, Rust, RV64, RISC-V, BinarySpartan, sum-check, binary fields, SHA-3, BLAKE3, polynomial commitment, transparency, cryptography">
   <meta name="author" content="Magnetar contributors">
   <link rel="canonical" href="https://idrees2516.github.io/magnetar/">
@@ -192,8 +192,8 @@
         <li><b>Execute.</b> The interpreter runs the microcode-expanded program and records the trace plus the memory-access log.</li>
         <li><b>Commit.</b> The direct segments and the auxiliary polynomials form one MosaicPCS polynomial; the protocol's only commitment.</li>
         <li><b>Virtual Spartan.</b> The two SIMD R1CS relations (F&#8322; bit constraints and F&#8322;&#185;&#178;&#8312; packed products) reduce jointly to one claim per witness segment — the virtual claims are forwarded, the direct claims held.</li>
-        <li><b>Reduce the virtual claims.</b> BinaryTwist for registers and RAM (with the Ψ-sum-checks binding the address and index claims), BinaryRouter for shifts and sub-word stores, BinaryShout for the bytecode.</li>
-        <li><b>Prove the committed evaluations.</b> MosaicPCS lifts each claim for free (aligned subcubes), batches them with one sum-check, and ring-switches to the packed polynomial for the single PCS evaluation argument.</li>
+        <li><b>Reduce the virtual claims.</b> BinaryTwist for registers and RAM (with the Ψ-sum-checks binding the address and index claims), BinaryRouter for shifts and sub-word stores (with the register-shift stage-select sum-check binding the conditional amount bits), BinaryShout for the bytecode.</li>
+        <li><b>Prove the committed evaluations.</b> MosaicPCS lifts each claim for free (aligned subcubes), batches them with one sum-check, and ring-switches to the packed polynomial for the single PCS evaluation argument — one argument for every segment in the claim-aggregated mode.</li>
       </ol>
     </section>
 
@@ -231,6 +231,15 @@ cargo run --release --bin magnetar -- fib 2</pre>
     </section>
 
     <section id="security">
+      <h2>Horizon instruments</h2>
+      <ul>
+        <li><b>Claim aggregation.</b> K segments of one program share ONE commitment and ONE evaluation argument; the byte-dominant part of the proof stays constant while the segment count grows (measured 3.46x at K=4 against the standalone counterfactual).</li>
+        <li><b>Dual-rate schedule.</b> Chunk proofs commit at rate 1/2 for the fastest prover; the public artifact uses the conservative wrap profile — both measured by the instrumented CLI.</li>
+        <li><b>Register-shift stage-select.</b> Register shifts prove end to end: the 6-stage trash-cell chain, the ROM-authenticated sel_stage one-hot, and the stage-selector sum-check composing the amount selector additively in characteristic two.</li>
+        <li><b>The measured cost model.</b> The committed-bit inventory, the byte breakdown, the aggregation ledger, and the rate schedule — printed from the actual wire structure (<a href="https://github.com/idrees2516/magnetar/blob/main/docs/architecture/cost-model.md">cost-model.md</a>).</li>
+      </ul>
+      <p>The full engineering program — horizons, the recursion path, and the 150M-cycles/s GPU study — lives in the <a href="https://github.com/idrees2516/magnetar/blob/main/ROADMAP.md">roadmap</a> and the <a href="https://github.com/idrees2516/magnetar/tree/main/docs/architecture">architecture deep-dives</a>.</p>
+
       <h2>Security posture</h2>
       <ul>
         <li><b>Assumptions:</b> SHA-3 (FIPS 202) and BLAKE3 only; transparent, no trusted setup.</li>

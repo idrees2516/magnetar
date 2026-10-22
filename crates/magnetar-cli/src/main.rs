@@ -1,20 +1,32 @@
 //! The `magnetar` command-line interface: execute, prove, and verify
-//! RV64I programs.
+//! RV64I programs — standalone, or claim-aggregated across segments with
+//! the dual-rate PCS schedule.
 
-use magnetar_zkvm::protocol::{keygen, prove, verify, PublicInput};
+use magnetar_pcs::PcsParams;
+use magnetar_zkvm::protocol::{
+    keygen, keygen_aggregate, prove, prove_multi, verify, verify_multi, PublicInput,
+};
 use std::time::Instant;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
         Some("fib") => cmd_fib(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8)),
+        Some("agg") => cmd_agg(
+            args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4),
+            args.get(3).map(|s| s.as_str()),
+        ),
         Some("check") => cmd_check(),
         _ => {
             eprintln!("Magnetar zkVM — post-quantum RV64I proving (eprint 2026-2423)");
             eprintln!();
             eprintln!("Usage:");
-            eprintln!("  magnetar fib [steps]   prove + verify a Fibonacci program");
-            eprintln!("  magnetar check         self-test of the proof stack");
+            eprintln!("  magnetar fib [steps]        prove + verify a Fibonacci program");
+            eprintln!("  magnetar agg [segments] [rate]  claim-aggregated proof of N segments");
+            eprintln!(
+                "                              (rate: 'chunk' = 1/2, 'wrap' = 1/4, default wrap)"
+            );
+            eprintln!("  magnetar check               self-test of the proof stack");
             std::process::exit(2);
         }
     }
@@ -41,11 +53,15 @@ fn cmd_fib(rounds: u32) {
     program.push((3 << 15) | (10 << 7) | 0x33); // x10 = x3 (rs2=x0)
     program.push(0x0000_0073); // ecall: halt
 
-    // Run the interpreter to get the output.
+    // Run the interpreter to get the output and the exact trace length
+    // (padded to the proving bound).
     let trace = magnetar_cpu::interp::execute(&program, &[], program.len() * 4 + 64);
     let output = trace.final_state.output;
-    // The trace is already padded to a power of two by the interpreter.
-    let trace_len = trace.records.len();
+    let trace_len = trace
+        .records
+        .len()
+        .next_power_of_two()
+        .max(trace.records.len());
 
     println!("Magnetar fib({rounds}) — {trace_len} virtual cycles, output = {output}");
     let (pk, vk) = keygen(program.clone(), trace_len);
@@ -64,6 +80,56 @@ fn cmd_fib(rounds: u32) {
 
     println!("prove: {prove_ms} ms, verify: {verify_ms} ms, accepted: {ok}");
     // The measured cost model (the research roadmap's first build item).
+    let stats = magnetar_zkvm::stats::proof_stats(&pk, &proof);
+    println!("{}", stats.report());
+    if !ok {
+        std::process::exit(1);
+    }
+}
+
+/// The claim-aggregated prover (roadmap Horizon 2): `segments` executions
+/// of one program — the rollup/batch flavor — share ONE commitment and ONE
+/// evaluation argument; the printed cost model shows the amortization
+/// against the standalone counterfactual.
+fn cmd_agg(segments: usize, rate: Option<&str>) {
+    let segments = segments.max(1).next_power_of_two();
+    let pcs = match rate {
+        Some("chunk") => PcsParams::chunk(),
+        _ => PcsParams::wrap(),
+    };
+    // The doubling program: read word k, add 7, store it back, and bind
+    // the result to a0.
+    let program = vec![
+        (3 << 12) | (3 << 7) | 0x03,                // ld x3, 0(x0)
+        enc_i(7, 0, 0, 5, 0x13),                    // addi x5, x0, 7
+        (5u32 << 20) | (3 << 15) | (3 << 7) | 0x33, // add x3, x3, x5
+        (3u32 << 20) | (3 << 12) | 0x23,            // sd x3, 0(x0) (rs1=x0, imm=0)
+        (3 << 12) | (10 << 7) | 0x03,               // ld x10, 0(x0)
+        0x0000_0073,                                // ecall
+    ];
+    let pub_ins: Vec<PublicInput> = (0..segments)
+        .map(|s| PublicInput {
+            input: vec![s as u64 + 1],
+            output: s as u64 + 8,
+        })
+        .collect();
+    println!(
+        "Magnetar agg — {segments} segments, {} rate, trace {} cycles/segment",
+        if pcs.k == 1 {
+            "chunk (1/2)"
+        } else {
+            "wrap (1/4)"
+        },
+        8
+    );
+    let (pk, vk) = keygen_aggregate(program, 8, 2, pcs, segments);
+    let t0 = Instant::now();
+    let proof = prove_multi(&pk, &pub_ins);
+    let prove_ms = t0.elapsed().as_millis();
+    let t1 = Instant::now();
+    let ok = verify_multi(&vk, &pub_ins, &proof).is_ok();
+    let verify_ms = t1.elapsed().as_millis();
+    println!("prove: {prove_ms} ms, verify: {verify_ms} ms, accepted: {ok}");
     let stats = magnetar_zkvm::stats::proof_stats(&pk, &proof);
     println!("{}", stats.report());
     if !ok {

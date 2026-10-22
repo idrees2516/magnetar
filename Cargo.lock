@@ -134,15 +134,16 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "magnetar-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-cpu",
+ "magnetar-pcs",
  "magnetar-zkvm",
 ]
 
 [[package]]
 name = "magnetar-cpu"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-field",
  "magnetar-spartan",
@@ -151,14 +152,14 @@ dependencies = [
 
 [[package]]
 name = "magnetar-field"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "rand",
 ]
 
 [[package]]
 name = "magnetar-hash"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "blake3",
  "magnetar-field",
@@ -168,7 +169,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-memory"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-field",
  "magnetar-hash",
@@ -178,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-pcs"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-field",
  "magnetar-hash",
@@ -188,7 +189,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-router"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-field",
  "magnetar-hash",
@@ -198,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-spartan"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-field",
  "magnetar-hash",
@@ -208,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-sumcheck"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-field",
  "magnetar-hash",
@@ -217,7 +218,7 @@ dependencies = [
 
 [[package]]
 name = "magnetar-zkvm"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "magnetar-cpu",
  "magnetar-field",

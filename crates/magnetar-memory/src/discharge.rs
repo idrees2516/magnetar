@@ -774,6 +774,339 @@ pub fn verify_selector_shout(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The register-shift stage-selector sum-check (the stage-select extension).
+// ---------------------------------------------------------------------------
+
+/// The stage-selector sum-check's public specification.
+///
+/// A register-shift stage row offers the shift router the *conditional*
+/// amount pair `{identity, shift-by-2^k}` — `k` the row's stage, fixed by
+/// the ROM's `sel_stage` one-hot — and the witness amount bit `b` (bit `k`
+/// of the amount register) picks within it. This sum-check proves, over
+/// the joint `(k', j)` space (stage index low, cycle high):
+///
+/// `q_stage = Σ_{k',j} eq(r_j, j)·oh(k', j)·[(1+b(j))·E₀ + b(j)·E(k')]`
+/// `        + γ · Σ_{k',j} eq(r_j, j)·oh(k', j)·(b(j) + amt(k', j))`
+///
+/// where `oh` is the fetched `sel_stage` one-hot (discharged against the
+/// ROM by the caller's selector check, exactly like the routers' other
+/// selectors), `b` the committed shamt flag, `amt` the amount register's
+/// low-byte bits (the `store-src` copy segment), `E₀ = eq(ρ_h, 0)` the
+/// identity-routing constant, `E(k') = eq(ρ_h, 2^{k'})` the
+/// shift-by-`2^{k'}` structure constants, and `γ` a transcript challenge
+/// folding in the bit-binding `b(j) = bit_{k}(amount)` at the one-hot's
+/// stage (the honest binding sum is zero).
+///
+/// The caller composes the claim additively in characteristic two: the
+/// shift router proves `Ê_Qlo(ρ_h, r_j) = q_lo` for its *witness* amount
+/// selector, this argument proves `q_stage = Ê_STAGElo(ρ_h, r_j)` for the
+/// *structured* stage part, and the `sel_lo` selector check runs with
+/// claim `q_lo + q_stage`, forcing `Q_lo = ROM(sel_lo) + STAGElo` at the
+/// router's random point — hence, by Schwartz–Zippel over the multilinear
+/// extensions, everywhere.
+#[derive(Clone, Debug)]
+pub struct StageSelectSpec {
+    /// The stage one-hot's index width (3 bits, 8 slots, stages 0..=5 live).
+    pub stage_bits: usize,
+    /// Cycle variables.
+    pub n: usize,
+    /// The shift routing's amount-space width (`ρ_h.len()`).
+    pub amount_bits: usize,
+    /// The router's amount point `ρ_h` (the structure constants).
+    pub r_amount: Vec<Gf128>,
+    /// The router's cycle point (the `eq(r_j, ·)` weights).
+    pub r_j: Vec<Gf128>,
+}
+
+impl StageSelectSpec {
+    /// `E₀ = eq(ρ_h, 0) = Π_i (1 + ρ_{h,i})` — the identity routing's
+    /// constant (an amount of zero).
+    pub fn e0(&self) -> Gf128 {
+        let mut acc = ONE;
+        for &r in &self.r_amount {
+            acc = mul(acc, ONE + r);
+        }
+        acc
+    }
+
+    /// `E[k'] = eq(ρ_h, 2^{k'})` — the shift-by-`2^{k'}` routing's
+    /// structure constant (zero for slots the amount space cannot index;
+    /// the one-hot is never live there).
+    pub fn e_table(&self) -> Vec<Gf128> {
+        let mut e = vec![ZERO; 1usize << self.stage_bits];
+        for (k, v) in e.iter_mut().enumerate() {
+            if k < self.amount_bits {
+                // eq(ρ_h, e_k) = ρ_{h,k} · Π_{i≠k} (1 + ρ_{h,i}).
+                let mut acc = self.r_amount[k];
+                for (i, &r) in self.r_amount.iter().enumerate() {
+                    if i != k {
+                        acc = mul(acc, ONE + r);
+                    }
+                }
+                *v = acc;
+            }
+        }
+        e
+    }
+}
+
+/// A stage-selector sum-check proof.
+#[derive(Clone, Debug)]
+pub struct StageSelectProof {
+    /// The claim `q_stage` (the structured stage part's contribution to
+    /// the router's amount selector).
+    pub claim: Gf128,
+    /// Round messages (the `(k', j)` space, `k'` bound first).
+    pub rounds: Vec<Vec<Gf128>>,
+    /// The fetched `sel_stage` one-hot's terminal claim (the caller
+    /// discharges it through the `sel_stage` selector check).
+    pub oh_terminal: Gf128,
+    /// The shamt flag's terminal claim at the bound cycle point.
+    pub b_terminal: Gf128,
+    /// The amount low-byte's terminal claim at the bound point.
+    pub amt_terminal: Gf128,
+}
+
+/// The symmetric sum-check driver: builds the spec's factors and terms.
+fn stage_select_spec(
+    spec: &StageSelectSpec,
+    gamma: Gf128,
+    dense: Vec<Vec<Gf128>>,
+    claim: Gf128,
+) -> SumcheckSpec {
+    let sb = spec.stage_bits;
+    let n = spec.n;
+    let jv = sb + n;
+    debug_assert_eq!(dense.len(), 3);
+    // oh and amt over the joint (k', j); b replicated over the stage block.
+    debug_assert_eq!(dense[0].len(), 1usize << jv);
+    debug_assert_eq!(dense[1].len(), 1usize << jv);
+    debug_assert_eq!(dense[2].len(), 1usize << jv);
+    // Public: eq(r_j, j) over the cycle block; E(k') over the stage block.
+    let public: Vec<Box<dyn PublicFactor + Send + Sync>> = vec![
+        Box::new(JointTableFactor::new(spec.e_table(), (0..sb).collect(), jv)),
+        Box::new(JointTableFactor::new(
+            magnetar_field::EqBits::build(&spec.r_j).values,
+            (sb..sb + n).collect(),
+            jv,
+        )),
+    ];
+    // Terms: oh·eq_j·[(1+b)E0 + b·E + γ(b + amt)].
+    SumcheckSpec {
+        num_vars: jv,
+        dense,
+        public,
+        terms: vec![
+            Term {
+                coeff: spec.e0(),
+                dense: vec![0],
+                public: vec![1],
+            },
+            Term {
+                coeff: spec.e0(),
+                dense: vec![0, 1],
+                public: vec![1],
+            },
+            Term {
+                coeff: ONE,
+                dense: vec![0, 1],
+                public: vec![0, 1],
+            },
+            Term {
+                coeff: gamma,
+                dense: vec![0, 1],
+                public: vec![1],
+            },
+            Term {
+                coeff: gamma,
+                dense: vec![0, 2],
+                public: vec![1],
+            },
+        ],
+        claim,
+    }
+}
+
+/// The dense tables' padding: `oh` and `amt` live over the joint `(k', j)`
+/// space; `b` is replicated over the stage block (its fold over an idle
+/// variable is the identity in characteristic two, so its terminal claim
+/// lands exactly at the cycle point).
+fn stage_dense_tables(
+    stage_bits: usize,
+    n: usize,
+    oh: &[Gf128],
+    b: &[Gf128],
+    amt: &[Gf128],
+) -> Vec<Vec<Gf128>> {
+    let jv = stage_bits + n;
+    let mut b_pad = vec![ZERO; 1usize << jv];
+    for j in 0..(1usize << n) {
+        for k in 0..(1usize << stage_bits) {
+            b_pad[k | (j << stage_bits)] = b[j];
+        }
+    }
+    vec![oh.to_vec(), b_pad, amt.to_vec()]
+}
+
+/// The bound points a stage-selector proof leaves behind (the prover
+/// needs them to build the `sel_stage` selector check's spec; the
+/// verifier recomputes them from the transcript).
+#[derive(Clone, Debug)]
+pub struct StageSelectPoints {
+    /// The bound stage-space point `ρ_{k'}`.
+    pub rho_k: Vec<Gf128>,
+    /// The bound cycle point `r_j*`.
+    pub r_j: Vec<Gf128>,
+}
+
+/// Prove the stage-selector sum-check. `oh` is the fetched `sel_stage`
+/// table over `(k', j)`, `b` the per-cycle shamt flags, `amt` the amount
+/// register's low-byte bits over `(k', j)`. Returns the proof and the
+/// bound points.
+pub fn prove_stage_select(
+    spec: &StageSelectSpec,
+    oh: &[Gf128],
+    b: &[Gf128],
+    amt: &[Gf128],
+    t: &mut Transcript,
+) -> (StageSelectProof, StageSelectPoints) {
+    let (sb, n) = (spec.stage_bits, spec.n);
+    let gamma = t.challenge_field("stage-gamma");
+    let e0 = spec.e0();
+    let e = spec.e_table();
+    let eq_j = magnetar_field::EqBits::build(&spec.r_j).values;
+    // The honest claim.
+    let mut claim = ZERO;
+    for j in 0..(1usize << n) {
+        for k in 0..(1usize << sb) {
+            let ohv = oh[k | (j << sb)];
+            if ohv == ZERO {
+                continue;
+            }
+            // eq(r_j, j)·oh·[(1+b)·E0 + b·E(k') + γ·(b + amt(k', j))].
+            let structure = e0 + mul(b[j], e0 + e[k]);
+            let binding = b[j] + amt[k | (j << sb)];
+            claim += mul(mul(ohv, eq_j[j]), structure + mul(gamma, binding));
+        }
+    }
+    let dense = stage_dense_tables(sb, n, oh, b, amt);
+    let sc = stage_select_spec(spec, gamma, dense, claim);
+    let mut prover = SumcheckProver::new(&sc, BindOrder::Increasing);
+    let mut rounds = Vec::with_capacity(sb + n);
+    for _ in 0..(sb + n) {
+        let msg = prover.message();
+        rounds.push(msg.0.clone());
+        prover.absorb_and_fold(t, "stage-select");
+    }
+    let challenges = prover.challenges();
+    let (terminals, _) = prover.finish();
+    let out = StageSelectProof {
+        claim,
+        rounds,
+        oh_terminal: terminals[0],
+        b_terminal: terminals[1],
+        amt_terminal: terminals[2],
+    };
+    t.absorb_field(
+        "stage-terminals",
+        &[out.oh_terminal, out.b_terminal, out.amt_terminal],
+    );
+    let point = BindOrder::Increasing.point(sb + n, &challenges);
+    let points = StageSelectPoints {
+        rho_k: point[..sb].to_vec(),
+        r_j: point[sb..].to_vec(),
+    };
+    (out, points)
+}
+
+/// Verify the stage-selector sum-check; returns the terminal claims and the
+/// bound points for the caller's Mosaic/selector discharges.
+#[derive(Clone, Debug)]
+pub struct StageSelectClaims {
+    /// The bound stage-space point `ρ_{k'}`.
+    pub rho_k: Vec<Gf128>,
+    /// The bound cycle point `r_j*`.
+    pub r_j: Vec<Gf128>,
+    /// The fetched one-hot's terminal (the `sel_stage` selector check's
+    /// claim input).
+    pub oh: Gf128,
+    /// The shamt flag's value at `r_j*`.
+    pub b: Gf128,
+    /// The amount low-byte's value at `(ρ_{k'}, r_j*)`.
+    pub amt: Gf128,
+}
+
+pub fn verify_stage_select(
+    spec: &StageSelectSpec,
+    proof: &StageSelectProof,
+    t: &mut Transcript,
+) -> Result<StageSelectClaims, &'static str> {
+    let (sb, n) = (spec.stage_bits, spec.n);
+    if proof.rounds.len() != sb + n {
+        return Err("stage-select: round count mismatch");
+    }
+    let gamma = t.challenge_field("stage-gamma");
+    // The verifier replays with the public factors only (the dense tables'
+    // terminal claims arrive as the proof's claimed values).
+    let jv = sb + n;
+    let e0 = spec.e0();
+    let public: Vec<Box<dyn PublicFactor + Send + Sync>> = vec![
+        Box::new(JointTableFactor::new(spec.e_table(), (0..sb).collect(), jv)),
+        Box::new(JointTableFactor::new(
+            magnetar_field::EqBits::build(&spec.r_j).values,
+            (sb..sb + n).collect(),
+            jv,
+        )),
+    ];
+    let terms = vec![
+        Term {
+            coeff: e0,
+            dense: vec![0],
+            public: vec![1],
+        },
+        Term {
+            coeff: e0,
+            dense: vec![0, 1],
+            public: vec![1],
+        },
+        Term {
+            coeff: ONE,
+            dense: vec![0, 1],
+            public: vec![0, 1],
+        },
+        Term {
+            coeff: gamma,
+            dense: vec![0, 1],
+            public: vec![1],
+        },
+        Term {
+            coeff: gamma,
+            dense: vec![0, 2],
+            public: vec![1],
+        },
+    ];
+    let mut v = SumcheckVerifier::new(jv, proof.claim, &public, terms, BindOrder::Increasing);
+    let mut challenges = Vec::with_capacity(jv);
+    for msg in &proof.rounds {
+        challenges.push(v.round_capturing(&RoundMsg(msg.clone()), t, "stage-select")?);
+    }
+    v.finish(&[proof.oh_terminal, proof.b_terminal, proof.amt_terminal])
+        .map_err(|_| "stage-select: terminal identity failed")?;
+    t.absorb_field(
+        "stage-terminals",
+        &[proof.oh_terminal, proof.b_terminal, proof.amt_terminal],
+    );
+    let point = BindOrder::Increasing.point(jv, &challenges);
+    Ok(StageSelectClaims {
+        rho_k: point[..sb].to_vec(),
+        r_j: point[sb..].to_vec(),
+        oh: proof.oh_terminal,
+        b: proof.b_terminal,
+        amt: proof.amt_terminal,
+    })
+}
+
 #[cfg(test)]
 mod multi_factor_tests {
     use super::*;

@@ -114,6 +114,10 @@ impl WITNESS_LAYOUT {
     pub const F_LD_BYTE: usize = 8;
     pub const F_LD_HALF: usize = 9;
     pub const F_LD_WORD: usize = 10;
+    /// The register-shift stage's selected amount bit (bit `k` of the
+    /// amount register). Not R1CS-constrained — the stage-selector
+    /// sum-check binds it to the rs2 segment and the ROM's stage one-hot.
+    pub const F_SHAMT_BIT: usize = 11;
 
     // The fetch bus field positions.
     pub const BUS_OP: usize = 0;
@@ -182,6 +186,7 @@ pub fn witness_row(rec: &CycleRecord, row: &RomRow, public_x: &[Gf128]) -> Vec<G
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_BYTE] = Gf128(rec.ld_byte as u128);
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_HALF] = Gf128(rec.ld_half as u128);
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_WORD] = Gf128(rec.ld_word as u128);
+    z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_SHAMT_BIT] = Gf128(rec.shamt_bit as u128);
     // The store offset bits.
     for k in 0..3 {
         z[WITNESS_LAYOUT::OFF + k] = Gf128(((rec.byte_offset >> k) & 1) as u128);
@@ -438,16 +443,21 @@ pub fn build_circuit() -> CircuitSpec {
             &[(WITNESS_LAYOUT::NH, ONE)],
         );
     }
-    // 6. Zero-extension: (1+ld_word)·rd_b = 0 for b ≥ 16; NH·rd_b = 0 for
-    // 8 ≤ b < 16.
+    // 6. Zero-extension of sub-word loads: byte loads zero `rd` bits
+    //    8..63, half loads zero `rd` bits 16..63. Word loads and
+    //    non-load cycles leave `rd` unconstrained here (the write mux and
+    //    the adder identity own it) — an ALU result with high bits set
+    //    (e.g. a negative addi) is perfectly legal.
+    //    The masks are `ld_byte + ld_half` / `ld_byte` (the flags are
+    //    mutually exclusive, so the characteristic-two sum is the OR).
     for b in 16..64 {
         add(
             &mut a1,
             &mut b1,
             &mut c1,
             &[
-                (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_WORD, ONE),
-                (WITNESS_LAYOUT::ONE_COL, ONE),
+                (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_BYTE, ONE),
+                (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_HALF, ONE),
             ],
             &[(WITNESS_LAYOUT::RD + b, ONE)],
             &[],
@@ -458,7 +468,7 @@ pub fn build_circuit() -> CircuitSpec {
             &mut a1,
             &mut b1,
             &mut c1,
-            &[(WITNESS_LAYOUT::NH, ONE)],
+            &[(WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_BYTE, ONE)],
             &[(WITNESS_LAYOUT::RD + b, ONE)],
             &[],
         );
@@ -751,5 +761,108 @@ mod tests {
             let z = witness_row(rec, row, &[Gf128(0)]);
             assert!(check_row(&spec, &z).is_ok(), "row pc={}", rec.micro_pc);
         }
+    }
+}
+
+#[cfg(test)]
+mod witness_sat_tests {
+    use super::*;
+
+    /// Evaluate every constraint of both relations on every witness row
+    /// of a trace: the full-circuit satisfiability check. This is the
+    /// regression harness for the zero-extension mask bug (honest
+    /// witnesses with high `rd` bits — negative/large ALU results — were
+    /// previously rejected by inverted sub-word-load masks) and the
+    /// trace-padding invariant (the witness cube must be filled exactly).
+    fn check_sat(program: &[u32], input: &[u64], pad_to: usize) {
+        let trace = crate::interp::execute_padded(program, input, pad_to, pad_to);
+        assert_eq!(trace.records.len(), pad_to);
+        let spec = build_circuit();
+        let public_x: Vec<Gf128> = {
+            let mut v = vec![ZERO; WITNESS_LAYOUT::M / 2 - 1];
+            v[0] = Gf128(0);
+            for (i, &w) in input.iter().enumerate() {
+                if 1 + i < v.len() {
+                    v[1 + i] = Gf128(w as u128);
+                }
+            }
+            v
+        };
+        let rows = &trace.program.rows;
+        let mut bad = 0usize;
+        for (u, rec) in trace.records.iter().enumerate() {
+            let row = &rows[rec.micro_pc % rows.len()].row;
+            let z = witness_row(rec, row, &public_x);
+            for (name, (a, b, c)) in [
+                ("bin", (&spec.a_bin, &spec.b_bin, &spec.c_bin)),
+                ("fld", (&spec.a_fld, &spec.b_fld, &spec.c_fld)),
+            ] {
+                let az = a.apply(&z);
+                let bz = b.apply(&z);
+                let cz = c.apply(&z);
+                for r in 0..az.len() {
+                    if mul(az[r], bz[r]) + cz[r] != ZERO {
+                        if bad < 8 {
+                            eprintln!("VIOLATION cyc={u} rel={name} row={r}");
+                        }
+                        bad += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(bad, 0, "witness must satisfy the circuit");
+    }
+
+    fn enc_i(imm: u32, rs1: u32, funct3: u32, rd: u32, op: u32) -> u32 {
+        ((imm & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | op
+    }
+
+    #[test]
+    fn sat_negative_alu_values() {
+        // A negative addi + a full-width add: high rd bits must be legal.
+        check_sat(
+            &[
+                enc_i((-16i32) as u32 & 0xfff, 0, 0, 1, 0x13),
+                enc_i(3, 0, 0, 2, 0x13),
+                (2u32 << 20) | (1 << 15) | (3 << 7) | 0x33, // add x3, x1, x2
+                0x0000_0073,
+            ],
+            &[],
+            16,
+        );
+    }
+
+    #[test]
+    fn sat_register_shift_chain() {
+        // The trash-cell stage chain with high accumulator bits.
+        check_sat(
+            &[
+                enc_i((-16i32) as u32 & 0xfff, 0, 0, 1, 0x13),
+                enc_i(3, 0, 0, 2, 0x13),
+                (2u32 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33, // sll x3, x1, x2
+                (2u32 << 20) | (3 << 15) | (5 << 12) | (4 << 7) | 0x33, // srl x4, x3, x2
+                (0x20u32 << 25) | (2 << 20) | (1 << 15) | (5 << 12) | (5 << 7) | 0x33, // sra x5, x1, x2
+                0x0000_0073,
+            ],
+            &[],
+            32,
+        );
+    }
+
+    #[test]
+    fn sat_subword_loads_and_padding() {
+        // Sub-word loads (the zero-extension semantics) plus heavy padding.
+        check_sat(
+            &[
+                enc_i(16, 0, 0, 1, 0x13),
+                enc_i(0xAB, 0, 0, 5, 0x13),
+                ((5u32 << 20) | (1 << 15)) | (1 << 7) | 0x23, // sb x5, 0(x1)
+                ((1u32 << 20) | (1 << 15)) | (3 << 7) | 0x03, // lb x3, 0(x1)
+                (1u32 << 20) | (1 << 15) | (1 << 12) | (4 << 7) | 0x03, // lh x4, 0(x1)
+                0x0000_0073,
+            ],
+            &[],
+            64,
+        );
     }
 }

@@ -37,11 +37,13 @@ field/utils/proof/arith/cpu split), one crate per component:
 ## The protocol (Construction 3)
 
 1. **Execute** — the interpreter runs the expanded program and records the
-   trace of virtual cycles (the CPU circuit's witness matrix `W`).
+   trace of virtual cycles (the CPU circuit's witness matrix `W`) — per
+   segment in the aggregated mode, padded to fill the witness cube exactly.
 2. **Commit** — `W`'s bits are packed 128 per `K` element over the top 7
    index bits; the affine-substitution codeword of the packed vector is
    Merkle-committed with BLAKE3. This is the protocol's only commitment,
-   sent before any verifier challenge.
+   sent before any verifier challenge — shared by every segment in the
+   claim-aggregated mode.
 3. **Virtual Spartan** — the two SIMD R1CS relations (F₂ and K) are
    reduced jointly — lockstep outer sum-checks sharing the instance
    challenges, one α-batched inner sum-check — to one evaluation claim
@@ -49,14 +51,41 @@ field/utils/proof/arith/cpu split), one crate per component:
 4. **Reduce the virtual claims** — BinaryTwist (registers, RAM),
    BinaryRouter (shifts, sub-word stores) and BinaryShout (bytecode) own
    the virtual segments; their reductions turn the claims into component
-   claims on committed data.
+   claims on committed data. The register-shift **stage-select** binds
+   the routers' conditional amount selectors: the trash-cell stage chain
+   (public ROM fields), the `sel_stage` one-hot (ROM-authenticated), and
+   the stage-selector sum-check composing `Q_lo = ROM(sel_lo) + STAGE`
+   additively in characteristic two.
 5. **Prove the committed evaluations** — MosaicPCS lifts every claim to
    `G` for free (aligned subcubes), batches them with one sum-check
    (binding the 7 packing variables first — after those rounds the dense
    factor *is* the c\*-folded table), and discharges the terminal via ring
    switching: the c\*-codeword's fold chain, anchored to the main
    commitment with exact `φ_c` bit-extraction checks at random
-   `(x, ε=0)` positions.
+   `(x, ε=0)` positions. In the aggregated mode this single discharge
+   covers **all** segments' claims (roadmap Horizon 2, "aggregation
+   before the wrap"): the byte-dominant evaluation argument is paid
+   once — measured 3.46x smaller than the standalone counterfactual at
+   K=4 segments.
+
+## Horizon-2 instruments
+
+* **Claim aggregation** — `keygen_aggregate` + `prove_multi`/
+  `verify_multi`: `K` segments share ONE Mosaic commitment (the
+  components' subcubes gain the `log2(K)` index dimension) and ONE
+  evaluation argument. `magnetar agg 4` proves 4 executions of a
+  program against one commitment and prints the amortization ledger.
+* **Dual-rate PCS schedule** — `PcsParams::chunk()` (rate 1/2, internal
+  artifacts: half the commit work, one level shorter paths) vs
+  `PcsParams::wrap()` (rate 1/4, the conservative public profile);
+  `magnetar agg N chunk|wrap` measures both.
+* **The measured cost model** — `stats.rs` now reports the aggregation
+  ledger (per-segment sum-check bytes, the single evaluation argument,
+  the analytic standalone counterfactual, the saving ratio).
+
+The full engineering program — what is done, what the horizons are, and
+the 150M-cycles/s GPU study's build order — is in [`ROADMAP.md`](ROADMAP.md)
+and [`docs/architecture/`](docs/architecture/) (one deep-dive per component).
 
 ## Security
 
@@ -78,11 +107,15 @@ field/utils/proof/arith/cpu split), one crate per component:
 
 ```sh
 cargo build --release
-cargo test --workspace      # 69 tests: field, hash, sum-check (dense +
+cargo test --workspace      # 75 tests: field, hash, sum-check (dense +
                              # sparse), PCS + ring switching, Virtual Spartan,
                              # Twist, Shout, the discharge helpers, Router, CPU,
-                             # end-to-end + 15 tamper classes
+                             # full-circuit satisfiability regressions,
+                             # end-to-end + 20 tamper classes, claim
+                             # aggregation, dual-rate profiles
 cargo run --release --bin magnetar -- fib 5
+cargo run --release --bin magnetar -- agg 4      # claim-aggregated proof
+cargo run --release --bin magnetar -- agg 4 chunk # at the chunk rate
 ```
 
 ## Status and scope
@@ -97,23 +130,44 @@ the **complete Construction-3 prover/verifier — all seven steps
 end-to-end, with the virtual-claim discharge (step 4) integrated**:
 BinaryTwist for registers and RAM, BinaryRouter for shifts and sub-word
 stores, and BinaryShout for the bytecode, each reducing its claims to
-evaluations on the single commitment. Four programs (arithmetic,
-load/store with sub-word semantics, shifts, a hot-cell with the public
-input binding) prove and verify, and **15 tamper classes are rejected** —
-one per transmitted claim and round-message family.
+evaluations on the single commitment. Five programs (arithmetic,
+load/store with sub-word semantics, immediate shifts, **register shifts
+via the stage-select extension**, a hot-cell with the public input
+binding) prove and verify, **20 tamper classes are rejected**, and
+**full-circuit satisfiability regressions** pin every witness row of the
+test programs against both R1CS relations.
+
+The **register-shift stage-select** extension is implemented end to end:
+register shifts (SLL/SRL/SRA by register) expand into 6 conditional
+routing stages chained through the trash cell, the ROM carries a
+`sel_stage` one-hot authenticated through the fetch, the routers' amount
+selector is the witness-conditional pair `{identity, shift-by-2^k}`, and
+the stage-selector sum-check binds the condition bit to the amount
+register's bits — composing the selector claims additively in
+characteristic two.
+
+**Claim aggregation** (roadmap Horizon 2) is implemented: K segments
+share one commitment and one evaluation argument (`prove_multi`), with
+the measured amortization ledger (3.46x at K=4) and the analytic
+standalone counterfactual printed by the cost model. The **dual-rate
+schedule** (`chunk` at rate 1/2 vs `wrap` at 1/4) is implemented and
+measured (`docs/architecture/pcs.md` carries the honest analysis of what
+the rate does and does not move in the affine-substitution code).
 
 The `magnetar-zkvm::stats` module measures the cost model directly (the
 committed-bit inventory per component, the PCS geometry, the byte
-breakdown): the PCS evaluation argument dominates at ~84% of the proof,
-exactly the paper's cost-anatomy prediction, making it the target of the
+breakdown): the PCS evaluation argument dominates, exactly the paper's
+cost-anatomy prediction, making it the target of the
 proof-size roadmap.
 
 Scope notes (paper-faithful): the cross-step micro-PC constraints are
 omitted exactly as the paper's Remark 4 omits them; the decode-vs-flag
-correlation and the register-shift stage-select are documented engineering
-extensions. Trace lengths in tests are 2^3–2^5 cycles (CI-scale); the
-paper's production envelope is 2^22 cycles at ~6.5–7.7M cycles/s with
-~600 KiB proofs and 10–12 ms verification.
+correlation remains a documented engineering extension. Aggregated
+segments are independent (input, output) pairs — cross-segment state
+continuity is the tree-IVC milestone on the roadmap. Trace lengths in
+tests are 2^3–2^5 cycles (CI-scale); the paper's production envelope is
+2^22 cycles at ~6.5–7.7M cycles/s with ~600 KiB proofs and 10–12 ms
+verification.
 
 ```sh
 $ cargo run --release --bin magnetar -- fib 2

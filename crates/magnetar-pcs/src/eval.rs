@@ -27,9 +27,33 @@ use magnetar_sumcheck::{
 /// Tunable PCS parameters. Defaults target ≥ 120-bit security at the test
 /// scale: `k = 2` (rate 1/4, distance ≈ 1 at generic γ) and `q = 40`
 /// correlated queries.
+///
+/// # The dual-rate schedule (roadmap Horizon 1/2)
+///
+/// The **chunk profile** (`k = 1`, rate 1/2) tunes the *internal*
+/// artifacts: a `2^{n+1}`-entry codeword halves the encode-and-commit
+/// work and shortens every Merkle path by one level, and chunk proofs
+/// never leave the prover's trust domain. The **wrap profile** (this
+/// crate's conservative default, `k = 2`) tunes the *public* artifact:
+/// one extra extension variable doubles the distance margin of the
+/// fold-chain's proximity argument at the price of one level of path per
+/// query — a few percent of the artifact.
+///
+/// The affine-substitution code's relative distance is ≈ 1 at generic
+/// seed-derived `γ` **for every** `k ≥ 1` (Schwartz–Zippel over the
+/// substitution points, see the crate-level discussion), so — unlike
+/// Reed–Solomon-based FRI — the rate does not move the query count in our
+/// construction; the query schedule stays `q = 40` for 120 bits on both
+/// profiles, and the rate tunes (commit work, path depth, tail size)
+/// instead. The roadmap's *low-rate wrap with fewer queries* couples to
+/// the recursion milestone (the wrap instance there is the small
+/// verifier-guest witness, where a lower rate buys queries on a
+/// RS-proximity analysis); until then, the honest dual-rate lever here is
+/// the chunk/wrap work-and-path split above, which the cost model
+/// (`stats`) measures directly.
 #[derive(Clone, Debug)]
 pub struct PcsParams {
-    /// Extension variables (log codeword blow-up).
+    /// Extension variables (log codeword blow-up; rate = `2^{-k}`).
     pub k: usize,
     /// Correlated query paths.
     pub queries: usize,
@@ -44,6 +68,24 @@ impl Default for PcsParams {
             queries: 40,
             domain: "magnetar/pcs/default".to_string(),
         }
+    }
+}
+
+impl PcsParams {
+    /// The **chunk profile** — internal, per-chunk proofs: rate 1/2
+    /// (`k = 1`) for the fastest encode/commit and the shortest paths.
+    pub fn chunk() -> Self {
+        PcsParams {
+            k: 1,
+            queries: 40,
+            domain: "magnetar/pcs/chunk".to_string(),
+        }
+    }
+
+    /// The **wrap profile** — the public artifact: the conservative
+    /// default (rate 1/4, `k = 2`).
+    pub fn wrap() -> Self {
+        PcsParams::default()
     }
 }
 

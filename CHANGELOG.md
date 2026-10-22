@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+### The register-shift stage-select extension (complete)
+
+- Register shifts (`SLL/SRL/SRA` by register) now prove end to end: the
+  6-stage decomposition chains through the trash cell **in the public
+  ROM fields** (stage 0 reads the source register, later stages read
+  cell 32, intermediate stages write it back) — no scratch register, x0
+  stays hardwired to zero, and the register Twist's one-write-per-cycle
+  model authenticates the chain unchanged.
+- The ROM gains the `sel_stage` one-hot (authenticated through the
+  fetch like every other selector) and the shift-kind column goes live
+  on stage rows; the router's amount selector becomes the
+  witness-conditional pair `{identity, shift-by-2^k}`.
+- The **stage-selector sum-check** (`magnetar-memory::discharge`) binds
+  the condition bit to bit k of the amount register (the `store-src`
+  copy segment) and yields the structured stage part's claim; the
+  `sel_lo` selector check composes it additively in characteristic two,
+  forcing `Q_lo = ROM(sel_lo) + STAGE` at the router's random point.
+- Five new tamper classes (the stage claim, a round, both terminals,
+  the stage selector) are rejected; the e2e register-shift program
+  covers SLL, SRL, and SRA with negative sources.
+
+### Claim aggregation (roadmap Horizon 2) and the dual-rate schedule
+
+- **`keygen_aggregate` / `prove_multi` / `verify_multi`**: K segments
+  share ONE Mosaic commitment (the components' subcubes gain the
+  `log2(K)` index dimension) and ONE evaluation argument — the
+  byte-dominant part of every hash-based proof is paid once,
+  independent of K. Measured: 3.46x smaller than the standalone
+  counterfactual at K=4.
+- **`PcsParams::chunk()` (rate 1/2) / `wrap()` (rate 1/4)**: the
+  dual-rate profiles, with the honest analysis of what the rate does
+  and does not move in the affine-substitution code
+  (`docs/architecture/pcs.md`).
+- The proof structure is now `Proof { commitment, segments: Vec<SegmentProof>,
+  mosaic }` — the single-segment API is the K=1 wrapper.
+- The **cost model** (`stats.rs`) prints the aggregation ledger:
+  measured per-segment sum-check bytes, the measured single evaluation
+  argument, and the analytic standalone counterfactual.
+- New CLI: `magnetar agg [segments] [chunk|wrap]`.
+
+### Correctness fixes (found by the new full-circuit satisfiability harness)
+
+- **Trace padding**: the witness cube is now filled exactly to the
+  proving bound (`execute_padded`); previously, programs whose cycle
+  count rounded below the bound left zero rows that violated the
+  per-cycle constraints.
+- **Inverted sub-word-load zero-extension masks**: byte loads zero
+  `rd` bits 8–63 and half loads bits 16–63, masked by the load-width
+  flags only — previously the mask also zeroed non-load cycles, making
+  any ALU result with high bits set (e.g. a negative ADDI) unprovable.
+- New regression tests evaluate both R1CS relations on every witness
+  row of representative programs (`witness_sat_tests`).
+
+### Documentation
+
+- `docs/architecture/` — ten production-grade component deep-dives
+  (fields, sum-check, PCS, Mosaic, Spartan, memory, router, CPU,
+  protocol, cost model), each mapping code to paper sections.
+- `ROADMAP.md` — the implemented-status table, the horizon program, and
+  the 150M-cycles/s GPU study's build order as the future plans.
+
 ## 0.2.0 (unreleased)
 
 ### The complete protocol

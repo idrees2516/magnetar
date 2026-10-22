@@ -3,9 +3,24 @@
 //!
 //! Register-shift instructions (`SLL/SRL/SRA` by register) expand into a
 //! fixed sequence of **static routing stages** (§5.4): a 6-stage binary
-//! decomposition of the shift amount, each stage a static shift by
-//! `2^k·bit_k(amount)`, with the shift output selected stage by stage.
-//! Immediate shifts are already static routings and stay single.
+//! decomposition of the shift amount, each stage a static routing by
+//! `2^k` selected by bit `k` of the amount register, with the shift output
+//! selected stage by stage (the **register-shift stage-select** extension).
+//!
+//! The stage chain runs through the **trash cell 32** (the same cell the
+//! `rd == 0` redirect already uses): stage 0 reads the source register,
+//! every later stage reads the trash cell (the previous stage's output),
+//! and intermediate stages write the trash cell back — so the chain is
+//! expressed entirely in the public ROM fields (`rs1`/`rd`) that the
+//! register BinaryTwist's one-write-per-cycle model already authenticates.
+//! No scratch register is touched and `x0` stays hardwired to zero.
+//!
+//! The amount-bit condition itself is witness data: each stage's routing
+//! is the *pair* `{identity, shift-by-2^k}` and the fetched row's
+//! `sel_stage` one-hot (see `magnetar-zkvm`'s `RomTables`) fixes which
+//! pair. The **stage-selector sum-check** (`magnetar-memory`'s `discharge`)
+//! binds the selected bit to bit `k` of the `rs2` segment and hands the
+//! router's amount selector its conditional claim.
 //!
 //! The micro-PC indexes the expanded program; branch targets are mapped to
 //! the micro-PC of the target instruction's first virtual instruction.
@@ -85,8 +100,15 @@ pub fn expand_program(program: &[u32]) -> ExpandedProgram {
                 let is_reg_shift = inst.opcode == Opcode::Op && matches!(inst.funct3, 1 | 5);
                 let is_imm_shift = inst.opcode == Opcode::OpImm && matches!(inst.funct3, 1 | 5);
                 if is_reg_shift {
-                    // 6 static stages: stage k shifts by 2^k if bit k of
-                    // the amount is set (amount = rs2's value).
+                    // 6 static stages: stage k routes by 2^k when bit k of
+                    // the amount (rs2's value) is set, and by 0 (the
+                    // identity routing) otherwise.
+                    //
+                    // The chain runs through the trash cell: stage 0 reads
+                    // the source register, later stages read cell 32 (the
+                    // previous stage's output); intermediate stages write
+                    // cell 32 back (`rd = 0` → the trash redirect), and the
+                    // last stage writes the instruction's true destination.
                     for stage in 0..SHIFT_STAGES {
                         rows.push(VirtualInst {
                             row: RomRow {
@@ -94,13 +116,19 @@ pub fn expand_program(program: &[u32]) -> ExpandedProgram {
                                 rd: if stage == SHIFT_STAGES - 1 {
                                     inst.rd
                                 } else {
-                                    0 // intermediate stages use a scratch
-                                      // (the interpreter chains stages)
+                                    0 // intermediate stages: the trash cell
+                                      // (rd == 0 → redirect to 32)
                                 },
-                                rs1: inst.rs1,
+                                rs1: if stage == 0 {
+                                    inst.rs1
+                                } else {
+                                    32 // the trash cell (the accumulator)
+                                },
                                 rs2: inst.rs2,
                                 funct3: inst.funct3,
-                                imm: inst.imm as Word,
+                                // The bus carries the stage index in the
+                                // immediate field (self-describing rows).
+                                imm: stage as Word,
                                 raw,
                             },
                         });
