@@ -1,0 +1,45 @@
+# Manual bring-up workflow for `magnetar-bitsum`'s `cutile` feature (the
+# Phase-1 GPU kernels). The feature requires the CUDA 13.x toolkit at BUILD
+# time, which stock CI runners and this repository's default build never
+# provide — that is why it is optional and why this job is manual:
+#
+#   Actions tab -> Run workflow
+#
+# On a runner without a GPU the parity tests print SKIP; the job still
+# validates that the kernels COMPILE against the real cutile/cuda-bindings
+# toolchain. On a runner with an sm_80+ GPU, BITSUM_GPU_TESTS=1 runs the
+# full acceptance gate (kernel parity + full-prover parity vs the CPU
+# oracle).
+name: bitsum-cuda
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cutile:
+    name: cutile build + parity gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CUDA 13.x toolkit
+        uses: Jimver/cuda-toolkit@v2
+        with:
+          cuda: '13.3.0'
+          method: network
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the cutile feature (JIT-capable host + kernels)
+        run: cargo build -p magnetar-bitsum --features cutile
+      - name: Parity acceptance gate
+        env:
+          BITSUM_GPU_TESTS: '1'
+        run: >
+          cargo test -p magnetar-bitsum --features cutile
+          --test gpu_parity --release
+      - name: GPU bench (informational)
+        run: >
+          cargo run --release -p magnetar-bitsum --features cutile
+          --example bench_gpu -- 20 || true
