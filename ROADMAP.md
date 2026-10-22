@@ -18,11 +18,12 @@ lever swaps in at a crate boundary without touching the protocol
 
 | Capability | State | Where |
 |---|---|---|
-| Full Construction 3 (7-step protocol, all claims through ONE commitment) | done, 75 tests, tamper classes | `protocol.rs` |
+| Full Construction 3 (7-step protocol, all claims through ONE commitment) | done, 108 tests, tamper classes | `protocol.rs` |
 | Register-shift **stage-select** (the documented extension) | done — the trash-cell stage chain, the `sel_stage` ROM one-hot, the stage-selector sum-check, additive claim composition | `cpu/expand.rs`, `zkvm/rom.rs`, `memory/discharge.rs`, `protocol.rs` |
 | **Claim aggregation** (Horizon 2, "aggregation before the wrap") | done — K segments, ONE commitment, ONE evaluation argument; measured 3.46x at K=4 | `prove_multi`, `docs/architecture/mosaic.md` |
 | **Dual-rate schedule** (Horizon 1/2) | done — `PcsParams::chunk()` (1/2) / `wrap()` (1/4), measured by the CLI | `pcs/eval.rs`, `cost-model.md` |
 | Measured cost model | done — committed-bit inventory, byte breakdown, the aggregation ledger, the standalone counterfactual | `stats.rs` |
+| **Bitsliced sum-check kernel** (GPU program Phase 1) | done — tested host oracle + cuTile kernel spec (`magnetar-bitsum`); hardware bring-up pending (manual `bitsum-cuda` workflow + `gpu_parity` gate) | `magnetar-bitsum`, `docs/architecture/bitsum.md` |
 | Production hardening | done — CI (fmt, clippy `-D warnings`, tests, CLI smoke), SECURITY/CONTRIBUTING/CHANGELOG, dependabot, issue/PR templates, the indexed docs site | repo root |
 
 Two latent correctness bugs were found and fixed while landing the
@@ -115,7 +116,13 @@ crate boundaries, none touch the protocol):
 1. **GPU sum-check kernels** (the `magnetar-sumcheck` engine's factor
    interface is the natural FFI surface: factors in, round messages
    out) — cutile-rs for the bandwidth-bound folds, cudarc for the host
-   plane, ICICLE as the reference to beat.
+   plane, ICICLE as the reference to beat. *Phase 1 landed as
+   `magnetar-bitsum`*: the bitsliced sum-check with a tested CPU oracle
+   (1.5 Melem/s measured), the repo-standard SHA3-256 transcript, a
+   verified tower↔K isomorphism, and the cuTile kernels behind the
+   `cutile` feature — hardware bring-up checklist in
+   `docs/architecture/bitsum.md`; wiring the engine's factor interface to
+   it is the remaining step.
 2. **GPU encode/commit** for the affine-substitution code (a streaming
    workload; the delta-shifted transform tiles cleanly).
 3. **Multi-GPU sharding** — the aggregation layer's coordinator-star

@@ -44,6 +44,7 @@ orchestrator — every cryptographic decision lives one layer down.
 | [cpu.md](cpu.md) | RV64I, micro-expansion, the trash-cell stage chain, the dual relation, the zero-extension semantics | §2, §4.2 |
 | [protocol.md](protocol.md) | Construction 3 end to end, transcript discipline, multi-segment aggregation | §5.5, §6.2 |
 | [cost-model.md](cost-model.md) | the measured ledger: committed bits, byte breakdown, amortization | §6, roadmap §3 |
+| [bitsum.md](bitsum.md) | the bitsliced GF(2^128) sum-check kernel (GPU program Phase 1): tower field, bit-plane layout, tree multiplier, K interop, cuTile kernels | GPU study |
 
 [lambda]: https://github.com/lambdaclass/lambda_vm
 
