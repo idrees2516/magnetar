@@ -11,6 +11,7 @@ members = [
     "crates/magnetar-cpu",
     "crates/magnetar-zkvm",
     "crates/magnetar-cli",
+    "crates/magnetar-bitsum",
 ]
 
 [workspace.package]
@@ -32,6 +33,11 @@ magnetar-memory = { path = "crates/magnetar-memory" }
 magnetar-router = { path = "crates/magnetar-router" }
 magnetar-cpu = { path = "crates/magnetar-cpu" }
 magnetar-zkvm = { path = "crates/magnetar-zkvm" }
+magnetar-bitsum = { path = "crates/magnetar-bitsum" }
+
+# NVlabs cuTile GPU kernel DSL (optional; built only with magnetar-bitsum's
+# `cutile` feature — requires the CUDA 13.x toolkit at build time).
+cutile = { version = "0.4" }
 
 # Standard, well-scrutinized hash implementations (RustCrypto / BLAKE3 team).
 sha3 = { version = "0.10", default-features = false }

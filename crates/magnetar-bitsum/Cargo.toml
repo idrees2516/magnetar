@@ -1,0 +1,30 @@
+[package]
+name = "magnetar-bitsum"
+description = "Bitsliced multilinear sum-check over GF(2^128) (tower basis): verified tower constants, 32-way bit-plane layout, the kernel-mirror tree multiplier, SHA3-256 Fiat-Shamir, K interop, and NVlabs cuTile GPU kernels behind the `cutile` feature (Phase 1 of the GPU proving program)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+magnetar-field = { workspace = true }
+magnetar-hash = { workspace = true }
+# NVlabs cuTile GPU kernels (build: CUDA 13.x toolkit; run: sm_80+). Optional
+# so the default build — and CI — stay pure Rust with no CUDA requirement.
+cutile = { workspace = true, optional = true }
+
+[features]
+default = []
+# Builds the cuTile GPU prover plane (`gpu` module, `bench_gpu` example,
+# `gpu_parity` acceptance test). Requires the CUDA 13.x toolkit at build
+# time (`CUDA_TOOLKIT_PATH`) and an sm_80+ GPU to execute.
+cutile = ["dep:cutile"]
+
+[[example]]
+name = "bench_gpu"
+required-features = ["cutile"]
+
+[[test]]
+name = "gpu_parity"
+required-features = ["cutile"]
