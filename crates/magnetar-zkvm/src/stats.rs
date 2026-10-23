@@ -84,7 +84,8 @@ impl ProofStats {
 
 /// Count field elements in a nested structure via a light recursive walk
 /// of the proof's known shapes.
-fn count_fields_proof(p: &Proof) -> (usize, Vec<(String, usize)>) {
+fn count_fields_proof(proof: &Proof) -> (usize, Vec<(String, usize)>) {
+    let p = &proof.inner;
     let _fe = |v: &[magnetar_field::Gf128]| v.len();
     let mut total = 0usize;
     let mut br = Vec::new();
@@ -201,10 +202,41 @@ fn count_fields_proof(p: &Proof) -> (usize, Vec<(String, usize)>) {
             .sum()
     };
     add("selectors", sel_n(&p.sel_shift) + sel_n(&p.sel_store));
+    // The cross-step argument.
+    let cs_n = p
+        .cross_step
+        .s1_rounds
+        .iter()
+        .map(|m| m.len())
+        .sum::<usize>()
+        + p.cross_step
+            .s2_rounds
+            .iter()
+            .map(|m| m.len())
+            .sum::<usize>()
+        + 5;
+    add("cross-step", cs_n);
+    // The final-state bindings (segments).
+    let fs_n = |fs: &Option<magnetar_memory::FinalStateProof>| -> usize {
+        fs.as_ref()
+            .map(|f| {
+                f.zero_rounds.iter().map(|m| m.len()).sum::<usize>()
+                    + f.evo_rounds.iter().map(|m| m.len()).sum::<usize>()
+                    + f.component_claims.len()
+                    + 2
+            })
+            .unwrap_or(0)
+    };
+    add("final-state", fs_n(&p.final_reg) + fs_n(&p.final_ram));
     // Mosaic.
-    let mosaic_n = p.mosaic.batch_rounds.iter().map(|m| m.len()).sum::<usize>()
+    let mosaic_n = proof
+        .mosaic
+        .batch_rounds
+        .iter()
+        .map(|m| m.len())
+        .sum::<usize>()
         + 1
-        + ring_fields(&p.mosaic.ring);
+        + ring_fields(&proof.mosaic.ring);
     add("mosaic+pcs-eval", mosaic_n);
     (total, br)
 }

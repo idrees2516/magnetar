@@ -10,6 +10,7 @@ members = [
     "crates/magnetar-router",
     "crates/magnetar-cpu",
     "crates/magnetar-zkvm",
+    "crates/magnetar-ivc",
     "crates/magnetar-cli",
 ]
 
@@ -27,6 +28,7 @@ magnetar-field = { path = "crates/magnetar-field" }
 magnetar-hash = { path = "crates/magnetar-hash" }
 magnetar-sumcheck = { path = "crates/magnetar-sumcheck" }
 magnetar-pcs = { path = "crates/magnetar-pcs" }
+magnetar-ivc = { path = "crates/magnetar-ivc" }
 magnetar-spartan = { path = "crates/magnetar-spartan" }
 magnetar-memory = { path = "crates/magnetar-memory" }
 magnetar-router = { path = "crates/magnetar-router" }

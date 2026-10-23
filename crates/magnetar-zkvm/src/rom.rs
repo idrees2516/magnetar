@@ -13,6 +13,14 @@ pub struct RomTables {
     /// The instruction bus bits: `bus[o | (k << 6)]` = bit `o` of row
     /// `k`'s bus `op‖rd‖rs1‖rs2‖funct3‖imm`.
     pub bus: Vec<Gf128>,
+    /// The cross-step transition table `TT(k, k', t, h)` (Remark 4):
+    /// 1 exactly when the next fetch address is `k'` given the current
+    /// fetch `k`, the branch-taken flag `t`, and the halt latch `h` —
+    /// `h = 1` freezes (`k' = k`); `h = 0` follows the branch direction.
+    /// Indexed `k | k'<<a | t<<2a | h<<(2a+1)`.
+    pub tt: Vec<Gf128>,
+    /// Whether the program contains `JALR` (rejected at keygen).
+    pub has_jalr: bool,
     /// The shift amount one-hot columns: `sel_lo[h | (k << amount_bits)]`
     /// (zero on non-shift rows).
     pub sel_lo: Vec<Gf128>,
@@ -31,6 +39,41 @@ impl RomTables {
         let mut sel_lo = vec![ZERO; (1usize << amount_bits) * row_count];
         let mut sel_hi = vec![ZERO; 4 * row_count];
         let mut sel_st = vec![ZERO; 4 * row_count];
+        // The successor tables N₀/N₁ per row (the branch directions).
+        let len = rows.len();
+        let mut next0 = vec![0usize; row_count];
+        let mut next1 = vec![0usize; row_count];
+        let mut has_jalr = false;
+        for (k, inst) in rows.iter().enumerate() {
+            let row = &inst.row;
+            match row.kind {
+                VirtualKind::System => {
+                    // The halt freeze.
+                    next0[k] = k;
+                    next1[k] = k;
+                }
+                VirtualKind::Branch => {
+                    next0[k] = (k + 1) % len;
+                    let target = (k as i64 + (row.imm as i64) / 4).max(0) as usize;
+                    next1[k] = target % len;
+                }
+                VirtualKind::Jump if (row.raw & 0x7f) == 0x67 => {
+                    // JALR: the target is data-dependent — unsupported.
+                    has_jalr = true;
+                    next0[k] = (k + 1) % len;
+                    next1[k] = (k + 1) % len;
+                }
+                VirtualKind::Jump => {
+                    let target = (k as i64 + (row.imm as i64) / 4).max(0) as usize;
+                    next0[k] = target % len;
+                    next1[k] = target % len;
+                }
+                _ => {
+                    next0[k] = (k + 1) % len;
+                    next1[k] = (k + 1) % len;
+                }
+            }
+        }
         for (k, inst) in rows.iter().enumerate() {
             let row = &inst.row;
             // The instruction bus: op(7) | rd(6) | rs1(6) | rs2(6) |
@@ -76,8 +119,27 @@ impl RomTables {
                 _ => {}
             }
         }
+        // The flat transition table.
+        let a = a_rom;
+        let mut tt = vec![ZERO; 1usize << (2 * a + 2)];
+        for k in 0..row_count {
+            for t in 0..2usize {
+                for h in 0..2usize {
+                    let target = if h == 1 {
+                        k
+                    } else if t == 1 {
+                        next1[k]
+                    } else {
+                        next0[k]
+                    };
+                    tt[k | (target << a) | (t << (2 * a)) | (h << (2 * a + 1))] = ONE;
+                }
+            }
+        }
         RomTables {
             a_rom,
+            tt,
+            has_jalr,
             bus,
             sel_lo,
             sel_hi,

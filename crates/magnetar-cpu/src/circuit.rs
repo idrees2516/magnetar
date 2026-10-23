@@ -59,14 +59,15 @@ impl WITNESS_LAYOUT {
     pub const IDX_BITS: usize = 6;
     pub const FUNCT3_BITS: usize = 3;
     pub const IMM_BITS: usize = 13;
-    // Total witness columns (before padding).
-    pub const W_COLS: usize = 1024;
+    // Total witness columns (before padding). 2048 leaves room for the
+    // comparison/flag-derivation aux (the Remark-4 cross-step support).
+    pub const W_COLS: usize = 2048;
     /// The `1` column index in `z`.
     pub const ONE_COL: usize = Self::W_COLS;
     /// Public inputs per cycle.
     pub const X_COLS: usize = Self::M / 2 - 1;
     /// Total columns `m = 2·|w|` (power of two).
-    pub const M: usize = 2048;
+    pub const M: usize = 4096;
 
     // ---- Virtual segments ----
     pub const RS1: usize = 0;
@@ -99,8 +100,36 @@ impl WITNESS_LAYOUT {
     pub const CH2: usize = 944; // 8: EQB·is_load_half
     pub const NH: usize = 952; // (1+is_word)(1+is_half)
     pub const WNL: usize = 953; // we·(1+is_load) — the write mux gate
+                                // ---- Cross-step / flag-derivation aux (1024.., one 1024-wide
+                                // virtual segment; the 960..1024 gap stays zero so the segments tile
+                                // the witness half exactly) ----
+    /// The running zero-product of the ALU word: z_i = Π_{j≤i}(1+alu_j);
+    /// z_63 = [alu == 0] (the branch equality indicator).
+    pub const ZERO: usize = 1024; // 64
+    /// The running [opcode == SYSTEM (0x73)] product (7 bits).
+    pub const OPSYS: usize = 1088; // 7
+    /// The running [opcode == BRANCH (0x63)] product.
+    pub const OPBR: usize = 1095; // 7
+    /// The funct3 equality intermediates: m_f = (1+f3_0+f_0)(1+f3_1+f_1).
+    pub const EQFM: usize = 1102; // 8
+    /// The funct3 equalities: e_f = m_f·(1+f3_2+f_2).
+    pub const EQF: usize = 1110; // 8
+    /// The signed-lt products (see build_circuit).
+    pub const LTSA: usize = 1118;
+    pub const LTSB: usize = 1119;
+    /// The unsigned-lt (borrow) products.
+    pub const LTUA: usize = 1120;
+    pub const LTUB: usize = 1121;
+    /// The comparison mux: (e_0+e_1)·z_63, (e_4+e_5)·lt_s, (e_6+e_7)·lt_u.
+    pub const CEQ: usize = 1122;
+    pub const CLT: usize = 1123;
+    pub const CLU: usize = 1124;
+    /// The gated zero-extension: ZE16 = (1+ld_word)·is_load,
+    /// ZE8 = NH·is_load (the load zero-extension applies ONLY on loads).
+    pub const ZE16: usize = 1125;
+    pub const ZE8: usize = 1126;
     /// First unused witness column.
-    pub const USED: usize = 960;
+    pub const USED: usize = 1127;
 
     // Flag bit positions (within FLAGS).
     pub const F_SUB: usize = 0;
@@ -114,6 +143,8 @@ impl WITNESS_LAYOUT {
     pub const F_LD_BYTE: usize = 8;
     pub const F_LD_HALF: usize = 9;
     pub const F_LD_WORD: usize = 10;
+    /// The branch-taken flag (derived: `branch_row ∧ comparison`).
+    pub const F_TAKEN: usize = 11;
 
     // The fetch bus field positions.
     pub const BUS_OP: usize = 0;
@@ -197,6 +228,78 @@ pub fn witness_row(rec: &CycleRecord, row: &RomRow, public_x: &[Gf128]) -> Vec<G
     }
     // The instruction bus.
     put_bus(&mut z, WITNESS_LAYOUT::FETCH, row);
+    // The branch-taken flag (the derivation constraints check it equals
+    // `branch_row ∧ comparison`).
+    z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_TAKEN] = Gf128(rec.branch_taken as u128);
+    // ---- The cross-step / flag-derivation aux ----
+    // The running zero-product of the ALU word.
+    {
+        let mut zp = ONE;
+        for i in 0..64usize {
+            zp = Gf128(((zp.0 == 1) && ((alu >> i) & 1 == 0)) as u128);
+            z[WITNESS_LAYOUT::ZERO + i] = zp;
+        }
+    }
+    // The opcode indicators (running products).
+    let mut bus_bits = [false; 7];
+    for (i, b) in bus_bits.iter_mut().enumerate() {
+        *b = z[WITNESS_LAYOUT::FETCH + i] == ONE;
+    }
+    let mut f3_bits = [false; 3];
+    for (i, b) in f3_bits.iter_mut().enumerate() {
+        *b = z[WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_FUNCT3 + i] == ONE;
+    }
+    for (target, opcode) in [
+        (WITNESS_LAYOUT::OPSYS, 0x73u32),
+        (WITNESS_LAYOUT::OPBR, 0x63),
+    ] {
+        let mut acc = true;
+        for i in 0..7usize {
+            acc = acc && (bus_bits[i] == ((opcode >> i) & 1 == 1));
+            z[target + i] = Gf128(acc as u128);
+        }
+    }
+    // The funct3 equalities.
+    for f in 0..8usize {
+        let m = (f3_bits[0] == (f & 1 == 1)) && (f3_bits[1] == ((f >> 1) & 1 == 1));
+        z[WITNESS_LAYOUT::EQFM + f] = Gf128(m as u128);
+        let e = m && (f3_bits[2] == ((f >> 2) & 1 == 1));
+        z[WITNESS_LAYOUT::EQF + f] = Gf128(e as u128);
+    }
+    // The comparison products.
+    let rs1_63 = rec.rs1_val >> 63 & 1 == 1;
+    let rs2_63 = rec.rs2_val >> 63 & 1 == 1;
+    let alu_63 = alu >> 63 & 1 == 1;
+    let lt_s = if rs1_63 != rs2_63 { rs1_63 } else { alu_63 };
+    // LTSA = (rs1_63+rs2_63)·rs1_63 = [signs differ]·rs1_63;
+    // LTSB = (1+rs1_63+rs2_63)·alu_63 = [signs equal]·alu_63;
+    // lt_s = LTSA + LTSB.
+    z[WITNESS_LAYOUT::LTSA] = Gf128(((rs1_63 != rs2_63) && rs1_63) as u128);
+    z[WITNESS_LAYOUT::LTSB] = Gf128(((rs1_63 == rs2_63) && alu_63) as u128);
+    // lt_u = 1 + carry_out of t1 + t2 + c0 (the borrow of rs1 - rs2).
+    let t1_63 = t1 >> 63 & 1 == 1;
+    let t2_63 = t2 >> 63 & 1 == 1;
+    let c63 = carry >> 63 & 1 == 1;
+    let ltua = t1_63 && t2_63;
+    let ltub = c63 && (t1_63 != t2_63);
+    z[WITNESS_LAYOUT::LTUA] = Gf128(ltua as u128);
+    z[WITNESS_LAYOUT::LTUB] = Gf128(ltub as u128);
+    let lt_u = !(ltua ^ ltub);
+    // The comparison mux: (e0+e1)·z63, (e4+e5)·lt_s, (e6+e7)·lt_u.
+    let mut zf = [false; 8];
+    for (i, b) in zf.iter_mut().enumerate() {
+        *b = z[WITNESS_LAYOUT::EQF + i] == ONE;
+    }
+    let zz = z[WITNESS_LAYOUT::ZERO + 63] == ONE;
+    z[WITNESS_LAYOUT::CEQ] = Gf128(((zf[0] || zf[1]) && zz) as u128);
+    z[WITNESS_LAYOUT::CLT] = Gf128(((zf[4] || zf[5]) && lt_s) as u128);
+    z[WITNESS_LAYOUT::CLU] = Gf128(((zf[6] || zf[7]) && lt_u) as u128);
+    // The gated load zero-extension.
+    let ld_word_b = rec.ld_word;
+    let is_load_b = rec.is_load;
+    let nh_val = !rec.ld_word && !rec.ld_half;
+    z[WITNESS_LAYOUT::ZE16] = Gf128((!ld_word_b && is_load_b) as u128);
+    z[WITNESS_LAYOUT::ZE8] = Gf128((nh_val && is_load_b) as u128);
     // The byte-lane eq aux (over the store/load offset).
     let off = rec.byte_offset as usize & 7;
     for a in 0..8usize {
@@ -438,17 +541,35 @@ pub fn build_circuit() -> CircuitSpec {
             &[(WITNESS_LAYOUT::NH, ONE)],
         );
     }
-    // 6. Zero-extension: (1+ld_word)·rd_b = 0 for b ≥ 16; NH·rd_b = 0 for
-    // 8 ≤ b < 16.
+    // 6. The gated load zero-extension: on byte/half loads the unloaded
+    // high bits of rd are zero. ZE16 = (1+ld_word)·is_load and
+    // ZE8 = NH·is_load gate it (an ungated rule would wrongly zero ALU
+    // results with high bits set).
+    add(
+        &mut a1,
+        &mut b1,
+        &mut c1,
+        &[
+            (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_WORD, ONE),
+            (WITNESS_LAYOUT::ONE_COL, ONE),
+        ],
+        &[(WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_IS_LOAD, ONE)],
+        &[(WITNESS_LAYOUT::ZE16, ONE)],
+    );
+    add(
+        &mut a1,
+        &mut b1,
+        &mut c1,
+        &[(WITNESS_LAYOUT::NH, ONE)],
+        &[(WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_IS_LOAD, ONE)],
+        &[(WITNESS_LAYOUT::ZE8, ONE)],
+    );
     for b in 16..64 {
         add(
             &mut a1,
             &mut b1,
             &mut c1,
-            &[
-                (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_WORD, ONE),
-                (WITNESS_LAYOUT::ONE_COL, ONE),
-            ],
+            &[(WITNESS_LAYOUT::ZE16, ONE)],
             &[(WITNESS_LAYOUT::RD + b, ONE)],
             &[],
         );
@@ -458,9 +579,212 @@ pub fn build_circuit() -> CircuitSpec {
             &mut a1,
             &mut b1,
             &mut c1,
-            &[(WITNESS_LAYOUT::NH, ONE)],
+            &[(WITNESS_LAYOUT::ZE8, ONE)],
             &[(WITNESS_LAYOUT::RD + b, ONE)],
             &[],
+        );
+    }
+
+    // ---- The cross-step / flag-derivation constraints (Remark 4) ----
+    // The linear-combo helper over (column, coeff) pairs.
+    {
+        let one = WITNESS_LAYOUT::ONE_COL;
+        // The zero-chain: z_0 = 1+alu_0 (linear); z_i = z_{i-1}·(1+alu_i).
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[
+                (WITNESS_LAYOUT::ZERO, ONE),
+                (WITNESS_LAYOUT::ALU, ONE),
+                (one, ONE),
+            ],
+            &[(one, ONE)],
+            &[],
+        );
+        for i in 1..64 {
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &[(WITNESS_LAYOUT::ZERO + i - 1, ONE)],
+                &[(WITNESS_LAYOUT::ALU + i, ONE), (one, ONE)],
+                &[(WITNESS_LAYOUT::ZERO + i, ONE)],
+            );
+        }
+        // The opcode running products: ops_0/opbr_0 linear, then products.
+        for (target, opcode) in [
+            (WITNESS_LAYOUT::OPSYS, 0x73u32),
+            (WITNESS_LAYOUT::OPBR, 0x63),
+        ] {
+            let bit0 = (opcode & 1) as u128;
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &[
+                    (target, ONE),
+                    (WITNESS_LAYOUT::FETCH, ONE),
+                    (one, Gf128(1 ^ bit0)),
+                ],
+                &[(one, ONE)],
+                &[],
+            );
+            for i in 1..7 {
+                let bit = (opcode >> i) & 1;
+                add(
+                    &mut a1,
+                    &mut b1,
+                    &mut c1,
+                    &[(target + i - 1, ONE)],
+                    &[
+                        (WITNESS_LAYOUT::FETCH + i, ONE),
+                        (one, Gf128(1 ^ (bit as u128))),
+                    ],
+                    &[(target + i, ONE)],
+                );
+            }
+        }
+        // F_HALT ⟺ opcode == SYSTEM: halt·(1+ops_6) = 0 and
+        // (1+halt)·ops_6 = 0.
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_HALT, ONE)],
+            &[(WITNESS_LAYOUT::OPSYS + 6, ONE), (one, ONE)],
+            &[],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[
+                (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_HALT, ONE),
+                (one, ONE),
+            ],
+            &[(WITNESS_LAYOUT::OPSYS + 6, ONE)],
+            &[],
+        );
+        // The funct3 equalities: m_f = (1+f3_0+f_0)(1+f3_1+f_1),
+        // e_f = m_f·(1+f3_2+f_2).
+        let f3b = |i: usize| WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_FUNCT3 + i;
+        for f in 0..8usize {
+            let b0 = (f & 1) as u128;
+            let b1_ = ((f >> 1) & 1) as u128;
+            let b2 = ((f >> 2) & 1) as u128;
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &[(f3b(0), ONE), (one, Gf128(1 ^ b0))],
+                &[(f3b(1), ONE), (one, Gf128(1 ^ b1_))],
+                &[(WITNESS_LAYOUT::EQFM + f, ONE)],
+            );
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &[(WITNESS_LAYOUT::EQFM + f, ONE)],
+                &[(f3b(2), ONE), (one, Gf128(1 ^ b2))],
+                &[(WITNESS_LAYOUT::EQF + f, ONE)],
+            );
+        }
+        // The comparison products.
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[
+                (WITNESS_LAYOUT::RS1 + 63, ONE),
+                (WITNESS_LAYOUT::RS2 + 63, ONE),
+            ],
+            &[(WITNESS_LAYOUT::RS1 + 63, ONE)],
+            &[(WITNESS_LAYOUT::LTSA, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[
+                (WITNESS_LAYOUT::RS1 + 63, ONE),
+                (WITNESS_LAYOUT::RS2 + 63, ONE),
+                (one, ONE),
+            ],
+            &[(WITNESS_LAYOUT::ALU + 63, ONE)],
+            &[(WITNESS_LAYOUT::LTSB, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::T1 + 63, ONE)],
+            &[(WITNESS_LAYOUT::T2 + 63, ONE)],
+            &[(WITNESS_LAYOUT::LTUA, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::CARRY_OFF + 63, ONE)],
+            &[
+                (WITNESS_LAYOUT::T1 + 63, ONE),
+                (WITNESS_LAYOUT::T2 + 63, ONE),
+            ],
+            &[(WITNESS_LAYOUT::LTUB, ONE)],
+        );
+        // The comparison mux: CEQ = (e_0+e_1)·z_63, CLT = (e_4+e_5)·lt_s
+        // with lt_s = LTSA+LTSB, CLU = (e_6+e_7)·lt_u with
+        // lt_u = 1+LTUA+LTUB.
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::EQF, ONE), (WITNESS_LAYOUT::EQF + 1, ONE)],
+            &[(WITNESS_LAYOUT::ZERO + 63, ONE)],
+            &[(WITNESS_LAYOUT::CEQ, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[
+                (WITNESS_LAYOUT::EQF + 4, ONE),
+                (WITNESS_LAYOUT::EQF + 5, ONE),
+            ],
+            &[(WITNESS_LAYOUT::LTSA, ONE), (WITNESS_LAYOUT::LTSB, ONE)],
+            &[(WITNESS_LAYOUT::CLT, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[
+                (WITNESS_LAYOUT::EQF + 6, ONE),
+                (WITNESS_LAYOUT::EQF + 7, ONE),
+            ],
+            &[
+                (WITNESS_LAYOUT::LTUA, ONE),
+                (WITNESS_LAYOUT::LTUB, ONE),
+                (one, ONE),
+            ],
+            &[(WITNESS_LAYOUT::CLU, ONE)],
+        );
+        // F_TAKEN = opbr_6·comp with comp = CEQ + e_1 + CLT + e_5 + CLU + e_7.
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::OPBR + 6, ONE)],
+            &[
+                (WITNESS_LAYOUT::CEQ, ONE),
+                (WITNESS_LAYOUT::EQF + 1, ONE),
+                (WITNESS_LAYOUT::CLT, ONE),
+                (WITNESS_LAYOUT::EQF + 5, ONE),
+                (WITNESS_LAYOUT::CLU, ONE),
+                (WITNESS_LAYOUT::EQF + 7, ONE),
+            ],
+            &[(WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_TAKEN, ONE)],
         );
     }
 
@@ -543,7 +867,10 @@ pub fn build_circuit() -> CircuitSpec {
         &[(WITNESS_LAYOUT::ONE_COL, ONE)],
         &[(WITNESS_LAYOUT::CARRY_OFF, ONE)],
     );
-    // The halt-latch I/O binding: halt·(Σβ·rd + x_out) = 0.
+    // The halt-latch I/O bindings: halt·(Σβ·rd + x_out) = 0 (the public
+    // output) and halt·(Σβ·(rd + rs1)) = 0 (the halt row reads x10 — the
+    // expansion sets its rs1 = 10 — so rd = the register file's x10,
+    // authenticated by the register Twist: x_out = x10 at halt).
     {
         let mut b_entries: Vec<(usize, Gf128)> = Vec::new();
         for i in 0..64 {
@@ -556,6 +883,19 @@ pub fn build_circuit() -> CircuitSpec {
             &mut c2,
             &[(WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_HALT, ONE)],
             &b_entries,
+            &[],
+        );
+        let mut b2_entries: Vec<(usize, Gf128)> = Vec::new();
+        for i in 0..64 {
+            b2_entries.push((WITNESS_LAYOUT::RD + i, Gf128(1u128 << i)));
+            b2_entries.push((WITNESS_LAYOUT::RS1 + i, Gf128(1u128 << i)));
+        }
+        add_k(
+            &mut a2,
+            &mut b2,
+            &mut c2,
+            &[(WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_HALT, ONE)],
+            &b2_entries,
             &[],
         );
     }

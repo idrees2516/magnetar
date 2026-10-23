@@ -137,6 +137,10 @@ name = "magnetar-cli"
 version = "0.1.0"
 dependencies = [
  "magnetar-cpu",
+ "magnetar-field",
+ "magnetar-ivc",
+ "magnetar-memory",
+ "magnetar-pcs",
  "magnetar-zkvm",
 ]
 
@@ -164,6 +168,18 @@ dependencies = [
  "magnetar-field",
  "rand",
  "sha3",
+]
+
+[[package]]
+name = "magnetar-ivc"
+version = "0.1.0"
+dependencies = [
+ "magnetar-cpu",
+ "magnetar-field",
+ "magnetar-hash",
+ "magnetar-pcs",
+ "magnetar-zkvm",
+ "rand",
 ]
 
 [[package]]

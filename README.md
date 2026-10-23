@@ -16,6 +16,18 @@ Magnetar fib(2) — 16 virtual cycles, output = 3
 prove: 1.7 s, verify: 29 ms, accepted: true
 ```
 
+## Status
+
+The complete Construction-3 protocol is implemented and tested end-to-end,
+including the Remark-4 cross-step constraints (the pc transition chain,
+the flag derivations, the ECALL output binding) and tree-IVC with shared
+commitments. See [`docs/STATUS.md`](docs/STATUS.md) for the honest
+implemented/not-implemented accounting (the top remaining items: the
+data-path decode-vs-flag constraints, the streaming Twist/Shout provers,
+ZK, recursion) and
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the measured comparison
+with the paper's figures.
+
 ## Architecture
 
 Following the paper's layering (in the spirit of LambdaVM's
@@ -29,10 +41,11 @@ field/utils/proof/arith/cpu split), one crate per component:
 | `magnetar-pcs` | §3.6, §5.2 | The hash-based multilinear commitment in Ligerito's role: affine-substitution codewords `C(x,ε) = T̂(x + L(ε))`, the FRI-style fold chain with correlated path queries and fully-revealed tails, plus **ring switching** (c\*-folded tables anchored to the main commitment with exact `φ_c` bit extraction) |
 | `magnetar-spartan` | §4.1–§4.3, §5.3 | Sparse R1CS, the SIMD (Phalanx) reduction, **Virtual Spartan** (Construction 2): two relations in lockstep over one shared witness, α-batched single inner sum-check, per-segment claims via `eq(q_i, b_i)` |
 | `magnetar-memory` | §4.4 | **BinaryTwist** (Val reconstruction with LT, read/write identities over the joint (k,o,j) space, sum-to-one, increments) and **BinaryShout** (the Φ-combination check with α₀ sum-forcing), both with the paper's **refined one-hotness** (Frobenius Δ\*: `s_h = r_h²`, `r'_h = r_h³/c_h`), plus the **discharge helpers** (§5.5 steps 3–6: the Ψ-sum-checks binding eq-weighted address/index claims, the joint-space bytecode Shout, the per-factor selector checks) |
-| `magnetar-router` | §5.4 | **BinaryRouter**: routing-identity sum-checks over the joint (o,j,u,h) space for shifts (`R_sh`, Eq. 5, two one-hot selector fields) and sub-word stores (`R_st`, Eq. 6, byte-offset variables linked via `eq(a_k, â_k(j))`) |
+| `magnetar-router` | §5.4 | **BinaryRouter**: routing-identity sum-checks over the joint (o,j,u,h) space for shifts (`R_sh`, Eq. 5, two one-hot selector fields) and sub-word stores (`R_st`, Eq. 6, byte-offset variables linked via `eq(a_k, â_k(j))`), with the **join-enumeration prover** — the paper's linear-in-T prover work (§5.4) |
 | `magnetar-cpu` | §5.1 | The complete RV64I decoder, microcode expansion (register shifts → 6 static-routing stages), the interpreter with the virtual-cycle trace, and the **dual SIMD R1CS circuit** (the F₂ bit constraints: booleanity + the 64-bit adder carry chain; the K packed products: the word-wide write mux, the packed sum identity, the halt-latch I/O binding) |
 | `magnetar-zkvm` | §5.2, §5.5 | **MosaicPCS** with the component layout (direct segments + the auxiliary one-hot/increment polynomials on aligned subcubes, the Equation-4 suffix lift), the **complete Construction-3 protocol** (all seven steps), the bytecode ROM tables, and the **proof-size instrumentation** |
 | `magnetar-cli` | — | The `magnetar` binary |
+| `magnetar-ivc` | roadmap §8.2 | **Tree-IVC**: segments proved independently in their own transcripts, sharing ONE MosaicPCS commitment; boundary chaining via the Remark-4 final-state bindings and public point claims; claim batching at the root |
 
 ## The protocol (Construction 3)
 

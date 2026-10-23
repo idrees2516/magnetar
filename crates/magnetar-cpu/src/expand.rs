@@ -193,7 +193,12 @@ pub fn expand_program(program: &[u32]) -> ExpandedProgram {
                     row: RomRow {
                         kind: VirtualKind::System,
                         rd: 0,
-                        rs1: 0,
+                        // The halt row reads x10 (the output register): the
+                        // R1CS halt-latch binding `halt·(rd + rs1) = 0` then
+                        // ties the public output to the register file
+                        // through the register Twist (Remark 4's I/O
+                        // binding).
+                        rs1: 10,
                         rs2: 0,
                         funct3: 0,
                         imm: 0,

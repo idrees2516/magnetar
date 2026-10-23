@@ -33,13 +33,19 @@
 //!   point. On non-store cycles the selector is identically zero, which
 //!   forces `Inc = 0`.
 //!
-//! Joint-space layout (little-endian, low to high): `o | j | u | h | a`.
+//! Joint-space layout (little-endian, bind order): `a | o | h | u | j` —
+//! the store offset bits, output, routing, source, and cycle index last.
+//! See [`join`] for the linear-in-T prover this enables.
 
 #![forbid(unsafe_code)]
 // Proof-system style: loops indexed over Boolean-cube coordinates and
 // multi-input reductions are the domain's normal shape.
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
+
+pub mod join;
+
+pub use join::{prove_routing_join, JoinWitness, RoutingTensor, SelCol};
 
 use magnetar_field::{Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
@@ -49,53 +55,9 @@ use magnetar_sumcheck::{
     BindOrder, RoundMsg, Term,
 };
 
-/// A public table over a subset of the joint variables, padded across the
-/// rest (padding leaves the MLE unchanged: the eq folds over idle variables
-/// sum to one).
-#[derive(Clone, Debug)]
-pub struct PaddedTableFactor {
-    pub table: Vec<Gf128>,
-    /// Which joint bit positions (low to high order of the table's
-    /// variables) are active.
-    pub active: Vec<usize>,
-    pub joint_vars: usize,
-}
-
-impl PaddedTableFactor {
-    pub fn new(table: Vec<Gf128>, active: Vec<usize>, joint_vars: usize) -> Self {
-        let table_vars = table.len().trailing_zeros() as usize;
-        assert_eq!(active.len(), table_vars);
-        PaddedTableFactor {
-            table,
-            active,
-            joint_vars,
-        }
-    }
-}
-
-impl magnetar_sumcheck::public::PublicFactor for PaddedTableFactor {
-    fn num_vars(&self) -> usize {
-        self.joint_vars
-    }
-    #[allow(dead_code)] // used by the routing tests via the dense engine
-    fn materialize(&self) -> Vec<Gf128> {
-        let mut out = vec![ZERO; 1usize << self.joint_vars];
-        for (idx, o) in out.iter_mut().enumerate() {
-            let mut ti = 0usize;
-            for (tv, &av) in self.active.iter().enumerate() {
-                if (idx >> av) & 1 == 1 {
-                    ti |= 1usize << tv;
-                }
-            }
-            *o = self.table[ti];
-        }
-        out
-    }
-    fn eval_at(&self, point: &[Gf128]) -> Gf128 {
-        let sub: Vec<Gf128> = self.active.iter().map(|&a| point[a]).collect();
-        magnetar_field::eval_mle(&self.table, &sub)
-    }
-}
+/// A public table over a subset of the joint variables, padded across
+/// the rest (see [`magnetar_sumcheck::public::PaddedFactor`]).
+pub use magnetar_sumcheck::public::PaddedFactor as PaddedTableFactor;
 
 /// A dense (witness) table over a subset of joint variables, padded.
 /// Materialized fully for the prover's folding at the test scale.
@@ -146,13 +108,17 @@ impl RoutingLayout {
     pub fn joint_vars(&self) -> usize {
         self.o_vars + self.j_vars + self.u_vars + self.h_vars + self.a_vars
     }
-    /// Bit ranges (low to high): o | j | u | h | a.
+    /// Bit ranges (bind order, low to high): `a | o | h | u | j` — the
+    /// small per-cycle spaces bind first and the cycle index last, so
+    /// the join prover's per-column structure survives to the final
+    /// rounds (the paper's linear-in-T prover, §5.4). Returns
+    /// `[o_off, j_off, u_off, h_off, a_off]`.
     pub fn offsets(&self) -> [usize; 5] {
-        let o = 0;
-        let j = o + self.o_vars;
-        let u = j + self.j_vars;
-        let h = u + self.u_vars;
-        let a = h + self.h_vars;
+        let a = 0;
+        let o = a + self.a_vars;
+        let h = o + self.o_vars;
+        let u = h + self.h_vars;
+        let j = u + self.u_vars;
         [o, j, u, h, a]
     }
 }
@@ -232,7 +198,7 @@ pub fn prove_routing(
     t: &mut Transcript,
 ) -> RouterProof {
     let jv = layout.joint_vars();
-    let [_, j_off, _, _, _] = layout.offsets();
+    let [o_off, j_off, _, _, _] = layout.offsets();
     let eq_o = magnetar_field::EqBits::build(r_o).values;
     let eq_j = magnetar_field::EqBits::build(r_j).values;
     let spec = SparseSpec {
@@ -242,7 +208,7 @@ pub fn prove_routing(
             .map(|d| SparseFactor::new(d.table.clone(), d.active.clone()))
             .collect(),
         public: vec![
-            SparseFactor::new(eq_o, (0..layout.o_vars).collect()),
+            SparseFactor::new(eq_o, (0..layout.o_vars).map(|i| o_off + i).collect()),
             SparseFactor::new(eq_j, (j_off..j_off + layout.j_vars).collect()),
             SparseFactor::new(r_public.table.clone(), r_public.active.clone()),
         ],
@@ -287,10 +253,10 @@ pub fn verify_routing(
     t: &mut Transcript,
 ) -> Result<RoutingClaims, &'static str> {
     let jv = layout.joint_vars();
-    let [_, j_off, _, _, _] = layout.offsets();
+    let [o_off, j_off, _u_off, _h_off, _a_off] = layout.offsets();
     let eq_o = magnetar_field::EqBits::build(r_o).values;
     let eq_j = magnetar_field::EqBits::build(r_j).values;
-    let eq_o_factor = PaddedTableFactor::new(eq_o, (0..layout.o_vars).collect(), jv);
+    let eq_o_factor = PaddedTableFactor::new(eq_o, (o_off..o_off + layout.o_vars).collect(), jv);
     let eq_j_factor = PaddedTableFactor::new(eq_j, (j_off..j_off + layout.j_vars).collect(), jv);
     let public: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> = vec![
         Box::new(eq_o_factor),
@@ -426,15 +392,20 @@ pub fn build_store_tensor(w: usize) -> (Vec<Gf128>, usize, usize, usize, usize) 
                 let byte = o / 8;
                 let inside = byte >= a && byte < a + width;
                 if inside {
-                    // Route from both the old and the store source of bit o.
-                    for s in 0..2usize {
-                        let u = o + w * s;
-                        let idx = o
-                            | (u << o_vars)
+                    // Inside the written byte the new bit is the
+                    // store-source bit `o − 8a` (the source byte 0 lands
+                    // at byte `a`), so the increment bit — the output —
+                    // is the XOR of the old RAM bit `o` and the source
+                    // bit `o − 8a`: route from BOTH.
+                    let u_old = o;
+                    let u_src = o - 8 * a + w;
+                    let idx = |u: usize| {
+                        o | (u << o_vars)
                             | (h << (o_vars + u_vars))
-                            | (a << (o_vars + u_vars + h_vars));
-                        r[idx] = ONE;
-                    }
+                            | (a << (o_vars + u_vars + h_vars))
+                    };
+                    r[idx(u_old)] = ONE;
+                    r[idx(u_src)] = ONE;
                 }
             }
         }
@@ -493,16 +464,20 @@ mod tests {
         let (r, o_vars, u_vars, h_vars, a_vars) = build_store_tensor(16);
         assert_eq!(a_vars, 3);
         assert_eq!(h_vars, 2);
-        // Byte store (h=0) at offset a=1, bit o=9 (byte 1): inside [8,16).
-        for s in 0..2usize {
-            let u = 9 + 16 * s;
+        // Byte store (h=0) at offset a=1, bit o=9 (byte 1): inside [8,16)
+        // — routed from the old RAM bit 9 AND the store-source bit
+        // o − 8a = 1 (the source byte 0 lands at byte 1).
+        for u in [9usize, 1 + 16] {
             let idx =
                 9 | (u << o_vars) | (0 << (o_vars + u_vars)) | (1 << (o_vars + u_vars + h_vars));
             assert_eq!(r[idx], ONE);
         }
+        // The source's bit 9 (u = 9 + 16) does NOT feed o=9 at a=1.
+        let idx =
+            9 | (25usize << o_vars) | (0 << (o_vars + u_vars)) | (1 << (o_vars + u_vars + h_vars));
+        assert_eq!(r[idx], ZERO);
         // Bit o=1 (byte 0): outside [8,16) for a=1 — not routed.
-        for s in 0..2usize {
-            let u = 1 + 16 * s;
+        for u in [1usize, 17] {
             let idx =
                 1 | (u << o_vars) | (0 << (o_vars + u_vars)) | (1 << (o_vars + u_vars + h_vars));
             assert_eq!(r[idx], ZERO);
@@ -515,7 +490,7 @@ mod tests {
         let mut rng = rand::thread_rng();
         let w = 4usize;
         let amount_bits = 2usize;
-        let (tensor, o_vars, u_vars, h_vars) = build_shift_tensor(w, amount_bits);
+        let (values, o_vars, u_vars, h_vars) = build_shift_tensor(w, amount_bits);
         let j_vars = 3usize;
         let layout = RoutingLayout {
             o_vars,
@@ -524,10 +499,8 @@ mod tests {
             h_vars,
             a_vars: 0,
         };
-        let jv = layout.joint_vars();
-        let [_, j_off, u_off, h_off, _] = layout.offsets();
         let cycles = 1usize << j_vars;
-        // X: the source word bits (u = bit index).
+        // X: the source word bits (u = bit index), column-major.
         let mut x = vec![ZERO; (1usize << u_vars) * cycles];
         for j in 0..cycles {
             for b in 0..w {
@@ -538,91 +511,76 @@ mod tests {
         let (a_off_h, a_hv, k_off_h, k_hv) = shift_selector_layout(amount_bits);
         let mut q_lo = vec![ZERO; (1usize << a_hv) * cycles];
         let mut q_hi = vec![ZERO; (1usize << k_hv) * cycles];
-        let mut y = vec![ZERO; (1usize << o_vars) * cycles];
         for j in 0..cycles {
             if rng.gen::<bool>() {
                 let amount = rng.gen_range(0..(1usize << amount_bits));
                 let kind = rng.gen_range(0..3usize);
                 q_lo[amount + j * (1usize << a_hv)] = ONE;
                 q_hi[kind + j * (1usize << k_hv)] = ONE;
-                for o in 0..w {
-                    let mut acc = ZERO;
-                    for u in 0..w {
-                        for hl in 0..(1usize << a_hv) {
-                            for hh in 0..(1usize << k_hv) {
-                                let h = hh * (1usize << amount_bits) + hl;
-                                let ridx = o | (u << o_vars) | (h << (o_vars + u_vars));
-                                acc += mul(
-                                    mul(
-                                        x[u + j * (1usize << u_vars)],
-                                        mul(
-                                            q_lo[hl + j * (1usize << a_hv)],
-                                            q_hi[hh + j * (1usize << k_hv)],
-                                        ),
-                                    ),
-                                    tensor[ridx],
-                                );
+            }
+        }
+        // The claim on Y at a random point (brute force over the joint
+        // (o, u, h_lo, h_hi, j) cube).
+        let r_o: Vec<Gf128> = (0..o_vars).map(|_| rg(&mut rng)).collect();
+        let r_j: Vec<Gf128> = (0..j_vars).map(|_| rg(&mut rng)).collect();
+        let mut y_claim = ZERO;
+        for j in 0..cycles {
+            for o in 0..(1usize << o_vars) {
+                for u in 0..(1usize << u_vars) {
+                    for hl in 0..(1usize << a_hv) {
+                        for hh in 0..(1usize << k_hv) {
+                            let h = hh * (1usize << amount_bits) + hl;
+                            let rv = values[o | (u << o_vars) | (h << (o_vars + u_vars))];
+                            let qv = mul(
+                                q_lo[hl + j * (1usize << a_hv)],
+                                q_hi[hh + j * (1usize << k_hv)],
+                            );
+                            if rv == ZERO || qv == ZERO {
+                                continue;
                             }
+                            let mut s = mul(mul(eq_mle(&r_o, o), eq_mle(&r_j, j)), rv);
+                            s = mul(s, x[u + j * (1usize << u_vars)]);
+                            y_claim += mul(s, qv);
                         }
                     }
-                    y[o + j * (1usize << o_vars)] = acc;
                 }
             }
         }
-        let r_o: Vec<Gf128> = (0..o_vars).map(|_| rg(&mut rng)).collect();
-        let r_j: Vec<Gf128> = (0..j_vars).map(|_| rg(&mut rng)).collect();
-        let y_mle = magnetar_field::eval_mle(&y, &[r_o.clone(), r_j.clone()].concat());
-        // Joint tables.
-        let x_joint: Vec<Gf128> = {
-            let mut t = vec![ZERO; 1usize << jv];
-            for idx in 0..t.len() {
-                let u = (idx >> u_off) & ((1usize << u_vars) - 1);
-                let j = (idx >> j_off) & (cycles - 1);
-                t[idx] = x[u + j * (1usize << u_vars)];
-            }
-            t
-        };
-        let q_lo_joint: Vec<Gf128> = {
-            let mut t = vec![ZERO; 1usize << jv];
-            for idx in 0..t.len() {
-                let hl = (idx >> (h_off + a_off_h)) & ((1usize << a_hv) - 1);
-                let j = (idx >> j_off) & (cycles - 1);
-                t[idx] = q_lo[hl + j * (1usize << a_hv)];
-            }
-            t
-        };
-        let q_hi_joint: Vec<Gf128> = {
-            let mut t = vec![ZERO; 1usize << jv];
-            for idx in 0..t.len() {
-                let hh = (idx >> (h_off + k_off_h)) & ((1usize << k_hv) - 1);
-                let j = (idx >> j_off) & (cycles - 1);
-                t[idx] = q_hi[hh + j * (1usize << k_hv)];
-            }
-            t
-        };
-        let r_factor: Vec<Gf128> = {
-            let mut t = vec![ZERO; 1usize << jv];
-            for idx in 0..t.len() {
-                let o = idx & ((1usize << o_vars) - 1);
-                let u = (idx >> u_off) & ((1usize << u_vars) - 1);
-                let h = (idx >> h_off) & ((1usize << h_vars) - 1);
-                let ridx = o | (u << o_vars) | (h << (o_vars + u_vars));
-                t[idx] = tensor[ridx];
-            }
-            t
-        };
-        let dense = vec![
-            PaddedDense::new(x_joint, (0..jv).collect(), jv),
-            PaddedDense::new(q_lo_joint, (0..jv).collect(), jv),
-            PaddedDense::new(q_hi_joint, (0..jv).collect(), jv),
+        let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, 0);
+        let sels = [
+            SelCol {
+                table: &q_lo,
+                h_off: a_off_h,
+                h_vars: a_hv,
+            },
+            SelCol {
+                table: &q_hi,
+                h_off: k_off_h,
+                h_vars: k_hv,
+            },
         ];
-        let r_pub = PaddedTableFactor::new(r_factor, (0..jv).collect(), jv);
+        let wit = JoinWitness {
+            x: &x,
+            selectors: &sels,
+            offset_bits: &[],
+        };
         let mut t = Transcript::new("router", &[b"t"]);
-        let proof = prove_routing(&layout, y_mle, &r_o, &r_j, &r_pub, &dense, 2, &mut t);
+        let proof = prove_routing_join(&layout, y_claim, &r_o, &r_j, &tensor, &wit, &mut t);
+        // The verifier needs the R factor in joint-padded form.
+        let jv = layout.joint_vars();
+        let [o_off, _, u_off, h_off, _a_off] = layout.offsets();
+        let r_pub = {
+            // The tensor's own variable order is (o, u, h); map each to its
+            // joint position under the new bind order.
+            let mut act: Vec<usize> = (0..o_vars).map(|i| o_off + i).collect();
+            act.extend(u_off..u_off + u_vars);
+            act.extend(h_off..h_off + h_vars);
+            PaddedTableFactor::new(tensor.values.clone(), act, jv)
+        };
         let mut tv = Transcript::new("router", &[b"t"]);
-        let claims = verify_routing(&layout, y_mle, &r_o, &r_j, &r_pub, 2, 0, &proof, &mut tv)
-            .expect("router sumcheck verifies");
-        // The X claim must equal the X table's MLE at the claim point.
+        let claims = verify_routing(&layout, y_claim, &r_o, &r_j, &r_pub, 2, 0, &proof, &mut tv)
+            .expect("join router sumcheck verifies");
+        // The X claim equals the X table's MLE at the claim point.
         let x_pt = claims.x_point(&layout);
         let want_x = magnetar_field::eval_mle(&x, &x_pt);
         assert_eq!(claims.x_value, want_x);
@@ -633,16 +591,15 @@ mod tests {
         let qhi_pt = claims.q_point(&layout, k_off_h, k_hv);
         let want_qhi = magnetar_field::eval_mle(&q_hi, &qhi_pt);
         assert_eq!(claims.q_values[1], want_qhi);
-        // Tamper: the X claim.
+        // Tamper: the X claim and a round.
         let mut p = proof.clone();
         p.x_value += ONE;
         let mut tv = Transcript::new("router", &[b"t"]);
-        assert!(verify_routing(&layout, y_mle, &r_o, &r_j, &r_pub, 2, 0, &p, &mut tv).is_err());
-        // Tamper: a round.
+        assert!(verify_routing(&layout, y_claim, &r_o, &r_j, &r_pub, 2, 0, &p, &mut tv).is_err());
         let mut p = proof.clone();
         p.rounds[0][1] += ONE;
         let mut tv = Transcript::new("router", &[b"t"]);
-        assert!(verify_routing(&layout, y_mle, &r_o, &r_j, &r_pub, 2, 0, &p, &mut tv).is_err());
+        assert!(verify_routing(&layout, y_claim, &r_o, &r_j, &r_pub, 2, 0, &p, &mut tv).is_err());
     }
 
     #[test]
@@ -650,7 +607,7 @@ mod tests {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         let w = 8usize;
-        let (tensor, o_vars, u_vars, h_vars, a_vars) = build_store_tensor(w);
+        let (values, o_vars, u_vars, h_vars, a_vars) = build_store_tensor(w);
         let j_vars = 3usize;
         let layout = RoutingLayout {
             o_vars,
@@ -659,16 +616,13 @@ mod tests {
             h_vars,
             a_vars,
         };
-        let jv = layout.joint_vars();
-        let [_, j_off, u_off, h_off, a_off] = layout.offsets();
         let cycles = 1usize << j_vars;
-        // The sources: old and store words per cycle; the offset bits; the
-        // selector; the increment (the output).
+        let jv = layout.joint_vars();
+        // The per-column witness: sources, selector, offset bits, increment.
         let mut old = vec![ZERO; w * cycles];
         let mut src = vec![ZERO; w * cycles];
         let mut off_bits = vec![ZERO; 3 * cycles];
         let mut q_st = vec![ZERO; 4 * cycles];
-        let mut inc = vec![ZERO; w * cycles];
         for j in 0..cycles {
             let o_word: u64 = rng.gen_range(0..(1u64 << w));
             let s_word: u64 = rng.gen_range(0..(1u64 << w));
@@ -683,101 +637,35 @@ mod tests {
                 off_bits[j * 3] = Gf128((a & 1) as u128);
                 off_bits[1 + j * 3] = Gf128(((a >> 1) & 1) as u128);
                 off_bits[2 + j * 3] = Gf128(((a >> 2) & 1) as u128);
+            }
+        }
+        // The claim: Inc at a random point, with Inc the routing output.
+        let r_o: Vec<Gf128> = (0..o_vars).map(|_| rg(&mut rng)).collect();
+        let r_j: Vec<Gf128> = (0..j_vars).map(|_| rg(&mut rng)).collect();
+        let mut y_claim = ZERO;
+        for j in 0..cycles {
+            if let Some(hsel) = (0..4).find(|&i| q_st[i + j * 4] == ONE) {
+                let a = (0..8)
+                    .find(|&i| {
+                        off_bits[j * 3] == Gf128((i & 1) as u128)
+                            && off_bits[1 + j * 3] == Gf128(((i >> 1) & 1) as u128)
+                            && off_bits[2 + j * 3] == Gf128(((i >> 2) & 1) as u128)
+                    })
+                    .unwrap();
                 let width = 1usize << hsel;
-                for b in 0..w {
-                    let byte = b / 8;
-                    if byte >= a && byte < a + width {
-                        inc[b + j * w] = old[b + j * w] + src[b + j * w];
+                let e_j = eq_mle(&r_j, j);
+                for o in 0..w {
+                    let byte = o / 8;
+                    let inside = byte >= a && byte < a + width;
+                    if inside {
+                        let e_o = eq_mle(&r_o, o);
+                        // Inc = old XOR src = old + src over B.
+                        y_claim += mul(mul(e_o, e_j), old[o + j * w] + src[o + j * w]);
                     }
                 }
             }
         }
-        // The claim: Inc at a random point.
-        let r_o: Vec<Gf128> = (0..o_vars).map(|_| rg(&mut rng)).collect();
-        let r_j: Vec<Gf128> = (0..j_vars).map(|_| rg(&mut rng)).collect();
-        let y_mle = magnetar_field::eval_mle(&inc, &[r_o.clone(), r_j.clone()].concat());
-        // Joint tables: X (over (u, j)), Q_st, the three eq-links, R.
-        let x_joint: Vec<Gf128> = {
-            let mut t = vec![ZERO; 1usize << jv];
-            for idx in 0..t.len() {
-                let u = (idx >> u_off) & ((1usize << u_vars) - 1);
-                let j = (idx >> j_off) & (cycles - 1);
-                t[idx] = if u < w {
-                    old[u + j * w]
-                } else if u < 2 * w {
-                    src[(u - w) + j * w]
-                } else {
-                    ZERO
-                };
-            }
-            t
-        };
-        let q_joint: Vec<Gf128> = {
-            let mut t = vec![ZERO; 1usize << jv];
-            for idx in 0..t.len() {
-                let h = (idx >> h_off) & 3;
-                let j = (idx >> j_off) & (cycles - 1);
-                t[idx] = q_st[h + j * 4];
-            }
-            t
-        };
-        let links: Vec<Vec<Gf128>> = (0..3)
-            .map(|k| {
-                let mut t = vec![ZERO; 1usize << jv];
-                for idx in 0..t.len() {
-                    let a_k = (idx >> (a_off + k)) & 1;
-                    let j = (idx >> j_off) & (cycles - 1);
-                    t[idx] = ONE + Gf128(a_k as u128) + off_bits[k + j * 3];
-                }
-                t
-            })
-            .collect();
-        let r_factor: Vec<Gf128> = {
-            let mut t = vec![ZERO; 1usize << jv];
-            for idx in 0..t.len() {
-                let o = idx & ((1usize << o_vars) - 1);
-                let u = (idx >> u_off) & ((1usize << u_vars) - 1);
-                let h = (idx >> h_off) & 3;
-                let a = (idx >> a_off) & 7;
-                let ridx = o
-                    | (u << o_vars)
-                    | (h << (o_vars + u_vars))
-                    | (a << (o_vars + u_vars + h_vars));
-                t[idx] = tensor[ridx];
-            }
-            t
-        };
-        let mut dense = vec![
-            PaddedDense::new(x_joint, (0..jv).collect(), jv),
-            PaddedDense::new(q_joint, (0..jv).collect(), jv),
-        ];
-        for lk in &links {
-            dense.push(PaddedDense::new(lk.clone(), (0..jv).collect(), jv));
-        }
-        let r_pub = PaddedTableFactor::new(r_factor, (0..jv).collect(), jv);
-        let mut t = Transcript::new("router2", &[b"t"]);
-        let proof = prove_routing(&layout, y_mle, &r_o, &r_j, &r_pub, &dense, 1, &mut t);
-        let mut tv = Transcript::new("router2", &[b"t"]);
-        let claims = verify_routing(&layout, y_mle, &r_o, &r_j, &r_pub, 1, 3, &proof, &mut tv)
-            .expect("store router verifies");
-        // The offset-bit claims recover â_k at the *terminal* cycle slice
-        // (the router's own random point, not the claim's r_j).
-        let [_, j_off, _, _, _] = layout.offsets();
-        let r_j_term: Vec<Gf128> = claims.r_joint[j_off..j_off + layout.j_vars].to_vec();
-        for k in 0..3 {
-            let got = claims.offset_bit_value(&layout, k);
-            let col: Vec<Gf128> = (0..cycles).map(|j| off_bits[k + j * 3]).collect();
-            let want = magnetar_field::eval_mle(&col, &r_j_term);
-            assert_eq!(got, want, "offset bit {k}");
-        }
-        // The X claim splits into the two segment claims.
-        let x_pt = claims.x_point(&layout);
-        let (w_old, r_bits) = {
-            let ((w0, b), _) = store_x_split(&x_pt[..u_vars], claims.x_value);
-            (w0, b)
-        };
-        let _ = (w_old, r_bits);
-        // Direct: X̂(r_u, r_j) over the (u, j) table.
+        // The X table over the joint u-space (bit + 64*half... here w=8).
         let x_table: Vec<Gf128> = {
             let mut t2 = vec![ZERO; (1usize << u_vars) * cycles];
             for j in 0..cycles {
@@ -793,12 +681,217 @@ mod tests {
             }
             t2
         };
+        // The k-major offset bits for the join witness.
+        let off_kmajor: Vec<Gf128> = (0..3)
+            .flat_map(|k| (0..cycles).map(move |j| (k, j)))
+            .map(|(k, j)| off_bits[k + j * 3])
+            .collect();
+        let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, a_vars);
+        let sels = [SelCol {
+            table: &q_st,
+            h_off: 0,
+            h_vars,
+        }];
+        let wit = JoinWitness {
+            x: &x_table,
+            selectors: &sels,
+            offset_bits: &off_kmajor,
+        };
+        let mut t = Transcript::new("router2", &[b"t"]);
+        let proof = prove_routing_join(&layout, y_claim, &r_o, &r_j, &tensor, &wit, &mut t);
+        // The verifier's padded R factor.
+        let [o_off, _, u_off, h_off, a_off] = layout.offsets();
+        let r_pub = {
+            let mut act: Vec<usize> = (0..o_vars).map(|i| o_off + i).collect();
+            act.extend(u_off..u_off + u_vars);
+            act.extend(h_off..h_off + h_vars);
+            act.extend(a_off..a_off + a_vars);
+            PaddedTableFactor::new(tensor.values.clone(), act, jv)
+        };
+        let mut tv = Transcript::new("router2", &[b"t"]);
+        let claims = verify_routing(&layout, y_claim, &r_o, &r_j, &r_pub, 1, 3, &proof, &mut tv)
+            .expect("store join router verifies");
+        // The offset-bit claims recover â_k at the terminal cycle point.
+        let [_, j_off, _, _, _] = layout.offsets();
+        let r_j_term: Vec<Gf128> = claims.r_joint[j_off..j_off + layout.j_vars].to_vec();
+        for k in 0..3 {
+            let got = claims.offset_bit_value(&layout, k);
+            let col: Vec<Gf128> = (0..cycles).map(|j| off_bits[k + j * 3]).collect();
+            let want = magnetar_field::eval_mle(&col, &r_j_term);
+            assert_eq!(got, want, "offset bit {k}");
+        }
+        // The X claim matches the (u, j) table.
+        let x_pt = claims.x_point(&layout);
         let want_x = magnetar_field::eval_mle(&x_table, &x_pt);
         assert_eq!(claims.x_value, want_x);
         // Tamper: the offset link claim.
         let mut p = proof.clone();
         p.offset_values[0] += ONE;
         let mut tv = Transcript::new("router2", &[b"t"]);
-        assert!(verify_routing(&layout, y_mle, &r_o, &r_j, &r_pub, 1, 3, &p, &mut tv).is_err());
+        assert!(verify_routing(&layout, y_claim, &r_o, &r_j, &r_pub, 1, 3, &p, &mut tv).is_err());
+    }
+
+    /// The join prover must emit **byte-identical** round messages to the
+    /// generic sparse prover on the same instance (both provers, same
+    /// layout, same transcript): the join prover is a pure performance
+    /// replacement.
+    #[test]
+    fn join_matches_sparse_prover() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let w = 8usize;
+        let (values, o_vars, u_vars, h_vars, a_vars) = build_store_tensor(w);
+        let j_vars = 3usize;
+        let layout = RoutingLayout {
+            o_vars,
+            j_vars,
+            u_vars,
+            h_vars,
+            a_vars,
+        };
+        let jv = layout.joint_vars();
+        let [o_off, j_off, u_off, h_off, a_off] = layout.offsets();
+        let cycles = 1usize << j_vars;
+        // Random per-column witness.
+        let x_table: Vec<Gf128> = (0..(1usize << u_vars) * cycles)
+            .map(|_| Gf128(rng.gen::<u64>() as u128 & 1))
+            .collect();
+        let mut q_st = vec![ZERO; 4 * cycles];
+        let mut off_bits = vec![ZERO; 3 * cycles];
+        for j in 0..cycles {
+            let hsel = rng.gen_range(0..5usize); // 4 = the zero column
+            if hsel < 4 {
+                q_st[hsel + j * 4] = ONE;
+            }
+            let a = rng.gen_range(0..8usize);
+            off_bits[j * 3] = Gf128((a & 1) as u128);
+            off_bits[1 + j * 3] = Gf128(((a >> 1) & 1) as u128);
+            off_bits[2 + j * 3] = Gf128(((a >> 2) & 1) as u128);
+        }
+        // The true claim over the joint cube.
+        let r_o: Vec<Gf128> = (0..o_vars).map(|_| rg(&mut rng)).collect();
+        let r_j: Vec<Gf128> = (0..j_vars).map(|_| rg(&mut rng)).collect();
+        let claim = {
+            let mut acc = ZERO;
+            for j in 0..cycles {
+                for o in 0..(1usize << o_vars) {
+                    for u in 0..(1usize << u_vars) {
+                        for h in 0..(1usize << h_vars) {
+                            for a in 0..(1usize << a_vars) {
+                                let rv = values[o
+                                    | (u << o_vars)
+                                    | (h << (o_vars + u_vars))
+                                    | (a << (o_vars + u_vars + h_vars))];
+                                if rv == ZERO {
+                                    continue;
+                                }
+                                let mut s = mul(mul(eq_mle(&r_o, o), eq_mle(&r_j, j)), rv);
+                                s = mul(s, x_table[u + j * (1usize << u_vars)]);
+                                s = mul(s, q_st[h + j * 4]);
+                                for k in 0..3 {
+                                    let ak = (a >> k) & 1;
+                                    let ahat = off_bits[k + j * 3];
+                                    s = mul(s, ONE + Gf128(ak as u128) + ahat);
+                                }
+                                acc += s;
+                            }
+                        }
+                    }
+                }
+            }
+            acc
+        };
+        // The factors for the sparse prover, each in its own variable
+        // space (that is precisely what the sparse engine supports).
+        let x_fac = PaddedDense::new(
+            x_table.clone(),
+            {
+                let mut a: Vec<usize> = (u_off..u_off + u_vars).collect();
+                a.extend(j_off..j_off + j_vars);
+                a
+            },
+            jv,
+        );
+        let q_fac = PaddedDense::new(
+            q_st.clone(),
+            {
+                let mut a: Vec<usize> = (h_off..h_off + h_vars).collect();
+                a.extend(j_off..j_off + j_vars);
+                a
+            },
+            jv,
+        );
+        let link_facs: Vec<PaddedDense> = (0..3)
+            .map(|k| {
+                let mut t = vec![ZERO; 2 * cycles];
+                for j in 0..cycles {
+                    let ahat = off_bits[k + j * 3];
+                    t[2 * j] = ONE + ahat;
+                    t[2 * j + 1] = ahat;
+                }
+                let mut a = vec![a_off + k];
+                a.extend(j_off..j_off + j_vars);
+                PaddedDense::new(t, a, jv)
+            })
+            .collect();
+        let r_pub = PaddedTableFactor::new(
+            values.clone(),
+            {
+                let mut act: Vec<usize> = (0..o_vars).map(|i| o_off + i).collect();
+                act.extend(u_off..u_off + u_vars);
+                act.extend(h_off..h_off + h_vars);
+                act.extend(a_off..a_off + a_vars);
+                act
+            },
+            jv,
+        );
+        let dense = {
+            let mut d = vec![x_fac, q_fac];
+            d.extend(link_facs);
+            d
+        };
+        // Sparse proof.
+        let mut t1 = Transcript::new("xcheck", &[b"t"]);
+        let sparse = prove_routing(&layout, claim, &r_o, &r_j, &r_pub, &dense, 1, &mut t1);
+        // Join proof.
+        let off_kmajor: Vec<Gf128> = (0..3)
+            .flat_map(|k| (0..cycles).map(move |j| (k, j)))
+            .map(|(k, j)| off_bits[k + j * 3])
+            .collect();
+        let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, a_vars);
+        let sels = [SelCol {
+            table: &q_st,
+            h_off: 0,
+            h_vars,
+        }];
+        let wit = JoinWitness {
+            x: &x_table,
+            selectors: &sels,
+            offset_bits: &off_kmajor,
+        };
+        let mut t2 = Transcript::new("xcheck", &[b"t"]);
+        let join = prove_routing_join(&layout, claim, &r_o, &r_j, &tensor, &wit, &mut t2);
+        // Byte-identical round messages.
+        assert_eq!(sparse.rounds.len(), join.rounds.len());
+        for (i, (a, b)) in sparse.rounds.iter().zip(join.rounds.iter()).enumerate() {
+            assert_eq!(a, b, "round {i} differs");
+        }
+        assert_eq!(sparse.x_value, join.x_value);
+        assert_eq!(sparse.q_values, join.q_values);
+        assert_eq!(sparse.offset_values, join.offset_values);
+        assert_eq!(sparse.terminal, join.terminal);
+    }
+
+    /// eq(r, x) for a Boolean x, as a field element.
+    fn eq_mle(r: &[Gf128], x: usize) -> Gf128 {
+        let mut v = ONE;
+        for (i, &ri) in r.iter().enumerate() {
+            v = if (x >> i) & 1 == 1 {
+                mul(v, ri)
+            } else {
+                mul(v, ONE + ri)
+            };
+        }
+        v
     }
 }
