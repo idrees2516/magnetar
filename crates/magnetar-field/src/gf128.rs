@@ -33,6 +33,21 @@ impl std::fmt::Debug for Gf128 {
 
 // Addition in characteristic two is XOR.
 #[allow(clippy::suspicious_arithmetic_impl)]
+impl std::iter::Sum for Gf128 {
+    fn sum<I: Iterator<Item = Gf128>>(iter: I) -> Gf128 {
+        // Characteristic-two addition is XOR — order-independent, so this
+        // is usable inside parallel reductions (docs/PERFORMANCE.md R1).
+        iter.fold(Gf128(0), |a, b| a + b)
+    }
+}
+
+impl<'a> std::iter::Sum<&'a Gf128> for Gf128 {
+    fn sum<I: Iterator<Item = &'a Gf128>>(iter: I) -> Gf128 {
+        iter.fold(Gf128(0), |a, b| a + *b)
+    }
+}
+
+#[allow(clippy::suspicious_arithmetic_impl)] // XOR is the characteristic-two +
 impl std::ops::Add for Gf128 {
     type Output = Gf128;
     #[inline(always)]

@@ -21,10 +21,15 @@ prove: 1.7 s, verify: 29 ms, accepted: true
 The complete Construction-3 protocol is implemented and tested end-to-end,
 including the Remark-4 cross-step constraints (the pc transition chain,
 the flag derivations, the ECALL output binding) and tree-IVC with shared
-commitments. See [`docs/STATUS.md`](docs/STATUS.md) for the honest
-implemented/not-implemented accounting (the top remaining items: the
-data-path decode-vs-flag constraints, the streaming Twist/Shout provers,
-ZK, recursion) and
+commitments. The prover stack runs on the parallelism rulebook
+([`docs/PERFORMANCE.md`](docs/PERFORMANCE.md) R1–R10: rayon kernels for
+the sum-check, Merkle, encode, the join router, and the tree-IVC
+segments) and the tree-IVC layer has a **streaming, parallel prover**
+(checkpointed trace replay, bounded-memory segments, byte-identical
+proofs — `magnetar-ivc::streaming`). See [`docs/STATUS.md`](docs/STATUS.md)
+for the honest implemented/not-implemented accounting (the top remaining
+items: the data-path decode-vs-flag constraints, the linear-in-T
+Twist/Shout provers, ZK, recursion) and
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for the measured comparison
 with the paper's figures.
 
@@ -45,7 +50,7 @@ field/utils/proof/arith/cpu split), one crate per component:
 | `magnetar-cpu` | §5.1 | The complete RV64I decoder, microcode expansion (register shifts → 6 static-routing stages), the interpreter with the virtual-cycle trace, and the **dual SIMD R1CS circuit** (the F₂ bit constraints: booleanity + the 64-bit adder carry chain; the K packed products: the word-wide write mux, the packed sum identity, the halt-latch I/O binding) |
 | `magnetar-zkvm` | §5.2, §5.5 | **MosaicPCS** with the component layout (direct segments + the auxiliary one-hot/increment polynomials on aligned subcubes, the Equation-4 suffix lift), the **complete Construction-3 protocol** (all seven steps), the bytecode ROM tables, and the **proof-size instrumentation** |
 | `magnetar-cli` | — | The `magnetar` binary |
-| `magnetar-ivc` | roadmap §8.2 | **Tree-IVC**: segments proved independently in their own transcripts, sharing ONE MosaicPCS commitment; boundary chaining via the Remark-4 final-state bindings and public point claims; claim batching at the root |
+| `magnetar-ivc` | roadmap §8.2 | **Tree-IVC**: segments proved independently in their own transcripts, sharing ONE MosaicPCS commitment; boundary chaining via the Remark-4 final-state bindings and public point claims; claim batching at the root — with the **streaming parallel prover** (checkpointed replay, rayon segments, tables packed directly into the commitment leaves) |
 
 ## The protocol (Construction 3)
 

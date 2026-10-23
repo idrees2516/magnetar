@@ -179,7 +179,7 @@ pub struct SegmentStatement {
 /// — everything **before** the (shared) commitment and its MosaicPCS
 /// discharge. The single-segment [`Proof`] wraps this; tree-IVC shares
 /// one commitment across many segments.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct InnerProof {
     /// Virtual Spartan's proof.
     pub vs: VirtualSpartanProof,
@@ -741,20 +741,20 @@ pub fn prove_inner(
     // The shift router runs the join-enumeration prover (linear in T):
     // the per-column X and selector tables, never a joint materialization.
     let shift_wit = JoinWitness {
-        x: &x_shift,
-        selectors: &[
+        x: x_shift.clone(),
+        selectors: vec![
             SelCol {
-                table: &sel_lo,
+                table: sel_lo.clone(),
                 h_off: 0,
                 h_vars: pk.amount_bits,
             },
             SelCol {
-                table: &sel_hi,
+                table: sel_hi.clone(),
                 h_off: pk.amount_bits,
                 h_vars: 2,
             },
         ],
-        offset_bits: &[],
+        offset_bits: Vec::new(),
     };
     let shift_claim = seg("shift-out").value;
     let shift_router = prove_routing_join(
@@ -799,27 +799,28 @@ pub fn prove_inner(
         }
         x
     };
-    // The raw offset bits â_k(j) (k-major: bits[k·T + j]) — the join
-    // prover derives the eq-links (1 + a_k + â_k) itself.
+    // The raw offset bits â_k(j) (per offset variable, one bool per cycle)
+    // — the join prover derives the eq-links (1 + a_k + â_k) itself.
     let off_off = pk.layout.offsets[pk.layout.index_of("off").expect("segment")];
-    let off_bits: Vec<Gf128> = (0..3)
-        .flat_map(|k| {
+    let off_bits: Vec<Vec<bool>> = (0..3)
+        .map(|k| {
             trace
                 .records
                 .iter()
-                .map(move |rec| Gf128(((rec.byte_offset >> k) & 1) as u128))
+                .map(|rec| (rec.byte_offset >> k) & 1 == 1)
+                .collect()
         })
         .collect();
     let _ = off_off;
     // The store router runs the join-enumeration prover as well.
     let store_wit = JoinWitness {
-        x: &x_store,
-        selectors: &[SelCol {
-            table: &sel_st,
+        x: x_store.clone(),
+        selectors: vec![SelCol {
+            table: sel_st.clone(),
             h_off: 0,
             h_vars: h_vs,
         }],
-        offset_bits: &off_bits,
+        offset_bits: off_bits,
     };
     // The output claim: the Inc claim at the verifier-sampled point.
     let (r_inc_o, r_inc_j) = inc_point.split_at(6);

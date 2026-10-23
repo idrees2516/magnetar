@@ -255,4 +255,86 @@ fn main() {
             "  proof body {body_bytes} B + ONE shared PCS tail {tail_bytes} B — vs 4 separate full proofs' 4 tails"
         );
     }
+
+    // The streaming, parallel prover: the same proofs with bounded memory
+    // and rayon segment parallelism (docs/PERFORMANCE.md R7/R8).
+    if max_log2 >= 10 {
+        println!("\nStreaming parallel prover (checkpoints -> rayon segments -> shared root):");
+        println!(
+            "{:>8} {:>9} {:>11} {:>11} {:>11} {:>11} {:>10} {:>10}",
+            "T", "segments", "seq (ms)", "stream (ms)", "speedup", "cycles/s", "peak RSS", "bound"
+        );
+        let prog = alu_program();
+        for log2_t in [10usize, 11, 12] {
+            let total = 1usize << log2_t;
+            let trace = magnetar_cpu::interp::execute(&prog, &[], total);
+            let out = trace.final_state.output;
+            for segments in [2usize, 4] {
+                // Sequential reference (the full-trace path).
+                let t0 = Instant::now();
+                let seq = magnetar_ivc::prove_ivc(
+                    &prog,
+                    &[],
+                    out,
+                    total,
+                    segments,
+                    &PcsParams::default(),
+                );
+                let seq_ms = t0.elapsed().as_secs_f64() * 1e3;
+                // Streaming + parallel.
+                let (stream, stats) = magnetar_ivc::prove_ivc_streaming(
+                    &prog,
+                    &[],
+                    out,
+                    total,
+                    segments,
+                    &PcsParams::default(),
+                );
+                // Byte-identical proofs (the checkpoint pipeline is a pure
+                // memory-path change).
+                assert_eq!(seq.commitment_root, stream.commitment_root);
+                assert!(magnetar_ivc::verify_ivc(
+                    &prog,
+                    &[],
+                    out,
+                    total,
+                    &stream,
+                    &PcsParams::default()
+                )
+                .is_ok());
+                let st_ms = stats.wall_total.as_secs_f64() * 1e3;
+                let bound = stats.packed_bytes
+                    + stats.codeword_bytes
+                    + stats.segment_table_bytes
+                    + stats.checkpoint_bytes;
+                println!(
+                    "{:>8} {:>9} {:>11.0} {:>11.0} {:>11.2}x {:>11.0} {:>9.1}M {:>9.1}M",
+                    format!("2^{log2_t}"),
+                    segments,
+                    seq_ms,
+                    st_ms,
+                    seq_ms / st_ms,
+                    total as f64 / (st_ms / 1e3),
+                    stats.peak_rss_bytes as f64 / 1048576.0,
+                    bound as f64 / 1048576.0
+                );
+                if log2_t == 12 && segments == 4 {
+                    println!(
+                        "    phases: checkpoints {:.0} ms, segments {:.0} ms ({} threads), root {:.0} ms",
+                        stats.wall_checkpoints.as_secs_f64() * 1e3,
+                        stats.wall_segments.as_secs_f64() * 1e3,
+                        stats.threads,
+                        stats.wall_root.as_secs_f64() * 1e3
+                    );
+                    println!(
+                        "    memory: packed {} KiB + codeword {} KiB + in-flight tables {} KiB + checkpoints {} KiB",
+                        stats.packed_bytes / 1024,
+                        stats.codeword_bytes / 1024,
+                        stats.segment_table_bytes / 1024,
+                        stats.checkpoint_bytes / 1024
+                    );
+                }
+            }
+        }
+    }
 }

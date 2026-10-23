@@ -151,3 +151,130 @@ fn clone_of(p: &magnetar_ivc::IvcProof) -> magnetar_ivc::IvcProof {
         mosaic: p.mosaic.clone(),
     }
 }
+
+/// The streaming prover must produce **byte-identical** proofs to the
+/// sequential prover (same statements, same per-segment transcripts,
+/// same commitment) on 1, 2 and 4 segments — the checkpoint/replay
+/// pipeline is a pure memory-path change (docs/PERFORMANCE.md R7).
+#[test]
+fn streaming_matches_sequential() {
+    let program = sum_program();
+    let input = vec![7u64];
+    let output = 49u64;
+    for segments in [1usize, 2, 4] {
+        let total = 32;
+        let seq = prove_ivc(
+            &program,
+            &input,
+            output,
+            total,
+            segments,
+            &PcsParams::default(),
+        );
+        let (stream, stats) = magnetar_ivc::prove_ivc_streaming(
+            &program,
+            &input,
+            output,
+            total,
+            segments,
+            &PcsParams::default(),
+        );
+        // Identical commitment and transcript digests.
+        assert_eq!(seq.commitment_root, stream.commitment_root);
+        assert_eq!(seq.segment_digests, stream.segment_digests);
+        assert_eq!(seq.pcs_n, stream.pcs_n);
+        assert_eq!(seq.ell, stream.ell);
+        // Identical statements (the boundary chain).
+        assert_eq!(
+            format!("{:?}", seq.statements),
+            format!("{:?}", stream.statements)
+        );
+        // Identical inner proofs and discharge.
+        assert_eq!(format!("{:?}", seq.inners), format!("{:?}", stream.inners));
+        assert_eq!(format!("{:?}", seq.mosaic), format!("{:?}", stream.mosaic));
+        // And the streaming proof verifies.
+        assert!(verify_ivc(
+            &program,
+            &input,
+            output,
+            total,
+            &stream,
+            &PcsParams::default()
+        )
+        .is_ok());
+        // The stats are populated (R10).
+        assert!(stats.wall_total >= stats.wall_checkpoints + stats.wall_root);
+        assert!(stats.packed_bytes > 0);
+        assert!(stats.codeword_bytes >= stats.packed_bytes);
+        assert!(stats.segment_table_bytes > 0);
+        assert!(stats.checkpoint_bytes > 0);
+        assert!(stats.threads >= 1);
+    }
+}
+
+/// The streaming prover's segments verify individually and the whole
+/// proof rejects the standard tamper classes (spot-check two).
+#[test]
+fn streaming_roundtrip_and_tamper() {
+    let program = sum_program();
+    let input = vec![5u64];
+    let output = 35u64;
+    let (proof, _stats) =
+        magnetar_ivc::prove_ivc_streaming(&program, &input, output, 32, 4, &PcsParams::default());
+    assert!(verify_ivc(&program, &input, output, 32, &proof, &PcsParams::default()).is_ok());
+    // Tamper: a broken boundary chain.
+    let mut p = clone_of(&proof);
+    p.statements[2].init.regs[2] += 1;
+    assert!(verify_ivc(&program, &input, output, 32, &p, &PcsParams::default()).is_err());
+    // Tamper: a wrong output.
+    assert!(verify_ivc(
+        &program,
+        &input,
+        output + 1,
+        32,
+        &proof,
+        &PcsParams::default()
+    )
+    .is_err());
+}
+
+/// The checkpointed replay regenerates the exact full padded trace
+/// (the deepest equivalence: record-level, before any proving).
+#[test]
+fn stream_cursor_matches_full_trace() {
+    use magnetar_cpu::expand_program;
+    use magnetar_cpu::interp::{execute, pad_records, StreamCursor};
+
+    let program = sum_program();
+    let input = vec![9u64];
+    let total = 64usize;
+    let seg_len = 16usize;
+    // The sequential path: execute + pad to total.
+    let mut full = execute(&program, &input, total);
+    pad_records(
+        &mut full.records,
+        &mut full.final_state,
+        &full.program,
+        total,
+    );
+    assert_eq!(full.records.len(), total);
+    // The streaming path: checkpoint + per-segment replay.
+    let prog = expand_program(&program);
+    let mut cursor = StreamCursor::start(&input);
+    let mut checkpoints = vec![cursor.clone()];
+    for _ in 0..total / seg_len {
+        let _ = cursor.run_segment(&prog, seg_len);
+        checkpoints.push(cursor.clone());
+    }
+    let mut replayed = Vec::new();
+    for cp in &checkpoints[..total / seg_len] {
+        let mut c = cp.clone();
+        replayed.extend(c.run_segment(&prog, seg_len));
+    }
+    assert_eq!(full.records, replayed);
+    // And the final state agrees.
+    assert_eq!(cursor.st.regs, full.final_state.regs);
+    assert_eq!(cursor.st.ram, full.final_state.ram);
+    assert_eq!(cursor.st.halted, full.final_state.halted);
+    assert_eq!(cursor.st.output, full.final_state.output);
+}

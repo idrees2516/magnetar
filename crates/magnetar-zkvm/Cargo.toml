@@ -16,6 +16,7 @@ magnetar-memory = { workspace = true }
 magnetar-router = { workspace = true }
 magnetar-cpu = { workspace = true }
 serde = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

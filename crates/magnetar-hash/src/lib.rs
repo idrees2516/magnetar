@@ -20,6 +20,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use blake3::Hasher as Blake3Hasher;
+use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
 use std::io::Write;
 
@@ -169,6 +170,9 @@ impl Transcript {
 /// The domain + size + index binding defeats cross-tree substitution,
 /// small-tree confusion, and index-forgery (duplicate-leaf) attacks; the
 /// 128-bit collision resistance of BLAKE3-256 dominates the security.
+/// Minimum leaves (or nodes) before a level is hashed in parallel (R2).
+const PAR_TREE_THRESHOLD: usize = 1 << 13;
+
 #[derive(Clone, Debug)]
 pub struct MerkleTree {
     /// All levels, leaves first: levels[0] = leaf digests (n), levels[i] =
@@ -186,6 +190,12 @@ impl MerkleTree {
     }
     /// Build a tree over `leaves` (each 16 bytes, little-endian field
     /// elements) under a domain-separation string.
+    ///
+    /// Parallel (docs/PERFORMANCE.md R1/R5): the leaf level and every
+    /// internal level are hashed with chunked parallelism; each level's
+    /// digests depend only on the completed previous level, so the tree is
+    /// built level-by-level (R5: one hash domain per level) and the result
+    /// is bit-identical to the sequential build.
     pub fn build(domain: &str, leaves: &[magnetar_field::Gf128]) -> Self {
         let n = leaves.len();
         assert!(
@@ -193,33 +203,39 @@ impl MerkleTree {
             "Merkle leaves must be a power of two"
         );
         let dom = domain.as_bytes().to_vec();
-        let level: Vec<[u8; DIGEST]> = leaves
-            .iter()
-            .enumerate()
-            .map(|(i, &x)| {
-                blake3_domain(&[
-                    b"magnetar/leaf/v1",
-                    &dom,
-                    &(n as u64).to_le_bytes(),
-                    &(i as u64).to_le_bytes(),
-                    &fe_to_bytes(x),
-                ])
-            })
-            .collect();
+        let leaf = |(i, &x): (usize, &magnetar_field::Gf128)| {
+            blake3_domain(&[
+                b"magnetar/leaf/v1",
+                &dom,
+                &(n as u64).to_le_bytes(),
+                &(i as u64).to_le_bytes(),
+                &fe_to_bytes(x),
+            ])
+        };
+        let level: Vec<[u8; DIGEST]> = if n >= PAR_TREE_THRESHOLD {
+            leaves.par_iter().enumerate().map(leaf).collect()
+        } else {
+            leaves.iter().enumerate().map(leaf).collect()
+        };
         let mut levels = vec![level];
         while levels.last().unwrap().len() > 1 {
             let cur = levels.last().unwrap();
             let lvl = levels.len() - 1;
-            let mut next = Vec::with_capacity(cur.len() / 2);
-            for j in 0..cur.len() / 2 {
-                next.push(blake3_domain(&[
+            let half = cur.len() / 2;
+            let node = |j: usize| {
+                blake3_domain(&[
                     b"magnetar/node/v1",
                     &dom,
                     &(lvl as u64).to_le_bytes(),
                     &cur[2 * j],
                     &cur[2 * j + 1],
-                ]));
-            }
+                ])
+            };
+            let next: Vec<[u8; DIGEST]> = if half >= PAR_TREE_THRESHOLD {
+                (0..half).into_par_iter().map(node).collect()
+            } else {
+                (0..half).map(node).collect()
+            };
             levels.push(next);
         }
         MerkleTree {

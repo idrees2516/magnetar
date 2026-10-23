@@ -10,6 +10,7 @@ repository.workspace = true
 magnetar-field = { workspace = true }
 magnetar-hash = { workspace = true }
 magnetar-sumcheck = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

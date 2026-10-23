@@ -35,8 +35,9 @@ fn bench_routers() {
             off[2 + j * 3] = Gf128(((a >> 2) & 1) as u128);
         }
     }
-    let off_kmajor: Vec<Gf128> = (0..3 * total)
-        .map(|i| off[(i % total) * 3 + i / total])
+    // The join witness wants per-variable bool vectors: off_bools[k][j].
+    let off_bools: Vec<Vec<bool>> = (0..3)
+        .map(|k| (0..total).map(|j| off[j * 3 + k] == ONE).collect())
         .collect();
     let r_o: Vec<Gf128> = (0..o_vars)
         .map(|i| Gf128(0x1111_0000_0000_0001u64.wrapping_add(i as u64) as u128))
@@ -115,15 +116,15 @@ fn bench_routers() {
     let _ = claim;
     // Join.
     let tensor = RoutingTensor::from_parts(values.clone(), o_vars, u_vars, h_vars, a_vars);
-    let sels = [SelCol {
-        table: &q,
+    let sels = vec![SelCol {
+        table: q.clone(),
         h_off: 0,
         h_vars,
     }];
     let wit = JoinWitness {
-        x: &x,
-        selectors: &sels,
-        offset_bits: &off_kmajor,
+        x: x.clone(),
+        selectors: sels,
+        offset_bits: off_bools,
     };
     let t0 = std::time::Instant::now();
     let mut t = Transcript::new("bench", &[b"t"]);

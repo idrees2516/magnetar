@@ -1,34 +1,38 @@
 # Benchmarks — the reference implementation vs. the paper
 
-Measured on this repository's reference implementation (single-threaded
-Rust, `--release`, test-scale parameters: RAM = 2^8 words, shift amount
-width 2, witness width W = 2048, GF(2^128) with PCLMULQDQ) and compared
-with the paper's reported figures (eprint 2026-2423, §6, Table 6).
+Measured on this repository's reference implementation (Rust `--release`,
+rayon parallel kernels, test-scale parameters: RAM = 2^8 words, shift
+amount width 2, witness width W = 2048, GF(2^128) with PCLMULQDQ) and
+compared with the paper's reported figures (eprint 2026-2423, §6,
+Table 6). The development container: 2 Xeon cores, 4 GiB.
 
 Run with:
 
 ```sh
-cargo run --release -p magnetar-cli --bin magnetar-bench
+cargo run --release -p magnetar-cli --bin magnetar-bench          # end-to-end
+cargo run --release -p magnetar-cli --bin magnetar-bench-stream   # streaming vs sequential
 ```
 
 ## End-to-end results (this implementation)
 
 | workload | T | prove (ms) | verify (ms) | cycles/s | proof (KiB) |
 |---|---|---|---|---|---|
-| alu-chain | 2^8 | 18,021 | 303 | 14 | 352.6 |
-| alu-chain | 2^10 | 82,122 | 1,438 | 12 | 443.1 |
-| mem-mix | 2^8 | 17,331 | 303 | 15 | 351.9 |
-| mem-mix | 2^10 | 80,288 | 1,442 | 13 | 442.4 |
-| branchy | 2^8 | 16,984 | 306 | 15 | 351.9 |
-| branchy | 2^10 | 80,182 | 1,478 | 13 | 442.4 |
-| shift-mix | 2^8 | 17,069 | 306 | 15 | 351.9 |
-| shift-mix | 2^10 | 80,778 | 1,442 | 13 | 442.4 |
+| alu-chain | 2^8 | 13,263 | 291 | 19 | 352.6 |
+| alu-chain | 2^10 | 58,183 | 1,488 | 18 | 443.1 |
+| mem-mix | 2^8 | 12,819 | 305 | 20 | 351.9 |
+| mem-mix | 2^10 | 55,865 | 1,390 | 18 | 442.4 |
+| branchy | 2^8 | 12,473 | 299 | 21 | 351.9 |
+| branchy | 2^10 | 56,028 | 1,382 | 18 | 442.4 |
+| shift-mix | 2^8 | 12,653 | 308 | 20 | 351.9 |
+| shift-mix | 2^10 | 56,297 | 1,472 | 18 | 442.4 |
 
 Tree-IVC (T = 2^10 total, 4 segments of 2^8 sharing one commitment):
-prove 89,874 ms, verify 1,229 ms, **proof body 90,304 B + ONE shared PCS
+prove 69,159 ms, verify 1,216 ms, **proof body 90,304 B + ONE shared PCS
 tail (1,008 B)** — versus four separate full proofs, each of which would
 carry its own evaluation-argument tail. This is the roadmap §8.2
-aggregation saving, measured.
+aggregation saving, measured. (The ~25% prove-time drop vs. the previous
+measurement is the parallel Merkle/encode kernels and the join-enumeration
+router now wired through the protocol.)
 
 ## The paper's figures (Table 6, erc20-mixed-block, optimized system)
 
@@ -70,8 +74,11 @@ for three identified reasons, in order of impact:
    paper's 8–11 ms): the reference verifier evaluates public factors by
    materialization rather than the paper's O(polylog) structured
    evaluation.
-3. **Single-threaded, allocation-heavy Rust** — no rayon, no arena, no
-   SIMD batching beyond the field multiplication.
+3. **Allocation-heavy Rust with only coarse parallelism** — the rayon
+   kernels (Merkle, encode, sum-check folds, the join router, the
+   parallel segments below) are in, but the dense per-segment provers
+   stream hundreds of MB per sum-check round, so memory bandwidth, not
+   core count, is the binding constraint at this scale (measured below).
 
 **Memory.** T = 2^11 exceeds this implementation's envelope (OOM on a
 commodity container) for the same reason as (1); the paper peaks at
@@ -91,11 +98,62 @@ commodity container) for the same reason as (1); the paper peaks at
   time by ~4.7×, converging toward linear as the fixed components
   amortize).
 
+## The streaming, parallel tree-IVC prover
+
+`magnetar-ivc::streaming` proves the same tree-IVC statements with a
+bounded-memory pipeline — checkpoint pass (the trace never resides),
+rayon-parallel segment proofs (each with its own Fiat–Shamir transcript,
+tables packed straight into the shared leaf vector and dropped), then
+one sequential root (parallel encode + Merkle + the discharge). The
+proofs are **byte-identical** to the sequential prover's (tested on 1/2/4
+segments), so this is purely a memory/scheduling change.
+
+Measured in fresh processes (mode-separated; `VmHWM` is a lifetime
+high-water mark), alu-chain:
+
+| T | segments | sequential (ms) | streaming (ms) | ckpt | segments phase | root | streaming artifacts |
+|---|---|---|---|---|---|---|---|
+| 2^9 | 1 | 27,231 | 27,671 | ~0 | 24.6 s | 3.1 s | 1.3 MiB |
+| 2^9 | 2 | 29,581 | 28,394 | ~0 | 22.8 s | 5.6 s | 1.0 MiB |
+| 2^9 | 4 | 34,488 | 33,326 | ~0 | 21.8 s | 10.9 s | 0.8 MiB |
+| 2^10 | 1 | 58,623 | 58,044 | ~0 | 51.5 s | 6.6 s | 2.6 MiB |
+| 2^10 | 2 | 60,369 | 60,574 | ~0 | 48.5 s | 12.1 s | 1.9 MiB |
+| 2^10 | 4 | 70,939 | 68,050 | ~0 | 45.1 s | 23.0 s | 1.6 MiB |
+
+What this measures, honestly:
+
+- **The parallelism is real and correct.** Worker tracing
+  (`MAGNETAR_TRACE_WORKERS=1`) shows segment workers dispatched two at a
+  time on both cores with ~100% thread utilization (e.g. at T = 2^8,
+  4 segments: two concurrent ~5.3 s waves — 4 × 5.5 s of work in 11.0 s
+  of wall).
+- **The net wall-clock is ~1.0–1.15x, not ~2x, because the per-segment
+  provers are memory-bound.** Under 2-way concurrency each worker runs
+  ~1.8x slower (a register-only CPU loop scales 2.10x on the same box);
+  the dense Twist/Shout tables stream hundreds of MB per round and
+  saturate the shared memory bus. This is R3's lesson in the flesh:
+  collapse the algorithm before counting cores — the roadmap's
+  linear-in-T Twist/Shout provers are what unlock the parallel speedup,
+  exactly as the paper's cost model predicts.
+- **The streaming artifacts are 3 orders of magnitude below the dense
+  provers' working set**: the checkpoint store + packed leaves + codeword
+  + in-flight tables total 0.8–2.6 MiB at these scales, while the dense
+  per-segment provers dominate the process RSS (~1.4 GiB at 2^9). The
+  architecture bounds everything it is responsible for; the remaining
+  memory is the dense provers' known gap.
+- **The commitment path no longer materializes the boolean union**:
+  `pack_tables` writes the leaves directly from the component tables
+  (a ~16x commitment-memory reduction), parallel over leaves.
+
 ## Reproducing
 
 ```sh
-cargo test --release          # 79 tests: the tamper classes and roundtrips
+cargo test --release          # 93 tests: the tamper classes and roundtrips
 cargo run --release -p magnetar-cli --bin magnetar-bench
+cargo run --release -p magnetar-cli --bin magnetar-bench-stream -- 9 seq    # isolated sequential
+cargo run --release -p magnetar-cli --bin magnetar-bench-stream -- 9 stream # isolated streaming
+MAGNETAR_TRACE_WORKERS=1 cargo run --release -p magnetar-cli \
+    --bin magnetar-bench-stream -- 8 stream   # the worker schedule
 cargo run --release --bin magnetar fib 12      # the CLI smoke
 cargo run --release --bin magnetar proof-stats # the byte breakdown
 ```

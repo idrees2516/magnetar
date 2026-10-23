@@ -13,8 +13,14 @@
 //! evaluation claims of the reduction (paper Definition 5).
 
 use crate::{interpolate, BindOrder, RoundMsg, SumcheckSpec};
-use magnetar_field::{bind_var, mul, Gf128, ZERO};
+use magnetar_field::{mul, par_bind_var, Gf128, ZERO};
 use magnetar_hash::Transcript;
+use rayon::prelude::*;
+
+/// Minimum remaining-cube size before the round message is computed with
+/// chunked parallelism (R2). Field arithmetic reduces order-independently
+/// (R1), so the parallel message is bit-identical to the sequential one.
+const PAR_MSG_THRESHOLD: usize = 1 << 13;
 
 /// Prover-side state: the folding tables plus the running claim.
 pub struct SumcheckProver {
@@ -72,69 +78,114 @@ impl SumcheckProver {
 
     /// `Σ_{rest} g(X, rest)` over the remaining Boolean cube, with the round
     /// variable fixed to the field value `X`.
+    ///
+    /// Parallel strategy (docs/PERFORMANCE.md R1/R3/R8): every factor's
+    /// view is a disjoint chunk-wise map; each term's elementwise product
+    /// is reduced per chunk and the chunk sums are XOR-combined — every
+    /// reduction is over `+`/`×` (commutative, associative), so the result
+    /// is bit-identical to the sequential computation regardless of thread
+    /// scheduling.
     fn summand_sum_at(&self, x: Gf128) -> Gf128 {
-        // Per factor: the table viewed at (X, rest) = A + X·B where A is the
-        // bit-0 slice and B = A + bit-1 slice (characteristic two).
         let bit = self.order.current_bit(self.num_vars, self.round);
-        // Value of the MLE at (X, rest) = A + X·(A + T1), where A is the
-        // bit-0 slice and T1 the bit-1 slice (characteristic two).
+        // Value of the MLE at (X, rest) = A + X·(A + T1) per entry.
         let view = |table: &Vec<Gf128>| -> Vec<Gf128> {
             let block = 1usize << bit;
-            let mut out = Vec::with_capacity(table.len() / 2);
-            let mut i = 0;
-            while i < table.len() {
-                for j in 0..block {
-                    let a = table[i + j];
-                    let t1 = table[(i + j) | block];
-                    out.push(a + mul(x, a + t1));
+            let out_len = table.len() / 2;
+            if table.len() >= PAR_MSG_THRESHOLD {
+                // One task per aligned span of pair-groups (R2/R8): the
+                // chunk length is a multiple of `block`, so no group is
+                // ever split across tasks.
+                let threads = rayon::current_num_threads().max(1);
+                let target = (out_len / (threads * 4)).clamp(block, out_len);
+                let task = target.next_multiple_of(block).clamp(block, out_len);
+                let mut buf = vec![ZERO; out_len];
+                buf.par_chunks_mut(task)
+                    .enumerate()
+                    .for_each(|(ci, ochunk)| {
+                        let groups = ochunk.len() / block;
+                        let gi0 = (ci * task) / block;
+                        for g in 0..groups {
+                            let base = (gi0 + g) * 2 * block;
+                            for j in 0..block {
+                                let a = table[base + j];
+                                let t1 = table[(base + j) | block];
+                                ochunk[g * block + j] = a + mul(x, a + t1);
+                            }
+                        }
+                    });
+                buf
+            } else {
+                let mut out = Vec::with_capacity(out_len);
+                let mut i = 0;
+                while i < table.len() {
+                    for j in 0..block {
+                        let a = table[i + j];
+                        let t1 = table[(i + j) | block];
+                        out.push(a + mul(x, a + t1));
+                    }
+                    i += 2 * block;
                 }
-                i += 2 * block;
+                out
             }
-            out
         };
         let dense_views: Vec<Vec<Gf128>> = self.dense.iter().map(view).collect();
         let public_views: Vec<Vec<Gf128>> = self.public_tables.iter().map(view).collect();
-        // Sum terms elementwise on the product of the views.
+        // Sum terms elementwise on the product of the views — chunked
+        // with per-chunk XOR accumulators (R8: no shared mutable state).
+        // The iteration count is the shortest view (the round variable is
+        // already folded out of every view; zip-truncation semantics are
+        // preserved for degenerate factors).
         let mut total = ZERO;
         for (ti, t) in self.spec_terms.iter().enumerate() {
-            let mut prod: Option<Vec<Gf128>> = None;
-            for &d in &t.dense {
-                prod = Some(match prod {
-                    None => dense_views[d].clone(),
-                    Some(p) => p
-                        .iter()
-                        .zip(dense_views[d].iter())
-                        .map(|(&a, &b)| mul(a, b))
-                        .collect(),
-                });
-            }
-            for &p in &t.public {
-                prod = Some(match prod {
-                    None => public_views[p].clone(),
-                    Some(pr) => pr
-                        .iter()
-                        .zip(public_views[p].iter())
-                        .map(|(&a, &b)| mul(a, b))
-                        .collect(),
-                });
-            }
             let coeff = self.coeffs[ti];
-            match prod {
-                None => {
-                    // Constant term (no factors): contributes coeff per
-                    // remaining Boolean point.
-                    let n = 1u128 << self.remaining_vars();
-                    // n mod 2 == 0 for ≥1 vars; only nonzero when n == 1.
-                    if n == 1 {
-                        total += coeff;
-                    }
+            let factor_views: Vec<&Vec<Gf128>> = t
+                .dense
+                .iter()
+                .map(|&d| &dense_views[d])
+                .chain(t.public.iter().map(|&p| &public_views[p]))
+                .collect();
+            if factor_views.is_empty() {
+                if self.remaining_vars() == 1 {
+                    total += coeff;
                 }
-                Some(p) => {
-                    for &v in &p {
-                        total += mul(coeff, v);
-                    }
-                }
+                continue;
             }
+            let n_rem = factor_views.iter().map(|f| f.len()).min().unwrap_or(0);
+            if n_rem == 0 {
+                continue;
+            }
+            if n_rem < PAR_MSG_THRESHOLD {
+                // Sequential kernel (R2).
+                let mut s = ZERO;
+                for i in 0..n_rem {
+                    let mut v = coeff;
+                    for f in &factor_views {
+                        v = mul(v, f[i]);
+                    }
+                    s += v;
+                }
+                total += s;
+                continue;
+            }
+            // Per chunk: fold the elementwise product of all factor views
+            // into one field element, then XOR-combine (R1: order-free).
+            let chunk = (1usize << 15).min(n_rem);
+            let terms_sum: Gf128 = (0..n_rem)
+                .into_par_iter()
+                .chunks(chunk)
+                .map(|idxs| {
+                    let mut s = ZERO;
+                    for i in idxs {
+                        let mut v = coeff;
+                        for f in &factor_views {
+                            v = mul(v, f[i]);
+                        }
+                        s += v;
+                    }
+                    s
+                })
+                .sum::<Gf128>();
+            total += terms_sum;
         }
         total
     }
@@ -169,10 +220,10 @@ impl SumcheckProver {
         self.running = mr;
         let bit = self.order.current_bit(self.num_vars, self.round);
         for d in self.dense.iter_mut() {
-            bind_var(d, bit, r);
+            par_bind_var(d, bit, r);
         }
         for p in self.public_tables.iter_mut() {
-            bind_var(p, bit, r);
+            par_bind_var(p, bit, r);
         }
         self.round += 1;
     }

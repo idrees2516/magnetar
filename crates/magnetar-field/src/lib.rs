@@ -29,6 +29,7 @@ mod eq;
 mod gf128;
 mod multilinear;
 mod pack;
+pub mod parallel;
 
 pub use eq::{eq_char2, eq_table, EqBits};
 pub use gf128::{inv, mul, pow, square, Gf128, ONE, ZERO};
@@ -37,6 +38,7 @@ pub use pack::{
     c_fold_table, eq_coefficients, pack_bits, pack_bytes_le, pack_table, phi_c, unpack_bits,
     PHIBITS,
 };
+pub use parallel::{par_bind_var, par_dot_xor, PAR_CHUNK, PAR_THRESHOLD};
 
 /// A small helper trait for field elements used across the stack.
 pub trait Field: Copy + PartialEq + std::fmt::Debug {

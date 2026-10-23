@@ -547,22 +547,22 @@ mod tests {
             }
         }
         let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, 0);
-        let sels = [
+        let sels = vec![
             SelCol {
-                table: &q_lo,
+                table: q_lo.clone(),
                 h_off: a_off_h,
                 h_vars: a_hv,
             },
             SelCol {
-                table: &q_hi,
+                table: q_hi.clone(),
                 h_off: k_off_h,
                 h_vars: k_hv,
             },
         ];
         let wit = JoinWitness {
-            x: &x,
-            selectors: &sels,
-            offset_bits: &[],
+            x: x.clone(),
+            selectors: sels,
+            offset_bits: Vec::new(),
         };
         let mut t = Transcript::new("router", &[b"t"]);
         let proof = prove_routing_join(&layout, y_claim, &r_o, &r_j, &tensor, &wit, &mut t);
@@ -681,21 +681,20 @@ mod tests {
             }
             t2
         };
-        // The k-major offset bits for the join witness.
-        let off_kmajor: Vec<Gf128> = (0..3)
-            .flat_map(|k| (0..cycles).map(move |j| (k, j)))
-            .map(|(k, j)| off_bits[k + j * 3])
+        // Per-variable offset bits for the join witness: bits[k][j].
+        let off_bools: Vec<Vec<bool>> = (0..3)
+            .map(|k| (0..cycles).map(|j| off_bits[k + j * 3] == ONE).collect())
             .collect();
         let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, a_vars);
-        let sels = [SelCol {
-            table: &q_st,
+        let sels = vec![SelCol {
+            table: q_st.clone(),
             h_off: 0,
             h_vars,
         }];
         let wit = JoinWitness {
-            x: &x_table,
-            selectors: &sels,
-            offset_bits: &off_kmajor,
+            x: x_table.clone(),
+            selectors: sels,
+            offset_bits: off_bools,
         };
         let mut t = Transcript::new("router2", &[b"t"]);
         let proof = prove_routing_join(&layout, y_claim, &r_o, &r_j, &tensor, &wit, &mut t);
@@ -854,20 +853,19 @@ mod tests {
         let mut t1 = Transcript::new("xcheck", &[b"t"]);
         let sparse = prove_routing(&layout, claim, &r_o, &r_j, &r_pub, &dense, 1, &mut t1);
         // Join proof.
-        let off_kmajor: Vec<Gf128> = (0..3)
-            .flat_map(|k| (0..cycles).map(move |j| (k, j)))
-            .map(|(k, j)| off_bits[k + j * 3])
+        let off_bools: Vec<Vec<bool>> = (0..3)
+            .map(|k| (0..cycles).map(|j| off_bits[k + j * 3] == ONE).collect())
             .collect();
         let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, a_vars);
-        let sels = [SelCol {
-            table: &q_st,
+        let sels = vec![SelCol {
+            table: q_st.clone(),
             h_off: 0,
             h_vars,
         }];
         let wit = JoinWitness {
-            x: &x_table,
-            selectors: &sels,
-            offset_bits: &off_kmajor,
+            x: x_table.clone(),
+            selectors: sels,
+            offset_bits: off_bools,
         };
         let mut t2 = Transcript::new("xcheck", &[b"t"]);
         let join = prove_routing_join(&layout, claim, &r_o, &r_j, &tensor, &wit, &mut t2);

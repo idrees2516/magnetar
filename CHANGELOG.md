@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.5.0] — the parallel streaming release
+
+### Added
+- **The performance rulebook** (`docs/PERFORMANCE.md`, R1–R10): the
+  mandatory engineering rules for every prover-side hot path —
+  order-free parallel reductions (char-2 determinism), work thresholds,
+  structure-collapse-before-parallelism, branch-free SIMD-friendly
+  kernels, batching, memoization, streaming memory discipline, disjoint
+  writes, the parallel-kernel shape, and honest measurement. Every PR
+  touching prover code is reviewed against its checklist.
+- **Parallel kernels throughout the stack** (rayon): the parallel
+  sum-check fold and round messages (bit-identical to the sequential
+  engine, tested), the parallel Merkle tree (level-by-level with
+  chunked leaf/node hashing), the parallel subspace-extension encode
+  (independent ε-blocks), `par_bind_var`/`par_dot_xor` field kernels
+  with measured thresholds, and `Gf128: Sum` for order-free reductions.
+- **The parallel join-enumeration router prover**
+  (`magnetar-router::join`): every routing sum-check phase enumerates
+  the trace column-by-column with per-chunk coefficient accumulators
+  (τ algebraic folding over the store offsets, sparse support pairs,
+  the one-hot kill, lockstep u-folds, pair-folded j-rounds) —
+  byte-identical round messages to the sparse prover (cross-validated),
+  O(c·T) work per routing instance.
+- **The streaming, parallel tree-IVC prover**
+  (`magnetar-ivc::streaming`): checkpointed execution
+  (`magnetar-cpu::StreamCursor` — the trace never resides; segment
+  replay byte-identical to the full padded trace, tested at the record
+  and proof levels), rayon-parallel segment proofs with per-segment
+  Fiat–Shamir transcripts, tables packed straight into the shared
+  commitment leaves and dropped in flight (`pack_tables`/
+  `pack_tables_slice` — no boolean union, ~16x less commitment memory),
+  and one sequential root. `StreamingStats` measures per-phase wall
+  clock, peak RSS (VmHWM), and the byte inventories. The proofs are
+  byte-identical to the sequential prover's on 1/2/4 segments.
+- **The streaming-prover benchmark**
+  (`magnetar-bench-stream`): mode-separated sequential-vs-streaming
+  measurement (fresh processes for honest VmHWM) with the worker
+  schedule tracer (`MAGNETAR_TRACE_WORKERS=1`) and the honest analysis
+  in `docs/BENCHMARKS.md` — the parallelism is thread-correct (~100%
+  utilization), the net speedup is bounded by the dense per-segment
+  provers' memory bandwidth (the roadmap's linear-in-T provers are the
+  unlock).
+
+### Fixed
+- The join prover's u-rounds split the round variable from the wrong
+  end of the working table (`split_at` on the high bit instead of the
+  strided bit 0 the folds bind) and the j-rounds double-counted each
+  pair (self-cancelling in characteristic two) while missing the folded
+  R/eq_o scale — found by the byte-identity cross-check against the
+  sparse prover, now green.
+
 ## [0.4.0] — the soundness closure release
 
 ### Added

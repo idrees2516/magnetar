@@ -40,7 +40,9 @@ pub mod protocol;
 pub mod rom;
 pub mod stats;
 
-pub use mosaic::{MosaicClaim, MosaicCommitment, MosaicLayout, MosaicProof};
+pub use mosaic::{
+    pack_tables, pack_tables_slice, MosaicClaim, MosaicCommitment, MosaicLayout, MosaicProof,
+};
 pub use protocol::{
     boundary_point_claims, build_segment, keygen, keygen_with, prove, prove_inner, verify,
     verify_inner, Boundary, InnerProof, KeyGen, Proof, PublicInput, SegmentStatement, VerifyingKey,
