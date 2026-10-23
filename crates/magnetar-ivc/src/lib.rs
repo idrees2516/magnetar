@@ -59,6 +59,9 @@ use magnetar_zkvm::{
     MosaicClaim, MosaicLayout, MosaicProof, PublicInput, SegmentStatement, AMOUNT_BITS,
 };
 
+pub mod streaming;
+pub use streaming::{peak_rss_bytes, prove_ivc_streaming, StreamingStats};
+
 /// One aggregated tree node: the union of a subtree's components and
 /// claims. Merging is associative, so segments can combine pairwise in
 /// any order (the claim-batching of the roadmap's §8.2).
@@ -437,7 +440,7 @@ pub fn verify_ivc(
 /// The combined Mosaic layout: `segments` copies of the per-segment
 /// component list, tagged by the segment index (placed on disjoint
 /// aligned subcubes by the alignment rule).
-fn combined_layout(pk: &KeyGen, segments: usize) -> MosaicLayout {
+pub(crate) fn combined_layout(pk: &KeyGen, segments: usize) -> MosaicLayout {
     let n = pk.trace_len.trailing_zeros() as usize;
     let a_rom = pk.rom.a_rom;
     let mut comps = Vec::new();
@@ -483,7 +486,7 @@ fn crate_mosaic_components(n: usize, a_rom: usize) -> Vec<magnetar_zkvm::mosaic:
 }
 
 /// The canonical byte encoding of a segment statement (transcript seed).
-fn stmt_bytes(st: &SegmentStatement) -> Vec<u8> {
+pub(crate) fn stmt_bytes(st: &SegmentStatement) -> Vec<u8> {
     let mut v = Vec::new();
     for b in [&st.init, &st.final_] {
         for w in b.regs.iter().chain(b.ram.iter()) {

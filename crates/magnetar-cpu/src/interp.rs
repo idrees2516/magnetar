@@ -34,7 +34,7 @@ pub struct ExecState {
 
 /// The per-cycle trace record (one per virtual cycle) — the CPU circuit's
 /// logical witness plus the memory-access log.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct CycleRecord {
     /// The micro-PC at the start of the cycle (the fetch address).
     pub micro_pc: usize,
@@ -158,33 +158,105 @@ pub fn pad_records(
     prog: &ExpandedProgram,
     target: usize,
 ) {
+    let mut last_pc = records.last().map(|r| r.next_pc).unwrap_or(0);
     while records.len() < target {
-        // The padding cycles freeze the micro-PC (the halt-latch
-        // semantics): they fetch the frozen row so the cross-step chain
-        // `fetch(j+1) = TT[fetch(j), taken(j), halt(j)]` stays consistent
-        // (the halt transition is the identity).
-        let last_pc = records.last().map(|r| r.next_pc).unwrap_or(0);
-        let frozen = last_pc % prog.rows.len();
-        let out = st.output;
-        let row = &prog.rows[frozen].row;
-        let write_addr = if row.rd == 0 { 32 } else { row.rd };
-        let rec = CycleRecord {
-            micro_pc: frozen,
-            rs1_val: st.regs[row.rs1 % REGS],
-            rs2_val: st.regs[row.rs2 % REGS],
-            next_pc: frozen,
-            rd: write_addr,
-            rd_old: st.regs[write_addr],
-            rd_val: out,
-            halted_latch: true,
-            ram_addr: 0,
-            ram_word: st.ram[0],
-            ..Default::default()
+        records.push(frozen_record(st, prog, last_pc));
+        // The frozen record is a fixed point of the transition (next_pc =
+        // frozen), so the chain is stable from here on.
+        last_pc = last_pc % prog.rows.len();
+    }
+}
+
+/// One halt-latch padding cycle at fetch row `last_pc % rows` — the
+/// padding semantics shared by `pad_records` and the streaming segment
+/// runner. Applies the halt-latch write to `st` so later cycles read the
+/// evolved state (the memory argument stays consistent).
+fn frozen_record(st: &mut ExecState, prog: &ExpandedProgram, last_pc: usize) -> CycleRecord {
+    // The padding cycles freeze the micro-PC (the halt-latch
+    // semantics): they fetch the frozen row so the cross-step chain
+    // `fetch(j+1) = TT[fetch(j), taken(j), halt(j)]` stays consistent
+    // (the halt transition is the identity).
+    let frozen = last_pc % prog.rows.len();
+    let out = st.output;
+    let row = &prog.rows[frozen].row;
+    let write_addr = if row.rd == 0 { 32 } else { row.rd };
+    let rec = CycleRecord {
+        micro_pc: frozen,
+        rs1_val: st.regs[row.rs1 % REGS],
+        rs2_val: st.regs[row.rs2 % REGS],
+        next_pc: frozen,
+        rd: write_addr,
+        rd_old: st.regs[write_addr],
+        rd_val: out,
+        halted_latch: true,
+        ram_addr: 0,
+        ram_word: st.ram[0],
+        ..Default::default()
+    };
+    // Apply the halt-latch write so later padding reads agree with the
+    // memory argument's evolution.
+    st.regs[write_addr] = out;
+    rec
+}
+
+/// A streaming execution cursor: the machine state plus the halt-frozen
+/// fetch-row chain (`next_fetch` = the last cycle's `next_pc`, which the
+/// padding identity preserves). Segments regenerate **byte-identically**
+/// from a cloned cursor: the interpreter is deterministic and the frozen
+/// chain crosses segment boundaries exactly as it does inside one
+/// `pad_records` run (docs/PERFORMANCE.md R7 — checkpoints).
+#[derive(Clone, Debug)]
+pub struct StreamCursor {
+    pub st: ExecState,
+    /// The last emitted cycle's `next_pc` (the halt-frozen row source).
+    pub next_fetch: usize,
+}
+
+impl StreamCursor {
+    /// The canonical start: zero state, input words loaded at RAM word 0.
+    pub fn start(input: &[Word]) -> Self {
+        let mut st = ExecState {
+            regs: [0; REGS],
+            ram: vec![0; 1usize << RAM_WORDS_LOG2],
+            micro_pc: 0,
+            cycles: 0,
+            halted: false,
+            output: 0,
         };
-        records.push(rec);
-        // Apply the halt-latch write so later padding reads agree with the
-        // memory argument's evolution.
-        st.regs[write_addr] = out;
+        for (i, &w) in input.iter().enumerate() {
+            if i < st.ram.len() {
+                st.ram[i] = w;
+            }
+        }
+        StreamCursor {
+            st,
+            next_fetch: 0,
+        }
+    }
+
+    /// Run exactly `seg_len` cycles: live `step`s while the machine runs,
+    /// halt-latch padding once halted (the same record shapes as
+    /// `pad_records`, chained across calls through `next_fetch`). The
+    /// state advances in place; records never exceed this segment.
+    pub fn run_segment(
+        &mut self,
+        prog: &ExpandedProgram,
+        seg_len: usize,
+    ) -> Vec<CycleRecord> {
+        let mut records = Vec::with_capacity(seg_len);
+        while records.len() < seg_len {
+            if !self.st.halted {
+                let rec = step(prog, &mut self.st);
+                self.st.cycles += 1;
+                self.next_fetch = rec.next_pc;
+                records.push(rec);
+            } else {
+                let rec = frozen_record(&mut self.st, prog, self.next_fetch);
+                self.next_fetch = rec.next_pc;
+                records.push(rec);
+            }
+        }
+        records
     }
 }
 

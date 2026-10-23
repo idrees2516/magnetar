@@ -32,6 +32,7 @@ use magnetar_sumcheck::{
     public::SumEqFactor,
     BindOrder, SumcheckSpec, Term,
 };
+use rayon::prelude::*;
 
 /// One committed component's placement.
 #[derive(Clone, Debug)]
@@ -132,7 +133,9 @@ pub struct MosaicCommitment {
 }
 
 /// Assemble the G bit table from the per-component bit tables (zero
-/// outside the union of the subcubes).
+/// outside the union of the subcubes). Test-only since the streaming
+/// pack ([`pack_tables`]) replaced the union materialization.
+#[cfg(test)]
 fn assemble_g(layout: &MosaicLayout, tables: &[Vec<bool>]) -> Vec<bool> {
     let mut g = vec![false; 1usize << layout.ell];
     for (i, t) in tables.iter().enumerate() {
@@ -146,6 +149,103 @@ fn assemble_g(layout: &MosaicLayout, tables: &[Vec<bool>]) -> Vec<bool> {
     g
 }
 
+/// One rectangular placement of a component inside the packed leaf
+/// vector: the component's bit range `[off, off + 2^vars)` intersected
+/// with a single bit-plane `p` — leaves `[leaf_lo, leaf_hi)` map to table
+/// entries `[j_lo, …)` (the g-index is `leaf + p·2^n`, the plane is the
+/// high 7 bits).
+#[derive(Clone, Copy, Debug)]
+struct PackPiece {
+    table: usize,
+    plane: usize,
+    leaf_lo: usize,
+    leaf_hi: usize,
+    /// The table index at `leaf_lo`.
+    j_lo: usize,
+}
+
+/// The pack geometry: the disjoint pieces covering the components' bit
+/// ranges, clipped per plane (each component spans at most a few planes).
+/// `tables` are the components `[first, first + tables.len())` of
+/// `layout`; the piece table indices are local to `tables`.
+fn pack_pieces(layout: &MosaicLayout, first: usize, tables: &[Vec<bool>]) -> Vec<PackPiece> {
+    let n = layout.ell - 7;
+    let mask = (1usize << n) - 1;
+    let mut pieces = Vec::with_capacity(tables.len() + 128);
+    for (i, t) in tables.iter().enumerate() {
+        let off = layout.offsets[first + i];
+        let size = 1usize << layout.vars(first + i);
+        debug_assert_eq!(t.len(), size);
+        let g_lo = off;
+        let g_hi = off + size;
+        for p in (g_lo >> n)..=((g_hi - 1) >> n) {
+            let lo = g_lo.max(p << n);
+            let hi = g_hi.min((p + 1) << n);
+            pieces.push(PackPiece {
+                table: i,
+                plane: p,
+                leaf_lo: lo & mask,
+                leaf_hi: (hi - 1) & mask,
+                j_lo: lo - g_lo,
+            });
+        }
+    }
+    pieces
+}
+
+/// Pack the component bit tables straight into the leaf vector — the
+/// streaming commitment path (docs/PERFORMANCE.md R5/R7): no `2^ell`-bit
+/// boolean union is materialized, and the leaves pack in parallel with
+/// disjoint writes. Bit-identical to the `assemble_g` + pack loop.
+pub fn pack_tables(layout: &MosaicLayout, tables: &[Vec<bool>], packed: &mut [Gf128]) {
+    pack_tables_slice(layout, 0, tables, packed);
+}
+
+/// Pack `tables` — the components `[first, first + tables.len())` of the
+/// (possibly combined) `layout` — into the leaf vector by **OR-ing** the
+/// components' planes into the existing leaf words. Disjoint component
+/// ranges make sequential slice packs compose into the full pack: this
+/// is the per-segment streaming commitment entry (the leaf words overlap
+/// across segments — different planes of the same word — so the caller
+/// serializes slice packs).
+pub fn pack_tables_slice(
+    layout: &MosaicLayout,
+    first: usize,
+    tables: &[Vec<bool>],
+    packed: &mut [Gf128],
+) {
+    let n = layout.ell - 7;
+    assert_eq!(packed.len(), 1usize << n);
+    let pieces = pack_pieces(layout, first, tables);
+    // R2: below the threshold one chunk (sequential); above, multiple
+    // tasks per core, never smaller than the threshold.
+    let chunk = if packed.len() < magnetar_field::PAR_THRESHOLD {
+        packed.len().max(1)
+    } else {
+        (packed.len() / (rayon::current_num_threads().max(1) * 4))
+            .clamp(magnetar_field::PAR_THRESHOLD, packed.len())
+    };
+    packed
+        .par_chunks_mut(chunk)
+        .enumerate()
+        .for_each(|(ci, out)| {
+            let base = ci * chunk;
+            for (rel, leaf) in out.iter_mut().enumerate() {
+                let u = base + rel;
+                let mut v: u128 = 0;
+                for pc in pieces.iter() {
+                    if u >= pc.leaf_lo && u <= pc.leaf_hi {
+                        let j = pc.j_lo + (u - pc.leaf_lo);
+                        if tables[pc.table][j] {
+                            v |= 1u128 << pc.plane;
+                        }
+                    }
+                }
+                *leaf = Gf128(leaf.0 | v);
+            }
+        });
+}
+
 /// Commit the Mosaic: `tables[i]` is component `i`'s bit table.
 pub fn commit_mosaic(
     params: &PcsParams,
@@ -155,20 +255,11 @@ pub fn commit_mosaic(
     assert_eq!(tables.len(), layout.components.len());
     let ell = layout.ell;
     assert!(ell >= 7, "witness must have at least 7 variables");
-    let bits = assemble_g(layout, tables);
     // Pack over the top 7 bits: P(u) = Σ_b β_b G(u, b) with u the low
-    // ℓ−7 bits.
+    // ℓ−7 bits (streaming: the boolean union is never materialized).
     let n = ell - 7;
     let mut packed = vec![ZERO; 1usize << n];
-    for u in 0..(1usize << n) {
-        let mut v: u128 = 0;
-        for b in 0..128usize {
-            if bits[u | (b << n)] {
-                v |= 1u128 << b;
-            }
-        }
-        packed[u] = Gf128(v);
-    }
+    pack_tables(layout, tables, &mut packed);
     let code_params = CodeParams::derive(n, params.k, &params.domain);
     let codeword = Codeword::encode(&code_params, &packed);
     let tree = MerkleTree::build(&format!("{}/level/0", params.domain), &codeword.values);
@@ -337,4 +428,58 @@ pub fn verify_mosaic(
         &proof.ring,
         t,
     )
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::*;
+
+    /// The streaming pack must be bit-identical to the (former)
+    /// assemble-then-pack path, on a layout whose components span several
+    /// planes and misaligned boundaries.
+    #[test]
+    fn pack_tables_matches_assemble_and_pack() {
+        let mut rng = rand::thread_rng();
+        use rand::Rng;
+        // A layout with mixed sizes: big components (multi-plane),
+        // small ones, and a trailing hole (planes beyond the union stay
+        // zero).
+        let comps: Vec<(usize, usize)> = vec![
+            (10, 6),  // 2^16 bits
+            (10, 6),
+            (10, 4),
+            (10, 3),
+            (10, 8),
+            (10, 6),
+        ];
+        let layout = MosaicLayout::build(
+            comps
+                .iter()
+                .map(|(n, v)| ComponentSpec {
+                    name: format!("c{n}-{v}"),
+                    vars: v + n,
+                })
+                .collect(),
+        );
+        let tables: Vec<Vec<bool>> = comps
+            .iter()
+            .map(|(n, v)| (0..(1usize << (n + v))).map(|_| rng.gen::<bool>()).collect())
+            .collect();
+        // Reference: assemble + pack.
+        let bits = assemble_g(&layout, &tables);
+        let n = layout.ell - 7;
+        let mut want = vec![ZERO; 1usize << n];
+        for u in 0..(1usize << n) {
+            let mut v: u128 = 0;
+            for b in 0..128usize {
+                if bits[u | (b << n)] {
+                    v |= 1u128 << b;
+                }
+            }
+            want[u] = Gf128(v);
+        }
+        let mut got = vec![ZERO; 1usize << n];
+        pack_tables(&layout, &tables, &mut got);
+        assert_eq!(want, got);
+    }
 }

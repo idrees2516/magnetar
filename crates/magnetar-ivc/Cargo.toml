@@ -12,6 +12,7 @@ magnetar-hash = { workspace = true }
 magnetar-cpu = { workspace = true }
 magnetar-zkvm = { workspace = true }
 magnetar-pcs = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

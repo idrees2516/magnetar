@@ -179,7 +179,7 @@ pub struct SegmentStatement {
 /// — everything **before** the (shared) commitment and its MosaicPCS
 /// discharge. The single-segment [`Proof`] wraps this; tree-IVC shares
 /// one commitment across many segments.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct InnerProof {
     /// Virtual Spartan's proof.
     pub vs: VirtualSpartanProof,

@@ -213,6 +213,7 @@ dependencies = [
  "magnetar-pcs",
  "magnetar-zkvm",
  "rand",
+ "rayon",
 ]
 
 [[package]]
@@ -280,6 +281,7 @@ dependencies = [
  "magnetar-spartan",
  "magnetar-sumcheck",
  "rand",
+ "rayon",
  "serde",
 ]
 
