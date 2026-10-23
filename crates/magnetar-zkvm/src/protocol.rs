@@ -59,6 +59,11 @@ fn magnetar_zkvm_rom_ks_bits() -> usize {
 /// The proving key (transparent: derived from the public program).
 #[derive(Clone)]
 pub struct KeyGen {
+    /// The zero-knowledge profile: blinds the witness-carrying
+    /// sum-check messages with per-round masks (see
+    /// `magnetar_sumcheck::zk`). The verifier derives the setting from
+    /// the proof itself.
+    pub zk: bool,
     /// The RV64I program (raw instruction words).
     pub program: Vec<u32>,
     /// The dual SIMD R1CS circuit.
@@ -236,6 +241,7 @@ pub fn keygen_with(
     let stage_tensor = magnetar_router::build_stage_tensor(64);
     let store_tensor = build_store_tensor(64);
     let pk = KeyGen {
+        zk: false,
         program: program.clone(),
         circuit: circuit.clone(),
         layout: layout.clone(),
@@ -492,14 +498,16 @@ fn slice_weights(point: &[Gf128], pos: usize, width: usize) -> Vec<Gf128> {
 }
 
 /// Prove the execution (Construction 3, steps 1–7).
+impl KeyGen {
+    /// Enable the zero-knowledge profile (the round-mask blinding of the
+    /// witness-carrying sum-checks; the Mosaic batching discharge is the
+    /// first wired site — see `docs/STATUS.md` for the full wiring plan).
+    pub fn enable_zk(&mut self) {
+        self.zk = true;
+    }
+}
+
 pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
-    let time_phases = std::env::var("MAGNETAR_TIME").is_ok();
-    let t0 = std::time::Instant::now();
-    let mark = |time_phases: bool, label: &str, t0: &std::time::Instant| {
-        if time_phases {
-            eprintln!("[phase] {label}: {:?}s", t0.elapsed().as_secs_f64());
-        }
-    };
     // ---- 1. Execute.
     let mut trace = execute(&pk.program, &pub_in.input, pk.trace_len);
     assert_eq!(
@@ -510,12 +518,32 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     // Pad the records up to the proving key's trace length (the witness
     // covers every cycle of the trace).
     trace.records = magnetar_cpu::interp::pad_records(&trace, pk.trace_len);
+    prove_padded_trace(pk, pub_in, &trace)
+}
+
+/// Prove from an already-executed, already-padded trace (the segmented
+/// interface: `segments::prove_segments` builds the trace chunk-by-chunk
+/// with `execute_chunks` and lands here — the chunks share one
+/// commitment and the memory arguments span the whole row space).
+pub fn prove_padded_trace(
+    pk: &KeyGen,
+    pub_in: &PublicInput,
+    trace: &magnetar_cpu::interp::Trace,
+) -> Proof {
+    let time_phases = std::env::var("MAGNETAR_TIME").is_ok();
+    let t0 = std::time::Instant::now();
+    let mark = |time_phases: bool, label: &str, t0: &std::time::Instant| {
+        if time_phases {
+            eprintln!("[phase] {label}: {:?}s", t0.elapsed().as_secs_f64());
+        }
+    };
+    assert_eq!(trace.records.len(), pk.trace_len);
     let q = pk.trace_len;
     let m = WITNESS_LAYOUT::M;
     let n = q.trailing_zeros() as usize;
     let a_rom = pk.rom.a_rom;
     let _rows = &trace.program.rows;
-    let wd = build_witness(pk, pub_in, &trace);
+    let wd = build_witness(pk, pub_in, trace);
     mark(time_phases, "witness", &t0);
     // ---- 2. Commit.
     // The component tables in Mosaic order.
@@ -686,7 +714,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         x
     };
     // The selector tables (over (h, j)) from the ROM at the fetched rows.
-    let (sel_lo, sel_hi, sel_st) = selector_tables_from_trace(&pk.rom, &trace, pk.amount_bits, q);
+    let (sel_lo, sel_hi, sel_st) = selector_tables_from_trace(&pk.rom, trace, pk.amount_bits, q);
     let (_, o_v, u_v, h_v) = pk.shift_tensor.clone();
     let shift_layout = RoutingLayout {
         o_vars: o_v,
@@ -804,7 +832,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     };
     let _ = shamt_cols;
     let stage_r_pub = {
-        let [_, j_off, u_off, h_off, _] = stage_layout.offsets();
+        let [_, _j_off, u_off, h_off, _] = stage_layout.offsets();
         let mut active = (0..st_o).collect::<Vec<usize>>();
         active.extend(u_off..u_off + st_u);
         active.extend(h_off..h_off + st_h);
@@ -1129,7 +1157,14 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         &store_x_claims,
     );
     mark(time_phases, "sel-store", &t0);
-    let mosaic_proof = prove_mosaic(&pk.pcs, &pk.mosaic, &commitment, &mosaic_claims, &mut t);
+    let mosaic_proof = prove_mosaic(
+        &pk.pcs,
+        &pk.mosaic,
+        &commitment,
+        &mosaic_claims,
+        pk.zk,
+        &mut t,
+    );
     mark(time_phases, "mosaic", &t0);
     Proof {
         commitment_root: commitment.stmt.root,
@@ -1217,7 +1252,6 @@ fn selector_tables_from_trace(
 
 /// Collect every Mosaic claim (the same collection on both sides; the
 /// claim values and points come from symmetric proof structures).
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn collect_mosaic_claims(
     layout: &SegmentLayout,
@@ -2037,6 +2071,86 @@ mod tests {
                 eprintln!("RD MISMATCH j={j} k={k}: bus={rd_bus} row={rd_w}");
             }
         }
+    }
+
+    /// The Horizon-1 rate/query dials: the full Construction-3 protocol
+    /// must prove and verify at every named PCS profile (the chunk profile
+    /// at rate 1/2, the wrap profiles at rate 1/8 and 1/16 with reduced
+    /// query counts) — the dual-rate strategy's two ends, exercised
+    /// end-to-end.
+    #[test]
+    fn end_to_end_pcs_profiles() {
+        use magnetar_pcs::PcsProfile;
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            (2u32 << 20) | (1 << 15) | (3 << 7) | 0x33,
+            (2u32 << 15) | (1 << 7) | 0x33,
+            enc_i(0, 3, 0, 2, 0x13),
+            (3 << 15) | (10 << 7) | 0x33,
+            0x0000_0073,
+        ];
+        let trace = execute(&program, &[], 16);
+        let out = trace.final_state.output;
+        for profile in [
+            PcsProfile::FastChunk,
+            PcsProfile::Balanced,
+            PcsProfile::CompactWrap,
+            PcsProfile::DeepWrap,
+        ] {
+            let (pk, vk) = keygen_with(program.clone(), 16, 2, profile.params());
+            let pub_in = PublicInput {
+                input: vec![],
+                output: out,
+            };
+            let proof = prove(&pk, &pub_in);
+            assert!(
+                verify(&vk, &pub_in, &proof).is_ok(),
+                "{profile:?} honest proof must verify"
+            );
+        }
+    }
+
+    /// The ZK profile: `enable_zk` blinds the witness-carrying
+    /// sum-check messages; the proof must still verify and the tamper
+    /// resistance must be unchanged.
+    #[test]
+    fn end_to_end_zk_profile() {
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            (2u32 << 20) | (1 << 15) | (3 << 7) | 0x33,
+            (2u32 << 15) | (1 << 7) | 0x33,
+            enc_i(0, 3, 0, 2, 0x13),
+            (3 << 15) | (10 << 7) | 0x33,
+            0x0000_0073,
+        ];
+        let trace = execute(&program, &[], 16);
+        let out = trace.final_state.output;
+        let (mut pk, vk) = keygen(program, 16);
+        pk.enable_zk();
+        let pub_in = PublicInput {
+            input: vec![],
+            output: out,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert!(
+            verify(&vk, &pub_in, &proof).is_ok(),
+            "the ZK-profile proof must verify"
+        );
+        assert!(
+            proof.mosaic.zk_offset.is_some(),
+            "the ZK profile must carry the offset"
+        );
+        // Stripping the offset must fail (the verifier notices the
+        // profile mismatch through the proof's own shape).
+        let mut stripped = proof.clone();
+        stripped.mosaic.zk_offset = None;
+        assert!(verify(&vk, &pub_in, &stripped).is_err());
+        // A tampered masked round message must fail.
+        let mut tampered = proof.clone();
+        tampered.mosaic.batch_rounds[0][1] += magnetar_field::Gf128(1);
+        assert!(verify(&vk, &pub_in, &tampered).is_err());
     }
 
     #[test]

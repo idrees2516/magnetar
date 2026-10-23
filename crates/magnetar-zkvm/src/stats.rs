@@ -80,6 +80,54 @@ impl ProofStats {
         }
         s
     }
+
+    /// Project the proof size at a different PCS profile (the dual-rate
+    /// cost model). The PCS-dependent bytes — the ring-switch query paths
+    /// (`q` correlated queries × 3 authentication paths of `n + k`
+    /// digests each) and the fully revealed tail (`2^k` entries with
+    /// `k`-deep paths) — are re-derived from the profile; everything else
+    /// (the sum-check transcripts, the commitments, the terminal claims)
+    /// is profile-independent. The model is first-order (it ignores the
+    /// level roots, `O((n+k)·32)` bytes) but the query-path term
+    /// dominates, so the projection tracks the measured totals within a
+    /// few percent.
+    pub fn project_at(&self, profile: magnetar_pcs::PcsProfile) -> u64 {
+        let p = profile.params();
+        let n = self.pcs_n as u64;
+        let d = self.digest_bytes as u64;
+        // The measured PCS bytes: the mosaic+pcs-eval breakdown minus the
+        // profile-independent sum-check rounds/terminal inside it. Rather
+        // than splitting that line, model the PCS bytes directly and
+        // subtract/add relative to the *measured* configuration.
+        let paths = |q: u64, k: u64| q * 3 * (n + k) * d;
+        let tail = |k: u64| (1u64 << k) * (16 + k * d);
+        let model_old = paths(self.queries as u64, self.pcs_k as u64) + tail(self.pcs_k as u64);
+        let model_new = paths(p.queries as u64, p.k as u64) + tail(p.k as u64);
+        let measured_pcs = self
+            .bytes_breakdown
+            .iter()
+            .find(|(name, _)| name == "mosaic+pcs-eval")
+            .map(|(_, b)| *b as u64)
+            .unwrap_or(0);
+        // Scale: measured_pcs × (model_new / model_old), then re-total.
+        let scaled_pcs = if model_old > 0 {
+            measured_pcs * model_new / model_old.max(1)
+        } else {
+            measured_pcs
+        };
+        let other = self.bytes_total as u64 - measured_pcs;
+        other + scaled_pcs
+    }
+
+    /// The full dual-rate projection table (the roadmap's Horizon-1/H2
+    /// measurement): this proof's size at every named profile.
+    pub fn projection_table(&self) -> Vec<(magnetar_pcs::PcsProfile, u64)> {
+        use magnetar_pcs::PcsProfile::*;
+        [FastChunk, Balanced, CompactWrap, DeepWrap]
+            .into_iter()
+            .map(|p| (p, self.project_at(p)))
+            .collect()
+    }
 }
 
 /// Count field elements in a nested structure via a light recursive walk

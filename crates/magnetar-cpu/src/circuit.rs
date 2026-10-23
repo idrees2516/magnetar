@@ -249,7 +249,7 @@ pub fn witness_row(rec: &CycleRecord, row: &RomRow, public_x: &[Gf128]) -> Vec<G
     // The signed / 32-bit load flags from the ROM row's funct3.
     let f3 = row.funct3;
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LDS] =
-        Gf128((rec.is_load && matches!(f3, 0 | 1 | 2)) as u128);
+        Gf128((rec.is_load && matches!(f3, 0..=2)) as u128);
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LW32] =
         Gf128((rec.is_load && matches!(f3, 2 | 6)) as u128);
     // The store offset bits.

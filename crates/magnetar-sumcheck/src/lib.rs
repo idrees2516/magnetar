@@ -37,10 +37,12 @@
 pub mod engine;
 pub mod public;
 pub mod sparse;
+pub mod zk;
 
 pub use engine::{SumcheckProver, SumcheckVerifier};
 pub use public::{PublicFactor, SumEqFactor, TableFactor};
 pub use sparse::{SparseFactor, SparseProver, SparseSpec};
+pub use zk::ZkMasker;
 
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 

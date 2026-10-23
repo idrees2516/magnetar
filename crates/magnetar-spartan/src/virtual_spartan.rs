@@ -194,7 +194,9 @@ fn separate_round(
 }
 
 // DEBUG helpers.
+#[allow(dead_code)]
 fn base_unused() {}
+#[allow(dead_code)]
 fn inner_p_segment_value(
     layout: &SegmentLayout,
     i: usize,

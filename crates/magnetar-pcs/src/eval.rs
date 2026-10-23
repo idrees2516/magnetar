@@ -47,6 +47,73 @@ impl Default for PcsParams {
     }
 }
 
+/// Named parameter profiles (the roadmap's Horizon-1 rate/query dials).
+///
+/// **The soundness arithmetic for this instantiation.** Unlike a
+/// Reed–Solomon commitment, the affine-substitution code's relative
+/// distance is ≈ 1 at generic `γ` (a nonzero multilinear difference
+/// vanishes on an `O(n/|K|)` fraction of the shifted evaluation points),
+/// so the rate dial `k` does **not** trade soundness per query — it
+/// trades encode/commit work and Merkle depth (`n + k` digest steps per
+/// authentication path). The *per-query* far-word rejection is governed
+/// by Schwartz–Zippel over the fold-relation zero sets: a word outside
+/// the unique-decoding radius fails a correlated query except with
+/// probability `≤ n/2^128 ≥ 2^-122` at the operating scales — so even the
+/// aggressive profiles keep each query near the 120-bit envelope, and
+/// the query count `q` adds independent confirmations plus the
+/// proximity-radius margin of the standard gap analysis
+/// (docs/security.md carries the full accounting).
+///
+/// The **dual-rate strategy** (roadmap Lever 1 / paper §6.5): prove
+/// chunks at a high rate for speed (`FastChunk`), and prove the small
+/// wrap instance at a low rate with few queries for size
+/// (`CompactWrap`/`DeepWrap`) — the wrap's table is small, so its deeper
+/// paths stay short and the reduced query count shrinks the public
+/// artifact directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcsProfile {
+    /// Rate 1/2 with the standard 40 queries: the fastest encode + Merkle
+    /// phase — the **chunk** profile.
+    FastChunk,
+    /// Rate 1/4, 40 queries: the default configuration.
+    Balanced,
+    /// Rate 1/8, 20 queries: the **wrap** profile — half the paths of a
+    /// chunk proof.
+    CompactWrap,
+    /// Rate 1/16, 14 queries: the aggressive wrap.
+    DeepWrap,
+}
+
+impl PcsProfile {
+    /// The profile's parameters.
+    pub fn params(self) -> PcsParams {
+        let (k, queries) = match self {
+            PcsProfile::FastChunk => (1, 40),
+            PcsProfile::Balanced => (2, 40),
+            PcsProfile::CompactWrap => (3, 20),
+            PcsProfile::DeepWrap => (4, 14),
+        };
+        PcsParams {
+            k,
+            queries,
+            domain: format!("magnetar/pcs/{self:?}").to_lowercase(),
+        }
+    }
+
+    /// The conservative per-query far-word rejection exponent (the
+    /// Schwartz–Zippel bound `n/2^128` with `n ≤ 64`): every profile
+    /// keeps a single correlated query within the 120-bit envelope on
+    /// its own, and `q` of them run independently.
+    pub fn per_query_soundness_bits(self) -> u32 {
+        122 // 128 - ceil(log2(64)) — the SZ bound at n ≤ 64
+    }
+
+    /// The rate `2^-k` as a fraction string.
+    pub fn rate_label(self) -> String {
+        format!("1/{}", 1usize << self.params().k)
+    }
+}
+
 /// A committed table: the codeword tree's root plus layout info.
 #[derive(Clone, Debug)]
 pub struct PcsStatement {
@@ -375,6 +442,52 @@ mod tests {
         run_case(5, 2, 12);
         run_case(4, 1, 8);
         run_case(6, 3, 10);
+    }
+
+    /// Every named profile must roundtrip honestly and reject a tampered
+    /// round message — the rate/query dials never touch correctness.
+    #[test]
+    fn profiles_roundtrip_and_reject() {
+        for profile in [
+            PcsProfile::FastChunk,
+            PcsProfile::Balanced,
+            PcsProfile::CompactWrap,
+            PcsProfile::DeepWrap,
+        ] {
+            let mut rng = rand::thread_rng();
+            let params = profile.params();
+            let n = 5;
+            let table: Vec<Gf128> = (0..(1 << n)).map(|_| rg(&mut rng)).collect();
+            let r: Vec<Gf128> = (0..n).map(|_| rg(&mut rng)).collect();
+            let y = magnetar_field::eval_mle(&table, &r);
+            let (_cw, _tree, stmt) = commit_table(&params, &table);
+            let base = || Transcript::new("pcs", &[b"profile"]);
+            let mut t = base();
+            let proof = prove_eval(&params, &table, &r, y, &mut t);
+            let mut tv = base();
+            assert!(
+                verify_eval(&stmt, &params, &r, y, &proof, &mut tv).is_ok(),
+                "{profile:?} honest proof must verify"
+            );
+            // Tampered round message.
+            let mut p = proof.clone();
+            p.rounds[0][1] += Gf128(1);
+            let mut tv = base();
+            assert!(
+                verify_eval(&stmt, &params, &r, y, &p, &mut tv).is_err(),
+                "{profile:?} tampered message must fail"
+            );
+            // Tampered query value.
+            let mut p = proof.clone();
+            if !p.queries.is_empty() {
+                p.queries[0].levels[0].a += Gf128(1);
+                let mut tv = base();
+                assert!(
+                    verify_eval(&stmt, &params, &r, y, &p, &mut tv).is_err(),
+                    "{profile:?} tampered query must fail"
+                );
+            }
+        }
     }
 
     #[test]

@@ -196,7 +196,7 @@ impl SumcheckProver {
                 .reduce(
                     || vec![ZERO; nterms * npts],
                     |mut a, b| {
-                        for (x, y) in a.iter_mut().zip(b.into_iter()) {
+                        for (x, y) in a.iter_mut().zip(b) {
                             *x += y;
                         }
                         a
@@ -423,6 +423,46 @@ impl<'a> SumcheckVerifier<'a> {
         self.running = mr;
         self.challenges.push(r);
         Ok(())
+    }
+
+    /// The ZK-masked terminal check: the same identity as [`finish`]
+    /// shifted by the revealed round-mask offset (`Σ terms + offset =
+    /// running`) — see the `zk` module for the masking construction.
+    pub fn finish_offset(
+        &self,
+        dense_claims: &[Gf128],
+        offset: Gf128,
+    ) -> Result<(Vec<Gf128>, Vec<Gf128>), &'static str> {
+        let n_dense = self
+            .terms
+            .iter()
+            .flat_map(|t| t.dense.iter().copied())
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        if dense_claims.len() != n_dense {
+            return Err("dense evaluation claim count mismatch");
+        }
+        let point = self.order.point(self.num_vars, &self.challenges);
+        let public_vals: Vec<Gf128> = self.spec_public.iter().map(|f| f.eval_at(&point)).collect();
+        let mut total = ZERO;
+        for t in &self.terms {
+            let mut prod = t.coeff;
+            for &p in &t.public {
+                prod = mul(prod, public_vals[p]);
+            }
+            for &d in &t.dense {
+                let v = dense_claims
+                    .get(d)
+                    .ok_or("missing dense evaluation claim")?;
+                prod = mul(prod, *v);
+            }
+            total += prod;
+        }
+        if total + offset != self.running {
+            return Err("terminal identity check failed");
+        }
+        Ok((point, dense_claims.to_vec()))
     }
 
     /// After all rounds: check the terminal identity with the prover's

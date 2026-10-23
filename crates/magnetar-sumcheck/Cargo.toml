@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 magnetar-field = { workspace = true }
 magnetar-hash = { workspace = true }
+rand = { workspace = true }
 rayon = { workspace = true }
 
 [dev-dependencies]

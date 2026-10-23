@@ -146,6 +146,75 @@ fn write_cell(st: &mut ExecState, idx: usize, val: Word) {
     }
 }
 
+/// Execute an execution **in chunks** with explicit state handoff: the
+/// segmented-proving interface (the roadmap's Horizon-2 "segments share
+/// the commitment" mechanism — the chunks concatenate into exactly the
+/// monolithic witness, and the memory arguments' cross-cycle continuity
+/// spans the whole row space, so the segment boundaries are invisible to
+/// the proof). Runs `chunks` chunks of `chunk_len` cycles, returning the
+/// per-chunk records plus the carried final state. The chunk boundaries
+/// are pure bookkeeping: halting inside a chunk latches the halt state
+/// and subsequent chunks emit halt-latch cycles.
+pub fn execute_chunks(
+    program: &[u32],
+    input: &[Word],
+    chunk_len: usize,
+    chunks: usize,
+) -> (Vec<Vec<CycleRecord>>, ExecState) {
+    let prog = expand_program(program);
+    let mut st = ExecState {
+        regs: [0; REGS],
+        scratch: 0,
+        ram: vec![0; 1usize << RAM_WORDS_LOG2],
+        micro_pc: 0,
+        cycles: 0,
+        halted: false,
+        output: 0,
+    };
+    for (i, &w) in input.iter().enumerate() {
+        if i < st.ram.len() {
+            st.ram[i] = w;
+        }
+    }
+    let mut all = Vec::with_capacity(chunks);
+    for _ in 0..chunks {
+        let mut recs = Vec::with_capacity(chunk_len);
+        while recs.len() < chunk_len && !st.halted {
+            let rec = step(&prog, &mut st);
+            recs.push(rec);
+            st.cycles += 1;
+        }
+        // Halted (or the chunk filled): pad the remaining chunk budget
+        // with halt-latch records re-fetching the halting row.
+        while recs.len() < chunk_len {
+            let last_pc = recs.last().map(|r| r.next_pc).unwrap_or(st.micro_pc);
+            let k = last_pc % prog.rows.len().max(1);
+            let row = &prog.rows[k].row;
+            let write_addr = if row.rd == 0 { 32 } else { row.rd };
+            let out = st.output;
+            let rec = CycleRecord {
+                micro_pc: k,
+                rs1_val: read_cell(&st, row.rs1),
+                rs2_val: read_cell(&st, row.rs2),
+                next_pc: last_pc,
+                rd: write_addr,
+                rd_old: read_cell(&st, write_addr),
+                rd_val: out,
+                alu_out: out,
+                we: true,
+                halted_latch: true,
+                ram_addr: 0,
+                ram_word: st.ram[0],
+                ..Default::default()
+            };
+            recs.push(rec);
+            write_cell(&mut st, write_addr, out);
+        }
+        all.push(recs);
+    }
+    (all, st)
+}
+
 /// Execute up to `max_cycles` virtual cycles.
 pub fn execute(program: &[u32], input: &[Word], max_cycles: usize) -> Trace {
     let prog = expand_program(program);

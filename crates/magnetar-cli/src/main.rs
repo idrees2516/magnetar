@@ -13,13 +13,15 @@ fn main() {
             args.get(3).and_then(|s| s.parse().ok()),
         ),
         Some("check") => cmd_check(),
+        Some("profiles") => cmd_profiles(),
         _ => {
             eprintln!("Magnetar zkVM — post-quantum RV64I proving (eprint 2026-2423)");
             eprintln!();
             eprintln!("Usage:");
             eprintln!("  magnetar fib [steps]        prove + verify a Fibonacci program");
-            eprintln!("  magnetar bench [min] [max]  trace-length sweep in powers of two");
+            eprintln!("  magnetar bench <lo> <hi>    trace-length sweep in powers of two");
             eprintln!("  magnetar check              self-test of the proof stack");
+            eprintln!("  magnetar profiles           the measured dual-rate cost model");
             std::process::exit(2);
         }
     }
@@ -36,20 +38,12 @@ fn fib_loop_program() -> Vec<u32> {
     // BNE x3, x0, off — the proper B-type encoding (imm[12]→31,
     // imm[10:5]→30:25, imm[11]→7, imm[4:1]→11:8).
     let bne = |off: i32| -> u32 {
-        let imm = (off as u16) as u16; // 13-bit two's complement
-        let imm = off as u16;
+        let imm = off as u16; // 13-bit two's complement
         let i12 = ((imm >> 12) & 1) as u32;
         let i11 = ((imm >> 11) & 1) as u32;
         let i10_5 = ((imm >> 5) & 0x3f) as u32;
         let i4_1 = ((imm >> 1) & 0xf) as u32;
-        (i12 << 31)
-            | (i10_5 << 25)
-            | (0 << 20)
-            | (3 << 15)
-            | (1 << 12)
-            | (i4_1 << 8)
-            | (i11 << 7)
-            | 0x63
+        (i12 << 31) | (i10_5 << 25) | (3 << 15) | (1 << 12) | (i4_1 << 8) | (i11 << 7) | 0x63
     };
     vec![
         r#type(0, 0, 0, 3),  // x3 = 0 (the counter; overwritten per run)
@@ -198,4 +192,47 @@ fn cmd_fib(rounds: u32) {
 fn cmd_check() {
     println!("Running the proof-stack self-test (cargo test handles this in CI).");
     println!("See `cargo test --workspace` for the full suite.");
+}
+
+/// The measured dual-rate cost model (the roadmap's Horizon-1 rate/query
+/// dials): prove one workload, report the measured cost model, and
+/// project the same proof at every named PCS profile.
+fn cmd_profiles() {
+    // A small straight-line fib (the shape of `cmd_fib`, 32 cycles).
+    let mut program = vec![enc_i(1, 0, 0, 1, 0x13), enc_i(1, 0, 0, 2, 0x13)];
+    for _ in 0..6 {
+        program.push((2u32 << 20) | (1 << 15) | (3 << 7) | 0x33);
+        program.push((2 << 15) | (1 << 7) | 0x33);
+        program.push(enc_i(0, 3, 0, 2, 0x13));
+    }
+    program.push((3 << 15) | (10 << 7) | 0x33);
+    program.push(0x0000_0073);
+    let trace = magnetar_cpu::interp::execute(&program, &[], 32);
+    let output = trace.final_state.output;
+    let trace_len = trace.records.len();
+    let (pk, vk) = keygen(program, trace_len);
+    let pub_in = PublicInput {
+        input: vec![],
+        output,
+    };
+    let proof = prove(&pk, &pub_in);
+    verify(&vk, &pub_in, &proof).expect("the profile proof must verify");
+    let stats = magnetar_zkvm::stats::proof_stats(&pk, &proof);
+    println!("{}", stats.report());
+    println!("Dual-rate projection (the same proof at every profile):");
+    println!(
+        "{:<14} {:>8} {:>10} {:>18} {:>14}",
+        "profile", "rate", "queries", "per-query soundness", "size (KiB)"
+    );
+    for (profile, bytes) in stats.projection_table() {
+        let p = profile.params();
+        println!(
+            "{:<14} {:>8} {:>10} {:>18} {:>14.1}",
+            format!("{profile:?}"),
+            profile.rate_label(),
+            p.queries,
+            format!("{} bits", profile.per_query_soundness_bits()),
+            bytes as f64 / 1024.0
+        );
+    }
 }

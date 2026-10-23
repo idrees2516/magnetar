@@ -196,14 +196,24 @@ pub struct MosaicProof {
     pub terminal: Gf128,
     /// The ring-switch discharge.
     pub ring: RingProof,
+    /// The ZK round-mask offset (`magnetar_sumcheck::zk`), present when
+    /// the proving key runs the zero-knowledge profile: the batching
+    /// sum-check's messages are blinded per round and this one revealed
+    /// value restores the terminal identity.
+    pub zk_offset: Option<Gf128>,
 }
 
-/// Prove the Mosaic discharge for a set of component claims.
+/// Prove the Mosaic discharge for a set of component claims. When `zk`
+/// is set the batching sum-check's round messages are zero-knowledge
+/// masked (see `magnetar_sumcheck::zk`): each message is blinded with a
+/// fresh random polynomial subject to the running constraint, so the
+/// committed witness bits do not leak through the transcript.
 pub fn prove_mosaic(
     params: &PcsParams,
     layout: &MosaicLayout,
     cm: &MosaicCommitment,
     claims: &[MosaicClaim],
+    zk: bool,
     t: &mut Transcript,
 ) -> MosaicProof {
     let ell = cm.ell;
@@ -240,11 +250,24 @@ pub fn prove_mosaic(
     };
     let order = BindOrder::HighBitsFirst { high: 7 };
     let mut prover = SumcheckProver::new_owned(spec, order);
+    let mut masker = magnetar_sumcheck::zk::ZkMasker::new();
     let mut batch_rounds = Vec::with_capacity(ell);
     for _ in 0..ell {
-        let msg = prover.message_cached();
+        let mut msg = prover.message_cached();
+        if zk {
+            masker.mask(&mut msg);
+        }
         batch_rounds.push(msg.0.clone());
-        prover.absorb_and_fold(t, "mosaic-batch");
+        let mut buf = Vec::with_capacity(msg.0.len() * 16);
+        for c in &msg.0 {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+        }
+        t.absorb_bytes("mosaic-batch", &buf);
+        let r = t.challenge_field("mosaic-batch");
+        if zk {
+            masker.commit(r);
+        }
+        prover.fold(r);
     }
     let challenges = prover.challenges();
     let (dense_claims, _) = prover.finish();
@@ -276,6 +299,7 @@ pub fn prove_mosaic(
         batch_rounds,
         terminal,
         ring,
+        zk_offset: zk.then(|| masker.offset()),
     }
 }
 
@@ -289,6 +313,7 @@ pub fn verify_mosaic(
     proof: &MosaicProof,
     t: &mut Transcript,
 ) -> Result<(), &'static str> {
+    let zk = proof.zk_offset.is_some();
     let alphas = t.challenge_field_vec("mosaic-alpha", claims.len());
     let mut lhs = ZERO;
     let mut items = Vec::with_capacity(claims.len());
@@ -316,8 +341,17 @@ pub fn verify_mosaic(
             "mosaic-batch",
         )?);
     }
-    v.finish(&[proof.terminal])
-        .map_err(|_| "mosaic: batching terminal failed")?;
+    match (zk, proof.zk_offset) {
+        (true, Some(off)) => {
+            v.finish_offset(&[proof.terminal], off)
+                .map_err(|_| "mosaic: batching terminal failed")?;
+        }
+        (false, None) => {
+            v.finish(&[proof.terminal])
+                .map_err(|_| "mosaic: batching terminal failed")?;
+        }
+        _ => return Err("mosaic: zk offset presence mismatch"),
+    }
     t.absorb_field("mosaic-terminal", &[proof.terminal]);
     let r_star = order.point(ell, &challenges);
     let r_block: Vec<Gf128> = r_star[..ell - 7].to_vec();

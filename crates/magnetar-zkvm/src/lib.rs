@@ -38,6 +38,7 @@
 pub mod mosaic;
 pub mod protocol;
 pub mod rom;
+pub mod segments;
 pub mod stats;
 
 pub use mosaic::{MosaicClaim, MosaicCommitment, MosaicLayout, MosaicProof};
