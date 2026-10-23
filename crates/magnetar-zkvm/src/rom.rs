@@ -59,7 +59,13 @@ impl RomTables {
         for (k, inst) in rows.iter().enumerate() {
             let row = &inst.row;
             // The instruction bus: op(7) | rd(6) | rs1(6) | rs2(6) |
-            // funct3(3) | imm(13), zero-padded to 64.
+            // funct3(3) | imm(36), zero-padded to 64. The immediate is
+            // the row's **full** pre-adjusted 36-bit field (the 12-bit
+            // I/S immediates sign-extended, the 20-bit U-immediates, the
+            // JAL links, and the AUIPC row offsets) — exactly the bits
+            // `put_bus` writes into the witness's fetch segment, so the
+            // bus Shout binds the witness to the same word (a negative
+            // immediate sign-extends into bits 41..63).
             let mut bus_word: u64 = 0;
             bus_word |= (row.raw & 0x7f) as u64;
             let rd6 = if row.rd == 0 { 32 } else { row.rd };
@@ -67,7 +73,7 @@ impl RomTables {
             bus_word |= ((row.rs1 as u64) & 0x3f) << 13;
             bus_word |= ((row.rs2 as u64) & 0x3f) << 19;
             bus_word |= ((row.funct3 as u64) & 0x7) << 25;
-            bus_word |= (row.imm & 0x1fff) << 28;
+            bus_word |= (row.imm & magnetar_cpu::circuit::WITNESS_LAYOUT::IMM_MASK) << 28;
             for o in 0..64usize {
                 bus[o | (k << 6)] = Gf128(((bus_word >> o) & 1) as u128);
             }

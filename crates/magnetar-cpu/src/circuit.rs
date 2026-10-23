@@ -59,6 +59,9 @@ impl WITNESS_LAYOUT {
     pub const IDX_BITS: usize = 6;
     pub const FUNCT3_BITS: usize = 3;
     pub const IMM_BITS: usize = 36;
+    /// The 36-bit immediate field's mask (the full pre-adjusted value
+    /// the bus carries; matches the ROM table's bus word).
+    pub const IMM_MASK: u64 = (1u64 << 36) - 1;
     // Total witness columns (before padding).
     pub const W_COLS: usize = 2048;
     /// The `1` column index in `z`.
@@ -460,6 +463,7 @@ pub fn build_circuit() -> CircuitSpec {
                 &[
                     (WITNESS_LAYOUT::T2 + i, ONE),
                     (WITNESS_LAYOUT::RS2 + i, ONE),
+                    (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_SUB, ONE),
                 ],
                 &[],
             );
@@ -674,73 +678,6 @@ pub fn build_circuit() -> CircuitSpec {
             &[(WITNESS_LAYOUT::ONE_COL, ONE)],
             &[],
         );
-    }
-    // 3b. The T2 operand binding (class-gated): register forms set
-    //     T2 = rs2, immediate forms T2 = the bus immediate — so the adder
-    //     validates the right operand per class.
-    {
-        use crate::expand::class as cl;
-        let reg_classes = [
-            cl::ADD_REG,
-            cl::SUBSLT_REG,
-            cl::XOR_REG,
-            cl::OR_REG,
-            cl::AND_REG,
-            cl::BRANCH,
-        ];
-        let imm_classes = [
-            cl::ADD_IMM,
-            cl::SUBSLT_IMM,
-            cl::XOR_IMM,
-            cl::OR_IMM,
-            cl::AND_IMM,
-            cl::SHIFT_IMM,
-            cl::LB,
-            cl::LBU,
-            cl::LH,
-            cl::LHU,
-            cl::LW,
-            cl::LWU,
-            cl::LD,
-            cl::STORE,
-        ];
-        let fold = |cs: &[usize]| -> Vec<(usize, Gf128)> {
-            cs.iter()
-                .map(|&c| (WITNESS_LAYOUT::CLASS + c, ONE))
-                .collect()
-        };
-        for i in 0..64 {
-            // reg forms: fold·(T2_i + rs2_i) = 0
-            add(
-                &mut a1,
-                &mut b1,
-                &mut c1,
-                &fold(&reg_classes),
-                &[
-                    (WITNESS_LAYOUT::T2 + i, ONE),
-                    (WITNESS_LAYOUT::RS2 + i, ONE),
-                ],
-                &[],
-            );
-            // imm forms: fold·(T2_i + bus_imm_i) = 0. The bus carries
-            // the immediate's low 36 bits (its word's whole upper
-            // half: the 12-bit I/S immediates, the 20-bit U-immediates,
-            // and the JAL links); the top bits are the sign extension
-            // (bit 35).
-            let imm_bit = if i < WITNESS_LAYOUT::IMM_BITS {
-                WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_IMM + i
-            } else {
-                WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_IMM + WITNESS_LAYOUT::IMM_BITS - 1
-            };
-            add(
-                &mut a1,
-                &mut b1,
-                &mut c1,
-                &fold(&imm_classes),
-                &[(WITNESS_LAYOUT::T2 + i, ONE), (imm_bit, ONE)],
-                &[],
-            );
-        }
     }
     // ram_addr_t = alu_{3+t} on memory cycles (the effective address's
     // low bits); on other cycles the segment is zero and the memory

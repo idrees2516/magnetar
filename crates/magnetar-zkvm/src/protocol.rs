@@ -493,6 +493,13 @@ fn slice_weights(point: &[Gf128], pos: usize, width: usize) -> Vec<Gf128> {
 
 /// Prove the execution (Construction 3, steps 1–7).
 pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
+    let time_phases = std::env::var("MAGNETAR_TIME").is_ok();
+    let t0 = std::time::Instant::now();
+    let mark = |time_phases: bool, label: &str, t0: &std::time::Instant| {
+        if time_phases {
+            eprintln!("[phase] {label}: {:?}s", t0.elapsed().as_secs_f64());
+        }
+    };
     // ---- 1. Execute.
     let mut trace = execute(&pk.program, &pub_in.input, pk.trace_len);
     assert_eq!(
@@ -509,6 +516,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     let a_rom = pk.rom.a_rom;
     let _rows = &trace.program.rows;
     let wd = build_witness(pk, pub_in, &trace);
+    mark(time_phases, "witness", &t0);
     // ---- 2. Commit.
     // The component tables in Mosaic order.
     let mut tables: Vec<Vec<bool>> = wd.direct_tables.clone();
@@ -522,6 +530,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     tables.push(wd.ram_wit.inc.iter().map(|&v| v == ONE).collect());
     tables.push(wd.fetch_comp.table.iter().map(|&v| v == ONE).collect());
     let commitment: MosaicCommitment = commit_mosaic(&pk.pcs, &pk.mosaic, &tables);
+    mark(time_phases, "commit", &t0);
     // ---- 3. Virtual Spartan.
     let mut t = Transcript::new(
         "magnetar",
@@ -550,6 +559,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         c_fld: pk.circuit.c_fld.clone(),
     };
     let (vs_proof, seg_claims) = prove_virtual_spartan(&rel, &pk.layout, &wd.joint_z, q, &mut t);
+    mark(time_phases, "virtual-spartan", &t0);
     let seg = |name: &str| -> SegmentClaim {
         let i = pk.layout.index_of(name).expect("segment");
         seg_claims[i].clone()
@@ -571,6 +581,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         r_cycle: r_inst.clone(),
     };
     let (reg_proof, reg_twist_claims) = prove_twist(&reg_inst, &wd.reg_wit, &mut t);
+    mark(time_phases, "reg-twist", &t0);
     // The register-index Ψ-sum-checks (read 1, read 2, write).
     let port_comps = [
         &wd.reg_wit.ports[0],
@@ -642,6 +653,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         r_cycle: r_inst.clone(),
     };
     let (ram_proof, ram_twist_claims) = prove_twist(&ram_inst, &wd.ram_wit, &mut t);
+    mark(time_phases, "ram-twist", &t0);
     // The RAM address Ψ-sum-checks (read, write) — checked against the
     // ram-addr segment's VS claim.
     let v_ramaddr = seg("ram-addr").value;
@@ -728,6 +740,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         ),
     ];
     let shift_claim = seg("shift-out").value;
+    mark(time_phases, "pre-shift-router", &t0);
     let shift_router = prove_routing(
         &shift_layout,
         shift_claim,
@@ -834,6 +847,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         ),
     ];
     let stage_claim = seg("stage-out").value;
+    mark(time_phases, "shift-router", &t0);
     let stage_router = prove_routing(
         &stage_layout,
         stage_claim,
@@ -925,6 +939,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     }
     // The output claim: the Inc claim at the verifier-sampled point.
     let (r_inc_o, r_inc_j) = inc_point.split_at(6);
+    mark(time_phases, "stage-router", &t0);
     let store_router = prove_routing(
         &store_layout,
         inc_claim,
@@ -980,6 +995,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         pc_r_local: r_local3.clone(),
         pc_claim: seg("pc").value,
     };
+    mark(time_phases, "store-router", &t0);
     let (bus_shout, bus_shout_claims) =
         prove_bus_shout(&bus_spec, std::slice::from_ref(&wd.fetch_comp), &mut t);
     // The selector checks.
@@ -1008,6 +1024,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
             ],
         }
     };
+    mark(time_phases, "bus-shout", &t0);
     let (sel_shift_proof, sel_shift_claims) = prove_selector_shout(
         &sel_shift,
         std::slice::from_ref(&wd.fetch_comp),
@@ -1030,6 +1047,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
             }],
         }
     };
+    mark(time_phases, "sel-shift", &t0);
     let (sel_class_proof, sel_class_claims) = prove_selector_shout(
         &class_sel_spec,
         std::slice::from_ref(&wd.fetch_comp),
@@ -1053,6 +1071,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
             }],
         }
     };
+    mark(time_phases, "sel-class", &t0);
     let (sel_stage_proof, sel_stage_claims) = prove_selector_shout(
         &sel_stage_spec,
         std::slice::from_ref(&wd.fetch_comp),
@@ -1075,6 +1094,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
             }],
         }
     };
+    mark(time_phases, "sel-stage", &t0);
     let (sel_store_proof, sel_store_claims) = prove_selector_shout(
         &sel_store,
         std::slice::from_ref(&wd.fetch_comp),
@@ -1108,7 +1128,9 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         &store_terminal,
         &store_x_claims,
     );
+    mark(time_phases, "sel-store", &t0);
     let mosaic_proof = prove_mosaic(&pk.pcs, &pk.mosaic, &commitment, &mosaic_claims, &mut t);
+    mark(time_phases, "mosaic", &t0);
     Proof {
         commitment_root: commitment.stmt.root,
         pcs_n: commitment.stmt.n,
@@ -1804,6 +1826,217 @@ mod tests {
             | (funct3 << 12)
             | ((imm & 0x1f) << 7)
             | op
+    }
+
+    #[test]
+    fn witness_rom_consistency_pointwise() {
+        // A control-flow program (a backward BNE — a negative immediate)
+        // checked point-wise: (a) the store-routing identity over (o, j),
+        // (b) the eq-weighted routing total vs the Inc claim, and (c) the
+        // witness fetch segment vs the ROM bus word at the fetched row.
+        // Regression guard for the truncated-ROM-immediate bug (the ROM
+        // bus must carry the full sign-extended 36-bit immediate, or every
+        // negative immediate desyncs the bus Shout).
+        let bne = |off: i32| -> u32 {
+            let imm = off as u16;
+            let i12 = ((imm >> 12) & 1) as u32;
+            let i11 = ((imm >> 11) & 1) as u32;
+            let i10_5 = ((imm >> 5) & 0x3f) as u32;
+            let i4_1 = ((imm >> 1) & 0xf) as u32;
+            (i12 << 31)
+                | (i10_5 << 25)
+                | (0 << 20)
+                | (3 << 15)
+                | (1 << 12)
+                | (i4_1 << 8)
+                | (i11 << 7)
+                | 0x63
+        };
+        let program = vec![
+            enc_i(2, 0, 0, 3, 0x13),
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            enc_i(0xfff, 3, 0, 3, 0x13),
+            (2 << 20) | (1 << 15) | (4 << 7) | 0x33,
+            enc_i(0, 2, 0, 1, 0x13),
+            enc_i(0, 4, 0, 2, 0x13),
+            bne(-24),
+            enc_i(0, 2, 0, 10, 0x13),
+            0x0000_0073,
+        ];
+        let q = 32usize;
+        let trace = execute(&program, &[], q);
+        let out = trace.final_state.regs[10];
+        let (pk, _vk) = keygen(program, q);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: out,
+        };
+        let wd = build_witness(&pk, &pub_in, &trace);
+        let (_, _, sel_st) = selector_tables_from_trace(&pk.rom, &trace, pk.amount_bits, q);
+        // The X bits: old = store-old, src = store-src (from the joint z).
+        let m = magnetar_cpu::circuit::WITNESS_LAYOUT::M;
+        let old_off = pk.layout.offsets[pk.layout.index_of("store-old").unwrap()];
+        let src_off = pk.layout.offsets[pk.layout.index_of("store-src").unwrap()];
+        let off_off = pk.layout.offsets[pk.layout.index_of("off").unwrap()];
+        let x = |u: usize, j: usize| -> Gf128 {
+            let col = if u < 64 {
+                old_off + u
+            } else {
+                src_off + u - 64
+            };
+            joint_bit(&wd.joint_z, j * m, col)
+        };
+        let ahat = |k: usize, j: usize| -> Gf128 { joint_bit(&wd.joint_z, j * m, off_off + k) };
+        let (tensor, o_vars, u_vars, h_vars, a_vars) = (
+            &pk.store_tensor.0,
+            pk.store_tensor.1,
+            pk.store_tensor.2,
+            pk.store_tensor.3,
+            pk.store_tensor.4,
+        );
+        let mut bad = 0usize;
+        for j in 0..q {
+            for o in 0..64usize {
+                // lhs = Σ_{u,h,a} R·X·sel·Π eq(a_k, â_k)
+                let mut lhs = Gf128(0);
+                for h in 0..(1usize << h_vars) {
+                    let sel = sel_st[h | (j << h_vars)];
+                    if sel == Gf128(0) {
+                        continue;
+                    }
+                    for a in 0..(1usize << a_vars) {
+                        let mut link = Gf128(1);
+                        for k in 0..a_vars {
+                            let ak = Gf128(((a >> k) & 1) as u128);
+                            link = magnetar_field::mul(link, Gf128(1) + ak + ahat(k, j));
+                        }
+                        if link == Gf128(0) {
+                            continue;
+                        }
+                        let mut routed_sum = Gf128(0);
+                        for u in 0..(1usize << u_vars) {
+                            let idx = o
+                                | (u << o_vars)
+                                | (h << (o_vars + u_vars))
+                                | (a << (o_vars + u_vars + h_vars));
+                            if tensor[idx] == Gf128(1) {
+                                routed_sum += x(u, j);
+                            }
+                        }
+                        lhs += magnetar_field::mul(magnetar_field::mul(sel, link), routed_sum);
+                    }
+                }
+                let rhs = wd.ram_wit.inc[o | (j << 6)];
+                if lhs != rhs {
+                    if bad < 12 {
+                        eprintln!("VIOLATION o={o} j={j}: routing={lhs:?} inc={rhs:?} is_store={:?} pc={}",
+                            trace.records[j].is_store, trace.records[j].micro_pc);
+                    }
+                    bad += 1;
+                }
+            }
+        }
+        assert_eq!(bad, 0, "{bad} store-identity violations");
+
+        // Now the eq-weighted total vs the claim: the exact round-0 check.
+        let n = q.trailing_zeros() as usize;
+        let inc_point: Vec<Gf128> = {
+            let mut t = magnetar_hash::Transcript::new("magnetar/protocol/v1", &[b"dbg"]);
+            let _ = &mut t;
+            t.challenge_field_vec("ram-inc-point", 6 + n)
+        };
+        let r_o = &inc_point[..6];
+        let r_j = &inc_point[6..];
+        let eq_o = magnetar_field::EqBits::build(r_o).values;
+        let eq_j = magnetar_field::EqBits::build(r_j).values;
+        let mut total = Gf128(0);
+        for j in 0..q {
+            for o in 0..64usize {
+                let mut lhs = Gf128(0);
+                for h in 0..(1usize << h_vars) {
+                    let sel = sel_st[h | (j << h_vars)];
+                    if sel == Gf128(0) {
+                        continue;
+                    }
+                    for a in 0..(1usize << a_vars) {
+                        let mut link = Gf128(1);
+                        for k in 0..a_vars {
+                            let ak = Gf128(((a >> k) & 1) as u128);
+                            link = magnetar_field::mul(link, Gf128(1) + ak + ahat(k, j));
+                        }
+                        if link == Gf128(0) {
+                            continue;
+                        }
+                        let mut routed_sum = Gf128(0);
+                        for u in 0..(1usize << u_vars) {
+                            let idx = o
+                                | (u << o_vars)
+                                | (h << (o_vars + u_vars))
+                                | (a << (o_vars + u_vars + h_vars));
+                            if tensor[idx] == Gf128(1) {
+                                routed_sum += x(u, j);
+                            }
+                        }
+                        lhs += magnetar_field::mul(magnetar_field::mul(sel, link), routed_sum);
+                    }
+                }
+                total += magnetar_field::mul(magnetar_field::mul(eq_o[o], eq_j[j]), lhs);
+            }
+        }
+        let inc_claim = magnetar_field::eval_mle(&wd.ram_wit.inc, &inc_point);
+        eprintln!("eq-weighted routing total = {total:?}, inc_claim = {inc_claim:?}");
+        assert_eq!(
+            total, inc_claim,
+            "the store-routing total must equal the Inc claim"
+        );
+
+        // The fundamental bus equality: the witness's fetch segment per
+        // cycle must equal the ROM bus word at the fetched row, and the
+        // register read/write one-hots must equal the bus's index slices.
+        let fetch_off = pk.layout.offsets[pk.layout.index_of("fetch").unwrap()];
+        let rows = &trace.program.rows;
+        for (j, rec) in trace.records.iter().enumerate() {
+            let k = rec.micro_pc % rows.len();
+            for c in 0..64usize {
+                let w_bit = joint_bit(&wd.joint_z, j * m, fetch_off + c);
+                let r_bit = pk.rom.bus[c | (k << 6)];
+                if w_bit != r_bit {
+                    eprintln!(
+                        "FETCH MISMATCH j={j} k={k} bit={c}: witness={w_bit:?} rom={r_bit:?}"
+                    );
+                }
+            }
+            let row = &rows[k].row;
+            let slice = |pos: usize, width: usize| -> u64 {
+                let mut v = 0u64;
+                for t in 0..width {
+                    if pk.rom.bus[(pos + t) | (k << 6)] == Gf128(1) {
+                        v |= 1 << t;
+                    }
+                }
+                v
+            };
+            let rs1_bus = slice(magnetar_cpu::circuit::WITNESS_LAYOUT::BUS_RS1, 6);
+            let rs2_bus = slice(magnetar_cpu::circuit::WITNESS_LAYOUT::BUS_RS2, 6);
+            let rd_bus = slice(magnetar_cpu::circuit::WITNESS_LAYOUT::BUS_RD, 6);
+            let rs1_w = (row.rs1 & 63) as u64;
+            let rs2_w = (row.rs2 & 63) as u64;
+            let rd_w = if row.rd == 0 {
+                32
+            } else {
+                (row.rd & 63) as u64
+            };
+            if rs1_bus != rs1_w {
+                eprintln!("RS1 MISMATCH j={j} k={k}: bus={rs1_bus} row={rs1_w}");
+            }
+            if rs2_bus != rs2_w {
+                eprintln!("RS2 MISMATCH j={j} k={k}: bus={rs2_bus} row={rs2_w}");
+            }
+            if rd_bus != rd_w {
+                eprintln!("RD MISMATCH j={j} k={k}: bus={rd_bus} row={rd_w}");
+            }
+        }
     }
 
     #[test]
