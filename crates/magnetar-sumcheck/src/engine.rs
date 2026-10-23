@@ -425,7 +425,7 @@ mod tests {
     use magnetar_field::Gf128;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     fn bit_table(bits: &[bool]) -> Vec<Gf128> {
@@ -436,7 +436,7 @@ mod tests {
     fn engine_roundtrip_simple() {
         // g(x) = eq(τ, x) · T(x), T a random bit table, claim = Σ eq·T.
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let m = 4;
         let tau: Vec<Gf128> = (0..m).map(|_| rg(&mut rng)).collect();
         let table: Vec<Gf128> = (0..(1 << m)).map(|_| rg(&mut rng)).collect();
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn tamper_detected() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let m = 5;
         let table: Vec<Gf128> = (0..(1 << m)).map(|_| rg(&mut rng)).collect();
         let tau: Vec<Gf128> = (0..m).map(|_| rg(&mut rng)).collect();
@@ -563,7 +563,7 @@ mod tests {
         // Check BindOrder::HighBitsFirst maps challenges back correctly by
         // folding a table whose value depends on variable order.
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let m = 6;
         let table: Vec<Gf128> = (0..(1 << m)).map(|_| rg(&mut rng)).collect();
         // Summand: 1 · T(x) — claim = Σ T.

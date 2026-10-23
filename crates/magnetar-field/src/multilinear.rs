@@ -103,14 +103,14 @@ pub fn eval_mle(values: &[Gf128], point: &[Gf128]) -> Gf128 {
 mod tests {
     use super::*;
     use crate::eq::EqBits;
-    use rand::Rng;
+    use rand::RngExt;
 
     #[test]
     fn eval_matches_eq_sum() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for nv in [1usize, 2, 3, 5, 8] {
-            let values: Vec<Gf128> = (0..(1 << nv)).map(|_| rng.gen()).collect();
-            let point: Vec<Gf128> = (0..nv).map(|_| rng.gen()).collect();
+            let values: Vec<Gf128> = (0..(1 << nv)).map(|_| rng.random()).collect();
+            let point: Vec<Gf128> = (0..nv).map(|_| rng.random()).collect();
             let got = eval_mle(&values, &point);
             let eq = EqBits::build(&point);
             let mut want = Gf128(0);
@@ -123,10 +123,10 @@ mod tests {
 
     #[test]
     fn fold_is_partial_evaluation() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for nv in [2usize, 4, 6] {
-            let values: Vec<Gf128> = (0..(1 << nv)).map(|_| rng.gen()).collect();
-            let r: Gf128 = rng.gen();
+            let values: Vec<Gf128> = (0..(1 << nv)).map(|_| rng.random()).collect();
+            let r: Gf128 = rng.random();
             // Fold variable 0.
             let mut t = values.clone();
             fold_pairs(&mut t, 0, r);
@@ -150,10 +150,10 @@ mod tests {
     #[test]
     fn fold_matches_eq_fold_identity() {
         // fold^n with challenges r equals eq-weighted sum: T_n = Σ eq(r,b)T(b).
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let nv = 5;
-        let values: Vec<Gf128> = (0..(1 << nv)).map(|_| rng.gen()).collect();
-        let point: Vec<Gf128> = (0..nv).map(|_| rng.gen()).collect();
+        let values: Vec<Gf128> = (0..(1 << nv)).map(|_| rng.random()).collect();
+        let point: Vec<Gf128> = (0..nv).map(|_| rng.random()).collect();
         let mut t = values.clone();
         for (k, &r) in point.iter().enumerate().rev() {
             fold_pairs(&mut t, k, r);

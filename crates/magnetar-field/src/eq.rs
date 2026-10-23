@@ -76,13 +76,13 @@ pub fn eq_table(point: &[Gf128], b_bits: &[bool]) -> Gf128 {
 mod tests {
     use super::*;
     use crate::gf128::ONE;
-    use rand::Rng;
+    use rand::RngExt;
 
     #[test]
     fn eq_identity_holds() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..8 {
-            let point: Vec<Gf128> = (0..10).map(|_| rng.gen()).collect();
+            let point: Vec<Gf128> = (0..10).map(|_| rng.random()).collect();
             let t = EqBits::build(&point);
             // Sum over the cube is 1.
             let sum = t.values.iter().fold(Gf128(0), |a, b| a + *b);
@@ -97,9 +97,9 @@ mod tests {
 
     #[test]
     fn char2_identity() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for _ in 0..64 {
-            let x: Gf128 = rng.gen();
+            let x: Gf128 = rng.random();
             assert_eq!(eq_char2(x, true), x);
             assert_eq!(eq_char2(x, false), ONE + x);
             // eq(x,0) + eq(x,1) = 1.

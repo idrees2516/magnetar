@@ -13,7 +13,7 @@ use magnetar_hash::Transcript;
 use magnetar_router::join::{prove_routing_join, JoinWitness, RoutingTensor, SelCol};
 use magnetar_router::{build_shift_tensor, shift_selector_layout, RoutingLayout};
 use magnetar_sumcheck::public::PaddedFactor;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 fn mul(a: Gf128, b: Gf128) -> Gf128 {
     magnetar_field::mul(a, b)
@@ -27,8 +27,8 @@ fn eq_mle(r: &[Gf128], x: usize) -> Gf128 {
     v
 }
 
-fn rg(rng: &mut dyn rand::RngCore) -> Gf128 {
-    Gf128(rand::Rng::gen::<u128>(rng))
+fn rg(rng: &mut impl rand::Rng) -> Gf128 {
+    Gf128(rand::RngExt::random::<u128>(rng))
 }
 
 fn run_case(seed: u64) -> Result<(), &'static str> {
@@ -48,16 +48,16 @@ fn run_case(seed: u64) -> Result<(), &'static str> {
     let mut x = vec![ZERO; (1usize << u_vars) * cycles];
     for j in 0..cycles {
         for b in 0..w {
-            x[b + j * (1usize << u_vars)] = Gf128(rng.gen::<bool>() as u128);
+            x[b + j * (1usize << u_vars)] = Gf128(rng.random::<bool>() as u128);
         }
     }
     let (a_off_h, a_hv, k_off_h, k_hv) = shift_selector_layout(amount_bits);
     let mut q_lo = vec![ZERO; (1usize << a_hv) * cycles];
     let mut q_hi = vec![ZERO; (1usize << k_hv) * cycles];
     for j in 0..cycles {
-        if rng.gen::<bool>() {
-            let amount = rng.gen_range(0..(1usize << amount_bits));
-            let kind = rng.gen_range(0..3usize);
+        if rng.random::<bool>() {
+            let amount = rng.random_range(0..(1usize << amount_bits));
+            let kind = rng.random_range(0..3usize);
             q_lo[amount + j * (1usize << a_hv)] = ONE;
             q_hi[kind + j * (1usize << k_hv)] = ONE;
         }

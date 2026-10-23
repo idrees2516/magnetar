@@ -927,8 +927,8 @@ mod tests {
 
     #[test]
     fn val_materialization_strict_and_inclusive() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let (a, d, ell, n) = (4usize, 2, 2, 3);
         let ad = a / d;
         let cycles = 1usize << n;
@@ -938,15 +938,15 @@ mod tests {
         for _ in 0..d {
             let mut b = vec![false; (1usize << ad) * cycles];
             for j in 0..cycles {
-                b[rng.gen_range(0..(1usize << ad)) + j * (1usize << ad)] = true;
+                b[rng.random_range(0..(1usize << ad)) + j * (1usize << ad)] = true;
             }
             wcomps.push(AddressComponent::from_bits(ad, n, &b));
         }
         let inc: Vec<Gf128> = (0..bits * cycles)
-            .map(|_| Gf128(rng.gen::<bool>() as u128))
+            .map(|_| Gf128(rng.random::<bool>() as u128))
             .collect();
         let m0: Vec<Gf128> = (0..cells * bits)
-            .map(|_| Gf128(rng.gen::<bool>() as u128))
+            .map(|_| Gf128(rng.random::<bool>() as u128))
             .collect();
         let vs = materialize_val(a, ell, n, &m0, &wcomps, &inc, false);
         let vi = materialize_val(a, ell, n, &m0, &wcomps, &inc, true);

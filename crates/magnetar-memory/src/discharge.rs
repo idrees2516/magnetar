@@ -779,13 +779,13 @@ mod multi_factor_tests {
     use super::*;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     #[test]
     fn selector_two_factors_roundtrip() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let (a, n, d) = (2usize, 2, 1);
         let ad = a / d;
         let fetch_seq = [0usize, 1, 2, 3];
@@ -799,8 +799,8 @@ mod multi_factor_tests {
         let rom_sel_lo: Vec<Gf128> = {
             let mut sel = vec![ZERO; (1usize << hv_lo) * (1usize << a)];
             for k in 0..(1usize << a) {
-                if rng.gen::<bool>() {
-                    let hot = rng.gen_range(0..(1usize << hv_lo));
+                if rng.random::<bool>() {
+                    let hot = rng.random_range(0..(1usize << hv_lo));
                     sel[hot | (k << hv_lo)] = ONE;
                 }
             }
@@ -809,8 +809,8 @@ mod multi_factor_tests {
         let rom_sel_hi: Vec<Gf128> = {
             let mut sel = vec![ZERO; (1usize << hv_hi) * (1usize << a)];
             for k in 0..(1usize << a) {
-                if rng.gen::<bool>() {
-                    let hot = rng.gen_range(0..(1usize << hv_hi));
+                if rng.random::<bool>() {
+                    let hot = rng.random_range(0..(1usize << hv_hi));
                     sel[hot | (k << hv_hi)] = ONE;
                 }
             }

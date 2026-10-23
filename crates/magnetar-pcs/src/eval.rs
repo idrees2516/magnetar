@@ -349,11 +349,11 @@ mod tests {
     use super::*;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     fn run_case(n: usize, k: usize, queries: usize) {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let params = PcsParams {
             k,
             queries,
@@ -379,7 +379,7 @@ mod tests {
 
     #[test]
     fn tamper_rejected() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let params = PcsParams {
             k: 2,
             queries: 12,

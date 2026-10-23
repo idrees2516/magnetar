@@ -362,11 +362,12 @@ mod tests {
     use super::*;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     fn pack_random_bits(rng: &mut impl rand::Rng, rows: usize) -> (Vec<bool>, Vec<Gf128>) {
-        let bits: Vec<bool> = (0..rows * 128).map(|_| rng.gen::<bool>()).collect();
+        use rand::RngExt;
+        let bits: Vec<bool> = (0..rows * 128).map(|_| rng.random::<bool>()).collect();
         let bytes: Vec<u8> = bits.iter().map(|&b| b as u8).collect();
         let packed = magnetar_field::pack_table(&bytes);
         (bits, packed)
@@ -376,7 +377,7 @@ mod tests {
     fn ring_roundtrip_and_tamper() {
         use magnetar_field::eq_table;
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let params = PcsParams {
             k: 2,
             queries: 10,

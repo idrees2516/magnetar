@@ -431,8 +431,8 @@ mod tests {
     use super::*;
     use magnetar_field::mul;
 
-    fn rg(rng: &mut dyn rand::RngCore) -> Gf128 {
-        Gf128(rand::Rng::gen::<u128>(rng))
+    fn rg(rng: &mut impl rand::Rng) -> Gf128 {
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     #[test]
@@ -486,8 +486,8 @@ mod tests {
 
     #[test]
     fn shift_routing_roundtrip() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let w = 4usize;
         let amount_bits = 2usize;
         let (values, o_vars, u_vars, h_vars) = build_shift_tensor(w, amount_bits);
@@ -504,7 +504,7 @@ mod tests {
         let mut x = vec![ZERO; (1usize << u_vars) * cycles];
         for j in 0..cycles {
             for b in 0..w {
-                x[b + j * (1usize << u_vars)] = Gf128(rng.gen::<bool>() as u128);
+                x[b + j * (1usize << u_vars)] = Gf128(rng.random::<bool>() as u128);
             }
         }
         // Selectors: one-hot (or zero) per cycle.
@@ -512,9 +512,9 @@ mod tests {
         let mut q_lo = vec![ZERO; (1usize << a_hv) * cycles];
         let mut q_hi = vec![ZERO; (1usize << k_hv) * cycles];
         for j in 0..cycles {
-            if rng.gen::<bool>() {
-                let amount = rng.gen_range(0..(1usize << amount_bits));
-                let kind = rng.gen_range(0..3usize);
+            if rng.random::<bool>() {
+                let amount = rng.random_range(0..(1usize << amount_bits));
+                let kind = rng.random_range(0..3usize);
                 q_lo[amount + j * (1usize << a_hv)] = ONE;
                 q_hi[kind + j * (1usize << k_hv)] = ONE;
             }
@@ -604,8 +604,8 @@ mod tests {
 
     #[test]
     fn store_routing_roundtrip() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let w = 8usize;
         let (values, o_vars, u_vars, h_vars, a_vars) = build_store_tensor(w);
         let j_vars = 3usize;
@@ -624,15 +624,15 @@ mod tests {
         let mut off_bits = vec![ZERO; 3 * cycles];
         let mut q_st = vec![ZERO; 4 * cycles];
         for j in 0..cycles {
-            let o_word: u64 = rng.gen_range(0..(1u64 << w));
-            let s_word: u64 = rng.gen_range(0..(1u64 << w));
+            let o_word: u64 = rng.random_range(0..(1u64 << w));
+            let s_word: u64 = rng.random_range(0..(1u64 << w));
             for b in 0..w {
                 old[b + j * w] = Gf128(((o_word >> b) & 1) as u128);
                 src[b + j * w] = Gf128(((s_word >> b) & 1) as u128);
             }
-            if rng.gen::<bool>() {
-                let hsel = rng.gen_range(0..4usize);
-                let a = rng.gen_range(0..8usize);
+            if rng.random::<bool>() {
+                let hsel = rng.random_range(0..4usize);
+                let a = rng.random_range(0..8usize);
                 q_st[hsel + j * 4] = ONE;
                 off_bits[j * 3] = Gf128((a & 1) as u128);
                 off_bits[1 + j * 3] = Gf128(((a >> 1) & 1) as u128);
@@ -736,8 +736,8 @@ mod tests {
     /// replacement.
     #[test]
     fn join_matches_sparse_prover() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let w = 8usize;
         let (values, o_vars, u_vars, h_vars, a_vars) = build_store_tensor(w);
         let j_vars = 3usize;
@@ -753,16 +753,16 @@ mod tests {
         let cycles = 1usize << j_vars;
         // Random per-column witness.
         let x_table: Vec<Gf128> = (0..(1usize << u_vars) * cycles)
-            .map(|_| Gf128(rng.gen::<u64>() as u128 & 1))
+            .map(|_| Gf128(rng.random::<u64>() as u128 & 1))
             .collect();
         let mut q_st = vec![ZERO; 4 * cycles];
         let mut off_bits = vec![ZERO; 3 * cycles];
         for j in 0..cycles {
-            let hsel = rng.gen_range(0..5usize); // 4 = the zero column
+            let hsel = rng.random_range(0..5usize); // 4 = the zero column
             if hsel < 4 {
                 q_st[hsel + j * 4] = ONE;
             }
-            let a = rng.gen_range(0..8usize);
+            let a = rng.random_range(0..8usize);
             off_bits[j * 3] = Gf128((a & 1) as u128);
             off_bits[1 + j * 3] = Gf128(((a >> 1) & 1) as u128);
             off_bits[2 + j * 3] = Gf128(((a >> 2) & 1) as u128);

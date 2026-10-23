@@ -210,10 +210,10 @@ mod tests {
 
     #[test]
     fn interpolation_is_exact() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for d in 1..=3usize {
-            let coeffs: Vec<Gf128> = (0..=d).map(|_| Gf128(rng.gen::<u128>())).collect();
+            let coeffs: Vec<Gf128> = (0..=d).map(|_| Gf128(rng.random::<u128>())).collect();
             let values: Vec<Gf128> = (0..=d)
                 .map(|i| {
                     // evaluate at X = i
@@ -235,10 +235,10 @@ mod extra_tests {
     #[test]
     fn interpolation_high_degree() {
         use super::*;
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for d in 4..=6usize {
-            let coeffs: Vec<Gf128> = (0..=d).map(|_| Gf128(rng.gen::<u128>())).collect();
+            let coeffs: Vec<Gf128> = (0..=d).map(|_| Gf128(rng.random::<u128>())).collect();
             let values: Vec<Gf128> = (0..=d)
                 .map(|i| {
                     let mut acc = ZERO;

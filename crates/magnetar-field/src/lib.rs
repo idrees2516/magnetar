@@ -77,12 +77,12 @@ mod tests {
 
     #[test]
     fn field_axioms() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..64 {
-            let a: Gf128 = rng.gen();
-            let b: Gf128 = rng.gen();
-            let c: Gf128 = rng.gen();
+            let a: Gf128 = rng.random();
+            let b: Gf128 = rng.random();
+            let c: Gf128 = rng.random();
             assert_eq!(a + a, ZERO);
             assert_eq!(a + ZERO, a);
             assert_eq!(mul(a, b), mul(b, a), "commutativity");
@@ -98,11 +98,11 @@ mod tests {
 
     #[test]
     fn frobenius_is_multiplicative() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..16 {
-            let a: Gf128 = rng.gen();
-            let b: Gf128 = rng.gen();
+            let a: Gf128 = rng.random();
+            let b: Gf128 = rng.random();
             // (a*b)^2 == a^2 * b^2 (Frobenius)
             assert_eq!(square(mul(a, b)), mul(square(a), square(b)));
             // (a+b)^2 == a^2 + b^2 (char 2)
@@ -126,11 +126,11 @@ mod tests {
             }
             p
         }
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..256 {
-            let a: Gf128 = rng.gen();
-            let b: Gf128 = rng.gen();
+            let a: Gf128 = rng.random();
+            let b: Gf128 = rng.random();
             assert_eq!(mul(a, b).0, slow_mul(a.0, b.0));
         }
         // Edge cases.
@@ -144,15 +144,15 @@ mod tests {
 
     #[test]
     fn packing_roundtrip_and_phi() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..32 {
-            let bits: [bool; 128] = std::array::from_fn(|_| rng.gen());
+            let bits: [bool; 128] = std::array::from_fn(|_| rng.random());
             let p = pack_bits(&bits);
             let back = unpack_bits(p);
             assert_eq!(&back, &bits);
             // phi_c = dot product of c with the bits.
-            let c: [Gf128; 128] = std::array::from_fn(|_| rng.gen());
+            let c: [Gf128; 128] = std::array::from_fn(|_| rng.random());
             let expect: Gf128 = c
                 .iter()
                 .zip(bits.iter())

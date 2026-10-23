@@ -176,9 +176,9 @@ mod tests {
 
     #[test]
     fn eq_factor_materialize_matches_eval() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-            Gf128(rng.gen::<u128>())
+            Gf128(rand::RngExt::random::<u128>(rng))
         }
         for nv in [1usize, 3, 5] {
             let point: Vec<Gf128> = (0..nv).map(|_| rg(&mut rng)).collect();
@@ -195,9 +195,9 @@ mod tests {
 
     #[test]
     fn sum_eq_matches_sum_of_eq() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-            Gf128(rng.gen::<u128>())
+            Gf128(rand::RngExt::random::<u128>(rng))
         }
         let nv = 4;
         let items: Vec<(Gf128, Vec<Gf128>)> = (0..3)
@@ -223,9 +223,9 @@ mod tests {
 
     #[test]
     fn table_factor_eval() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-            Gf128(rng.gen::<u128>())
+            Gf128(rand::RngExt::random::<u128>(rng))
         }
         let table: Vec<Gf128> = (0..16).map(|_| rg(&mut rng)).collect();
         let f = TableFactor::new(table.clone());

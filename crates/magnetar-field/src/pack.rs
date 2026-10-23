@@ -106,10 +106,10 @@ mod tests {
 
     #[test]
     fn pack_unpack_roundtrip() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..32 {
-            let bits: [bool; 128] = std::array::from_fn(|_| rng.gen());
+            let bits: [bool; 128] = std::array::from_fn(|_| rng.random());
             let p = pack_bits(&bits);
             assert_eq!(&unpack_bits(p)[..], &bits[..]);
             let bytes: Vec<u8> = bits.iter().map(|&b| b as u8).collect();
@@ -119,12 +119,12 @@ mod tests {
 
     #[test]
     fn phi_c_is_linear_in_bits() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..16 {
-            let bits: [bool; 128] = std::array::from_fn(|_| rng.gen());
+            let bits: [bool; 128] = std::array::from_fn(|_| rng.random());
             let p = pack_bits(&bits);
-            let c: [Gf128; 128] = std::array::from_fn(|_| rng.gen());
+            let c: [Gf128; 128] = std::array::from_fn(|_| rng.random());
             let mut want = ZERO;
             for (b, &bit) in bits.iter().enumerate() {
                 if bit {
@@ -138,9 +138,9 @@ mod tests {
     #[test]
     fn eq_coefficients_match_eq_table() {
         use crate::eq::eq_table;
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let r: [Gf128; 7] = std::array::from_fn(|_| rng.gen());
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let r: [Gf128; 7] = std::array::from_fn(|_| rng.random());
         let c = eq_coefficients(&r);
         for b in 0..128usize {
             let bits: Vec<bool> = (0..7).map(|j| (b >> j) & 1 == 1).collect();
@@ -150,13 +150,13 @@ mod tests {
 
     #[test]
     fn c_fold_matches_manual() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let rows = 12;
-        let w: Vec<bool> = (0..rows * 128).map(|_| rng.gen()).collect();
+        let w: Vec<bool> = (0..rows * 128).map(|_| rng.random()).collect();
         let bytes: Vec<u8> = w.iter().map(|&b| b as u8).collect();
         let packed = pack_table(&bytes);
-        let c: [Gf128; 128] = std::array::from_fn(|_| rng.gen());
+        let c: [Gf128; 128] = std::array::from_fn(|_| rng.random());
         let folded = c_fold_table(&packed, &c);
         for u in 0..rows {
             let want: Gf128 = (0..128)

@@ -274,7 +274,7 @@ mod tests {
     use crate::public::PublicFactor;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     /// A random sparse instance cross-checked against the dense engine:
@@ -282,7 +282,7 @@ mod tests {
     /// `SumcheckVerifier` with full-space public factors.
     #[test]
     fn sparse_matches_dense_engine() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Joint layout: a | b | c | d (4 vars). Factors: X over (a, d),
         // Y over (b, d), public P over (a, b, c).
         let m = 4;
@@ -361,7 +361,7 @@ mod tests {
     /// `2^remaining` copies — exercise it.
     #[test]
     fn sparse_constant_factor() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let m = 3;
         // Summand: C · Z(x) with C constant, Z over all vars.
         let c0 = rg(&mut rng);

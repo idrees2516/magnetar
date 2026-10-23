@@ -359,15 +359,15 @@ mod tests {
     use super::*;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     /// Build a random one-hot component set over a small space and check
     /// the full Shout flow.
     #[test]
     fn shout_roundtrip_and_tamper() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let (a, d, n, c) = (4usize, 2, 3, 2);
         let ad = a / d;
         // Random one-hot components: for each cycle, exactly one address.
@@ -377,7 +377,7 @@ mod tests {
         for _ in 0..d {
             let mut bits = vec![false; addrs * cycles];
             for j in 0..cycles {
-                let hot = rng.gen_range(0..addrs);
+                let hot = rng.random_range(0..addrs);
                 bits[hot + j * addrs] = true;
             }
             comps.push(AddressComponent::from_bits(ad, n, &bits));

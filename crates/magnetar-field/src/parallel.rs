@@ -96,18 +96,18 @@ pub fn par_dot_xor(a: &[Gf128], b: &[Gf128]) -> Gf128 {
 mod tests {
     use super::*;
     use crate::bind_var;
-    use rand::Rng;
+    use rand::RngExt;
 
     #[test]
     fn par_bind_matches_seq() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // 2^13 outputs cross the parallel threshold.
         for vars in [13usize, 15] {
             for var in 0..vars {
                 let base: Vec<Gf128> = (0..(1usize << vars))
-                    .map(|_| Gf128(rng.gen::<u128>()))
+                    .map(|_| Gf128(rng.random::<u128>()))
                     .collect();
-                let r = Gf128(rng.gen::<u128>());
+                let r = Gf128(rng.random::<u128>());
                 let mut a = base.clone();
                 let mut b = base;
                 bind_var(&mut a, var, r);
@@ -119,10 +119,10 @@ mod tests {
 
     #[test]
     fn dot_matches_seq() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let n = 1usize << 17;
-        let a: Vec<Gf128> = (0..n).map(|_| Gf128(rng.gen::<u128>())).collect();
-        let b: Vec<Gf128> = (0..n).map(|_| Gf128(rng.gen::<u128>())).collect();
+        let a: Vec<Gf128> = (0..n).map(|_| Gf128(rng.random::<u128>())).collect();
+        let b: Vec<Gf128> = (0..n).map(|_| Gf128(rng.random::<u128>())).collect();
         let mut seq = Gf128(0);
         for i in 0..n {
             seq += mul(a[i], b[i]);

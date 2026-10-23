@@ -175,23 +175,26 @@ pub fn fold_instances(per_instance: &[Gf128], r_inst: &[Gf128]) -> Gf128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     #[test]
     fn apply_and_mle_agree() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // Random sparse matrix, random z: apply == MLE-based identity at
         // Boolean points is not direct; check eval_mle_table against
         // direct MLE at Boolean column points.
         let (rows, cols) = (4usize, 8usize);
         let mut m = SparseMatrix::empty(rows, cols);
         for _ in 0..12 {
-            m.entries
-                .push((rng.gen_range(0..rows), rng.gen_range(0..cols), rg(&mut rng)));
+            m.entries.push((
+                rng.random_range(0..rows),
+                rng.random_range(0..cols),
+                rg(&mut rng),
+            ));
         }
         let r_row: Vec<Gf128> = (0..2).map(|_| rg(&mut rng)).collect();
         let table = m.eval_mle_table(&r_row);
@@ -217,13 +220,16 @@ mod tests {
 
     #[test]
     fn simd_apply_matches_block_diagonal() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let (rows, cols) = (4usize, 4usize);
         let mut m = SparseMatrix::empty(rows, cols);
         for _ in 0..10 {
-            m.entries
-                .push((rng.gen_range(0..rows), rng.gen_range(0..cols), rg(&mut rng)));
+            m.entries.push((
+                rng.random_range(0..rows),
+                rng.random_range(0..cols),
+                rg(&mut rng),
+            ));
         }
         let q = 4;
         let joint: Vec<Gf128> = (0..q * rows).map(|_| rg(&mut rng)).collect();
@@ -237,7 +243,7 @@ mod tests {
 
     #[test]
     fn public_fold_matches_definition() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let q = 4;
         let m = 8;
         let inst = SimdInstance {

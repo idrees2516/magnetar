@@ -654,15 +654,16 @@ mod tests {
     use super::*;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     fn rand_mat(rng: &mut impl rand::Rng, rows: usize, cols: usize, n: usize) -> SparseMatrix {
+        use rand::RngExt;
         let mut mat = SparseMatrix::empty(rows, cols);
         for _ in 0..n {
             mat.entries.push((
-                rng.gen_range(0..rows),
-                rng.gen_range(0..cols),
+                rng.random_range(0..rows),
+                rng.random_range(0..cols),
                 rg(&mut *rng),
             ));
         }
@@ -671,8 +672,8 @@ mod tests {
 
     #[test]
     fn virtual_spartan_roundtrip() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let q = 1usize;
         let m = 8usize;
         let layout = SegmentLayout::build(
@@ -704,7 +705,7 @@ mod tests {
         }
         // Fill the witness half with random bits (they are the W we prove).
         for i in 1..half {
-            joint[i] = Gf128(rng.gen::<bool>() as u128);
+            joint[i] = Gf128(rng.random::<bool>() as u128);
         }
         let az = a.apply(&joint);
         let bz = b.apply(&joint);

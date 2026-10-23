@@ -249,12 +249,12 @@ mod tests {
     use super::*;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     #[test]
     fn monomial_transforms_roundtrip() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for n in [1usize, 2, 3, 5] {
             let values: Vec<Gf128> = (0..(1 << n)).map(|_| rg(&mut rng)).collect();
             let c = values_to_monomials(&values, n);
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn shifted_evaluation_identity() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         // C(x, eps) must equal eval_mle(T, x + L(eps)) for Boolean x, eps.
         let n = 3;
         let k = 2;
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn fold_identity_substitution() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let n = 3;
         let k = 2;
         let params = CodeParams::derive(n, k, "test-fold");
@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn full_fold_tail_equals_eval() {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let n = 4;
         let k = 2;
         let params = CodeParams::derive(n, k, "test-tail");

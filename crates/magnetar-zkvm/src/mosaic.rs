@@ -439,8 +439,8 @@ mod pack_tests {
     /// planes and misaligned boundaries.
     #[test]
     fn pack_tables_matches_assemble_and_pack() {
-        let mut rng = rand::thread_rng();
-        use rand::Rng;
+        let mut rng = rand::rng();
+        use rand::RngExt;
         // A layout with mixed sizes: big components (multi-plane),
         // small ones, and a trailing hole (planes beyond the union stay
         // zero).
@@ -465,7 +465,7 @@ mod pack_tests {
             .iter()
             .map(|(n, v)| {
                 (0..(1usize << (n + v)))
-                    .map(|_| rng.gen::<bool>())
+                    .map(|_| rng.random::<bool>())
                     .collect()
             })
             .collect();

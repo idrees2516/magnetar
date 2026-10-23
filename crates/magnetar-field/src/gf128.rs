@@ -238,9 +238,9 @@ pub fn pow(a: Gf128, k: u128) -> Gf128 {
 }
 
 #[cfg(test)]
-impl rand::distributions::Distribution<Gf128> for rand::distributions::Standard {
+impl rand::distr::Distribution<Gf128> for rand::distr::StandardUniform {
     fn sample<R: rand::Rng + ?Sized>(&self, rng: &mut R) -> Gf128 {
-        Gf128(rng.gen())
+        Gf128(rand::RngExt::random(rng))
     }
 }
 
@@ -263,11 +263,11 @@ mod tests {
 
     #[test]
     fn mul_matches_reference() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..512 {
-            let a: Gf128 = rng.gen();
-            let b: Gf128 = rng.gen();
+            let a: Gf128 = rng.random();
+            let b: Gf128 = rng.random();
             assert_eq!(mul(a, b).0, slow_mul(a.0, b.0));
         }
         // Directed: x^128 ≡ 0x87.
@@ -328,10 +328,10 @@ mod tests {
 
     #[test]
     fn inverse_works() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         for _ in 0..16 {
-            let a: Gf128 = rng.gen();
+            let a: Gf128 = rng.random();
             if a == ZERO {
                 continue;
             }

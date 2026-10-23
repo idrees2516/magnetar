@@ -202,15 +202,17 @@ mod tests {
     use super::*;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
-        Gf128(rng.gen::<u128>())
+        Gf128(rand::RngExt::random::<u128>(rng))
     }
 
     #[test]
     fn row_and_column_folds() {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+        use rand::RngExt;
+        let mut rng = rand::rng();
         let (av, cv) = (3usize, 4usize);
-        let bits: Vec<bool> = (0..(1 << (av + cv))).map(|_| rng.gen::<bool>()).collect();
+        let bits: Vec<bool> = (0..(1 << (av + cv)))
+            .map(|_| rng.random::<bool>())
+            .collect();
         let comp = AddressComponent::from_bits(av, cv, &bits);
         let r: Vec<Gf128> = (0..av).map(|_| rg(&mut rng)).collect();
         let rc: Vec<Gf128> = (0..cv).map(|_| rg(&mut rng)).collect();
