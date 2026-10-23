@@ -1881,14 +1881,7 @@ mod tests {
             let i11 = ((imm >> 11) & 1) as u32;
             let i10_5 = ((imm >> 5) & 0x3f) as u32;
             let i4_1 = ((imm >> 1) & 0xf) as u32;
-            (i12 << 31)
-                | (i10_5 << 25)
-                | (0 << 20)
-                | (3 << 15)
-                | (1 << 12)
-                | (i4_1 << 8)
-                | (i11 << 7)
-                | 0x63
+            (i12 << 31) | (i10_5 << 25) | (3 << 15) | (1 << 12) | (i4_1 << 8) | (i11 << 7) | 0x63
         };
         let program = vec![
             enc_i(2, 0, 0, 3, 0x13),
@@ -2289,8 +2282,8 @@ mod tests {
         let trace = magnetar_cpu::interp::execute(&program, &[], 256);
         let out = trace.final_state.regs[10];
         // Sanity: the semantics.
-        assert_eq!(trace.final_state.regs[3], 0x12345_000 ^ 0x67);
-        assert_eq!(trace.final_state.regs[8], 0x12345_000u64 << 41);
+        assert_eq!(trace.final_state.regs[3], 0x1234_5000 ^ 0x67);
+        assert_eq!(trace.final_state.regs[8], 0x1234_5000u64 << 41);
         let (pk, vk) = keygen(program, 256);
         let pub_in = PublicInput {
             input: vec![],

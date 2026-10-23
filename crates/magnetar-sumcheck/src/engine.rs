@@ -710,7 +710,7 @@ mod tests {
 #[cfg(test)]
 mod rewrite_tests {
     use super::*;
-    use crate::public::{EqFactor, TableFactor};
+    use crate::public::EqFactor;
     use magnetar_field::{mul, Gf128, ONE};
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {

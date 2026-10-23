@@ -129,14 +129,7 @@ mod tests {
             let i11 = ((imm >> 11) & 1) as u32;
             let i10_5 = ((imm >> 5) & 0x3f) as u32;
             let i4_1 = ((imm >> 1) & 0xf) as u32;
-            (i12 << 31)
-                | (i10_5 << 25)
-                | (0 << 20)
-                | (3 << 15)
-                | (1 << 12)
-                | (i4_1 << 8)
-                | (i11 << 7)
-                | 0x63
+            (i12 << 31) | (i10_5 << 25) | (3 << 15) | (1 << 12) | (i4_1 << 8) | (i11 << 7) | 0x63
         };
         // A looping program that crosses the chunk boundary repeatedly.
         let program = vec![

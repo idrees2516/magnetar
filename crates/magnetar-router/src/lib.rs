@@ -455,6 +455,68 @@ pub fn store_x_split(r_u: &[Gf128], _x_claim: Gf128) -> ((Gf128, Vec<Gf128>), (G
     ((w_old, bits.clone()), (w_src, bits))
 }
 
+/// Build the register-shift **stage-routing** tensor `R_stage(o, u, h)`
+/// (the paper's §5.4 register-shift expansion: each stage is a static
+/// routing). `h = kind | (stage << 2) | (b << 5)`:
+/// * `kind ∈ {0: SLL, 1: SRL, 2: SRA, 3: pad}`;
+/// * `stage ∈ 0..6` (the 6-stage binary decomposition of the amount);
+/// * `b ∈ {0, 1}` — the runtime amount bit: `b = 0` routes the identity
+///   (`u = o`), `b = 1` routes the static `2^stage` shift (zero fill for
+///   SLL/SRL past the word, sign fill for SRA).
+///
+/// Returns `(tensor, o_vars, u_vars, h_vars)` with `h_vars = 6`.
+pub fn build_stage_tensor(w: usize) -> (Vec<Gf128>, usize, usize, usize) {
+    let o_vars = w.trailing_zeros() as usize;
+    let u_vars = o_vars;
+    let h_vars = 6usize; // kind(2) | stage(3) | b(1)
+    let mut r = vec![ZERO; (1usize << o_vars) * (1usize << u_vars) * (1usize << h_vars)];
+    for kind in 0..4usize {
+        for stage in 0..8usize {
+            for b in 0..2usize {
+                let h = kind | (stage << 2) | (b << 5);
+                for o in 0..w {
+                    let src: Option<usize> = match (kind, b) {
+                        (_, 0) => Some(o), // identity
+                        (0, _) => {
+                            // SLL: source bit o - 2^stage, zero fill.
+                            let sh = 1usize << stage;
+                            if o >= sh {
+                                Some(o - sh)
+                            } else {
+                                None
+                            }
+                        }
+                        (1, _) => {
+                            // SRL: source bit o + 2^stage, zero fill.
+                            let sh = 1usize << stage;
+                            if o + sh < w {
+                                Some(o + sh)
+                            } else {
+                                None
+                            }
+                        }
+                        (2, _) => {
+                            // SRA: source bit o + 2^stage, sign fill.
+                            let sh = 1usize << stage;
+                            if o + sh < w {
+                                Some(o + sh)
+                            } else {
+                                Some(w - 1)
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(u) = src {
+                        let idx = o | (u << o_vars) | (h << (o_vars + u_vars));
+                        r[idx] = ONE;
+                    }
+                }
+            }
+        }
+    }
+    (r, o_vars, u_vars, h_vars)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -801,66 +863,4 @@ mod tests {
         let mut tv = Transcript::new("router2", &[b"t"]);
         assert!(verify_routing(&layout, y_mle, &r_o, &r_j, &r_pub, 1, 3, &p, &mut tv).is_err());
     }
-}
-
-/// Build the register-shift **stage-routing** tensor `R_stage(o, u, h)`
-/// (the paper's §5.4 register-shift expansion: each stage is a static
-/// routing). `h = kind | (stage << 2) | (b << 5)`:
-/// * `kind ∈ {0: SLL, 1: SRL, 2: SRA, 3: pad}`;
-/// * `stage ∈ 0..6` (the 6-stage binary decomposition of the amount);
-/// * `b ∈ {0, 1}` — the runtime amount bit: `b = 0` routes the identity
-///   (`u = o`), `b = 1` routes the static `2^stage` shift (zero fill for
-///   SLL/SRL past the word, sign fill for SRA).
-///
-/// Returns `(tensor, o_vars, u_vars, h_vars)` with `h_vars = 6`.
-pub fn build_stage_tensor(w: usize) -> (Vec<Gf128>, usize, usize, usize) {
-    let o_vars = w.trailing_zeros() as usize;
-    let u_vars = o_vars;
-    let h_vars = 6usize; // kind(2) | stage(3) | b(1)
-    let mut r = vec![ZERO; (1usize << o_vars) * (1usize << u_vars) * (1usize << h_vars)];
-    for kind in 0..4usize {
-        for stage in 0..8usize {
-            for b in 0..2usize {
-                let h = kind | (stage << 2) | (b << 5);
-                for o in 0..w {
-                    let src: Option<usize> = match (kind, b) {
-                        (_, 0) => Some(o), // identity
-                        (0, _) => {
-                            // SLL: source bit o - 2^stage, zero fill.
-                            let sh = 1usize << stage;
-                            if o >= sh {
-                                Some(o - sh)
-                            } else {
-                                None
-                            }
-                        }
-                        (1, _) => {
-                            // SRL: source bit o + 2^stage, zero fill.
-                            let sh = 1usize << stage;
-                            if o + sh < w {
-                                Some(o + sh)
-                            } else {
-                                None
-                            }
-                        }
-                        (2, _) => {
-                            // SRA: source bit o + 2^stage, sign fill.
-                            let sh = 1usize << stage;
-                            if o + sh < w {
-                                Some(o + sh)
-                            } else {
-                                Some(w - 1)
-                            }
-                        }
-                        _ => None,
-                    };
-                    if let Some(u) = src {
-                        let idx = o | (u << o_vars) | (h << (o_vars + u_vars));
-                        r[idx] = ONE;
-                    }
-                }
-            }
-        }
-    }
-    (r, o_vars, u_vars, h_vars)
 }
