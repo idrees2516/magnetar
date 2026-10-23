@@ -40,6 +40,7 @@ pub mod mosaic;
 pub mod protocol;
 pub mod rom;
 pub mod stats;
+pub mod wire;
 
 pub use mosaic::{MosaicClaim, MosaicCommitment, MosaicLayout, MosaicProof};
 pub use protocol::{

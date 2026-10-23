@@ -93,9 +93,26 @@ field/utils/proof/arith/cpu split), one crate per component:
   ledger (per-segment sum-check bytes, the single evaluation argument,
   the analytic standalone counterfactual, the saving ratio).
 
+* **The end-to-end benchmark** — `magnetar bench [max-trace]` runs the
+  paper's Table-6 methodology (trace scaling with **exact wire sizes**
+  from `magnetar-zkvm::wire`, the aggregation ledger, the tree-IVC
+  chunk count, the dual-rate schedule, peak RSS). Measured highlights:
+  proof sizes land in the paper's own range (375.7–619.1 KiB across all
+  artifacts vs. the paper's 377–598 KiB), claim aggregation saves
+  **59% of wire bytes at K=4** (37% at K=2) against the standalone
+  counterfactual, tree-IVC chunking grows the artifact in the *chunk
+  count* (not the total cycles) at a ~13% chunking overhead, and the
+  wrap rate costs +8.4% with flat verification — see
+  [`docs/benchmarks.md`](docs/benchmarks.md) for every table.
+
 The full engineering program — what is done, what the horizons are, and
 the 150M-cycles/s GPU study's build order — is in [`ROADMAP.md`](ROADMAP.md)
 and [`docs/architecture/`](docs/architecture/) (one deep-dive per component).
+The honest inventory of what is **not** implemented yet — the prover-
+throughput gap with its optimization path, the verifier-guest/wrap
+recursion, zero-knowledge, the QROM argument, ISA completeness, and
+the production-engineering backlog — is in
+[`docs/remaining-work.md`](docs/remaining-work.md).
 
 ## Security
 

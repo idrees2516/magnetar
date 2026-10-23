@@ -139,3 +139,25 @@ The initial release: the binary-field stack, the sum-check engine, the
 PCS with ring switching, Spartan/Virtual Spartan, BinaryTwist/BinaryShout
 with the refined one-hotness, BinaryRouter, the RV64I decoder and
 interpreter, the dual SIMD R1CS circuit, and MosaicPCS.
+
+### The end-to-end benchmark and the honest inventory
+
+- `magnetar-zkvm::wire`: the exact uncompressed wire-size model over the
+  real proof objects (`Proof` and the tree-IVC `AggregateProof`) — 16 B
+  per committed field element, 32 B digests, 8 B length prefixes — so
+  the benchmark reports measured bytes, not estimates.
+- `magnetar bench [max-trace]`: the paper's Table-6 methodology plus the
+  H2 artifacts (the aggregation ledger vs. the standalone
+  counterfactual, the tree-IVC chunk count, the dual-rate schedule,
+  peak RSS). Highlights: proof sizes 375.7–619.1 KiB across all
+  artifacts (the paper's own range is 377–598 KiB at its operating
+  points); claim aggregation saves 59% of wire bytes at K=4 (37% at
+  K=2); tree-IVC chunking keeps the artifact growing in the chunk count
+  at a ~13% overhead; the wrap rate costs +8.4% with flat verification.
+- `docs/benchmarks.md`: the full measured tables with the hardware
+  disclosure and the honest prover-throughput analysis.
+- `docs/remaining-work.md`: the honest inventory — the sum-check-engine
+  speed path (memoized/lazy round products, small-domain arithmetic,
+  the streaming Twist, parallelism), the verifier-guest/wrap recursion,
+  zero-knowledge, QROM, ISA completeness (LB/LH sign extension, the
+  workload suite), and the production-engineering backlog.
