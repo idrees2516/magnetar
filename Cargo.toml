@@ -42,7 +42,7 @@ magnetar-bitsum = { path = "crates/magnetar-bitsum" }
 cutile = { version = "0.4" }
 
 # Standard, well-scrutinized hash implementations (RustCrypto / BLAKE3 team).
-sha3 = { version = "0.10", default-features = false }
+sha3 = { version = "0.12", default-features = false }
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
 # Parallel proving.
 rayon = { version = "1.10" }
