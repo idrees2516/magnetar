@@ -52,15 +52,23 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod claims;
+pub mod cross_step;
 pub mod discharge;
+pub mod final_state;
 pub mod shout;
 pub mod twist;
 
 pub use claims::{PcsPoint, SelectorPcsClaims, ShoutPcsClaims, TwistPcsClaims};
+pub use cross_step::{
+    prove_cross_step, verify_cross_step, CrossStepClaims, CrossStepProof, CrossStepSpec,
+};
 pub use discharge::{
     prove_bus_shout, prove_psi_claim, prove_selector_shout, verify_bus_shout, verify_psi_claim,
     verify_selector_shout, BusShoutProof, BusShoutSpec, PsiProof, SelectorCheckSpec,
     SelectorShoutProof, SelectorShoutSpec,
+};
+pub use final_state::{
+    prove_final_state, verify_final_state, FinalStateClaims, FinalStateInstance, FinalStateProof,
 };
 pub use shout::{prove_shout, verify_shout, ShoutInstance, ShoutProof};
 pub use twist::{prove_twist, verify_twist, TwistInstance, TwistProof, TwistWitness};

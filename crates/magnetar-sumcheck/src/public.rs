@@ -233,3 +233,4 @@ mod tests {
         assert_eq!(f.eval_at(&point), magnetar_field::eval_mle(&table, &point));
     }
 }
+

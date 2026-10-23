@@ -11,5 +11,9 @@ name = "magnetar"
 path = "src/main.rs"
 
 [dependencies]
-magnetar-zkvm = { workspace = true }
+magnetar-pcs = { workspace = true }
+magnetar-field = { workspace = true }
+magnetar-ivc = { workspace = true }
 magnetar-cpu = { workspace = true }
+magnetar-memory = { workspace = true }
+magnetar-zkvm = { workspace = true }

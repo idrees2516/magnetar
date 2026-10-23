@@ -136,20 +136,43 @@ pub fn execute(program: &[u32], input: &[Word], max_cycles: usize) -> Trace {
         records.push(rec);
         st.cycles += 1;
     }
-    // Pad the trace to a power of two with halt-latch records. The
-    // padding cycles are real no-op cycles: they fetch ROM row 0 and read
-    // the registers its fields name — the logged values are the machine's
-    // current contents, keeping the memory arguments consistent.
-    while records.len().next_power_of_two() != records.len() {
+    // Pad the trace to a power of two with halt-latch records.
+    let target = records.len().next_power_of_two();
+    pad_records(&mut records, &mut st, &prog, target);
+    Trace {
+        program: prog,
+        records,
+        final_state: st,
+    }
+}
+
+/// Pad a record list to `target` with halt-latch no-op cycles: they fetch
+/// ROM row 0 and read the registers its fields name — the logged values
+/// are the machine's current contents, keeping the memory arguments
+/// consistent. The halt-latch write is applied to `st` so later padding
+/// reads agree with the memory argument's evolution. (Public: the
+/// tree-IVC segments pad their slices with the same semantics.)
+pub fn pad_records(
+    records: &mut Vec<CycleRecord>,
+    st: &mut ExecState,
+    prog: &ExpandedProgram,
+    target: usize,
+) {
+    while records.len() < target {
+        // The padding cycles freeze the micro-PC (the halt-latch
+        // semantics): they fetch the frozen row so the cross-step chain
+        // `fetch(j+1) = TT[fetch(j), taken(j), halt(j)]` stays consistent
+        // (the halt transition is the identity).
         let last_pc = records.last().map(|r| r.next_pc).unwrap_or(0);
+        let frozen = last_pc % prog.rows.len();
         let out = st.output;
-        let row = &prog.rows[0].row;
+        let row = &prog.rows[frozen].row;
         let write_addr = if row.rd == 0 { 32 } else { row.rd };
         let rec = CycleRecord {
-            micro_pc: 0,
+            micro_pc: frozen,
             rs1_val: st.regs[row.rs1 % REGS],
             rs2_val: st.regs[row.rs2 % REGS],
-            next_pc: last_pc,
+            next_pc: frozen,
             rd: write_addr,
             rd_old: st.regs[write_addr],
             rd_val: out,
@@ -162,11 +185,6 @@ pub fn execute(program: &[u32], input: &[Word], max_cycles: usize) -> Trace {
         // Apply the halt-latch write so later padding reads agree with the
         // memory argument's evolution.
         st.regs[write_addr] = out;
-    }
-    Trace {
-        program: prog,
-        records,
-        final_state: st,
     }
 }
 

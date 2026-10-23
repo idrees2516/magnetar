@@ -168,6 +168,10 @@ name = "magnetar-cli"
 version = "0.1.0"
 dependencies = [
  "magnetar-cpu",
+ "magnetar-field",
+ "magnetar-ivc",
+ "magnetar-memory",
+ "magnetar-pcs",
  "magnetar-zkvm",
 ]
 
@@ -200,6 +204,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-ivc"
+version = "0.1.0"
+dependencies = [
+ "magnetar-cpu",
+ "magnetar-field",
+ "magnetar-hash",
+ "magnetar-pcs",
+ "magnetar-zkvm",
+ "rand",
+]
+
+[[package]]
 name = "magnetar-memory"
 version = "0.1.0"
 dependencies = [
@@ -228,6 +244,7 @@ dependencies = [
  "magnetar-hash",
  "magnetar-sumcheck",
  "rand",
+ "rayon",
 ]
 
 [[package]]

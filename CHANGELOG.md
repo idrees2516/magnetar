@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.4.0] — the soundness closure release
+
+### Added
+- **The cross-step transition argument** (the paper's Remark-4 mechanism,
+  `magnetar-memory::cross_step`): the fetch chain
+  `fetch(j+1) = TT[fetch(j), taken(j), halt(j)]` proven by two chained
+  sum-checks (the transition Shout with α₀ sum-forcing + the
+  predecessor-weight shift discharge), with the ROM transition table
+  built at keygen. Closes the jumped-pc soundness gap — a swapped
+  instruction order is now rejected (`tamper_jumped_pc_rejected`).
+- **The flag-derivation constraints** (`magnetar-cpu::circuit`):
+  `halt ⟺ opcode = SYSTEM` and `taken = branch-row ∧ comparison` (the
+  full 64-bit comparison circuit: the zero-chain, the signed/unsigned
+  less-than muxes, the funct3 selection) — a faked halt or branch
+  direction is now unsatisfiable.
+- **The ECALL output binding**: the halt row reads x10 (rs1 = 10 in the
+  expansion) and `halt · (rd + rs1) = 0` ties the public output to the
+  register file through the register Twist. `prove` additionally
+  requires the execution to halt within the trace bound.
+- **The initial-pc and final-halt public point claims** (single-segment
+  and tree-IVC shapes).
+- **Tree-IVC** (`magnetar-ivc`, new crate): segments share one
+  MosaicPCS commitment; per-segment boundary statements chain through
+  the final-state bindings; the root discharges all segments' claims
+  with one batching sum-check and one PCS evaluation argument.
+- **The final-state binding** (`magnetar-memory::final_state`): the
+  Remark-4 initial/final register and RAM binding via the zero-check +
+  the evolution reduction.
+- **The join-enumeration router prover** (`magnetar-router::join`): the
+  paper's linear-in-T BinaryRouter prover — byte-identical proofs to the
+  generic sparse prover, ~600× faster at T = 2^12.
+- **The benchmark harness and paper comparison**
+  (`magnetar-cli::magnetar-bench`, `docs/BENCHMARKS.md`).
+- `docs/STATUS.md`: the honest implemented/not-implemented accounting.
+
+### Fixed
+- The sub-word store tensor routed the source bit `o` instead of
+  `o − 8a` at byte offset `a` — every store with a nonzero byte offset
+  produced an unsound routing identity (all prior tests used offset 0).
+- The store-router offset claims selected bit-column `2^k` instead of
+  `k` (a unit-vector vs binary-index confusion in the claim point).
+- The load zero-extension constraints were not gated on `is_load` and
+  rejected any ALU result with bits above 15 set (e.g. sign-extended
+  immediates).
+- `prove` now pads the trace to exactly `trace_len` (the interpreter
+  padded to the next power of two of the record count, desynchronizing
+  every auxiliary argument at non-matching lengths).
+
+### Changed
+- The witness width doubled (W = 2048, M = 4096) to fit the comparison
+  circuit; the `crossaux` virtual segment tiles the new region.
+- The halt-latch padding cycles fetch the frozen row (the cross-step
+  chain requires the freeze transition to be consistent).
+- `JALR` is rejected at keygen: the static transition table cannot
+  encode register-indirect targets (see `docs/STATUS.md`).
+
+
+
 ## 0.2.0 (unreleased)
 
 ### The complete protocol

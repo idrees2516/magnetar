@@ -54,6 +54,17 @@ pub struct RoutingTensor {
 }
 
 impl RoutingTensor {
+    /// Construct from the builders' `(values, o, u, h, a)` tuple shape.
+    pub fn from_parts(values: Vec<Gf128>, o: usize, u: usize, h: usize, a: usize) -> Self {
+        RoutingTensor {
+            values,
+            o_vars: o,
+            u_vars: u,
+            h_vars: h,
+            a_vars: a,
+        }
+    }
+
     /// The nonzero support grouped per `(h, a)` position:
     /// `support[h | a<<h_vars] = [(o, u, coef)]`.
     fn support_by_ha(&self) -> Vec<Vec<(usize, usize, Gf128)>> {
@@ -160,6 +171,19 @@ fn quad_term(r: Gf128, v0: Gf128, v1: Gf128, s: Gf128) -> [Gf128; 3] {
 #[inline]
 fn eqb(x: Gf128, b: bool) -> Gf128 {
     x + Gf128(b as u128) + ONE
+}
+
+/// The round-0 self-check: the first round message must sum to the stated
+/// claim (`p(0) + p(1) = Σ coeffs` in characteristic two).
+#[inline]
+fn round0_check(rounds: &[Vec<Gf128>], coeffs: &Coeffs, degree: usize, claim: Gf128) {
+    if rounds.is_empty() {
+        debug_assert_eq!(
+            coeffs[..degree + 1].iter().copied().sum::<Gf128>(),
+            claim,
+            "join prover round 0 must sum to the claim"
+        );
+    }
 }
 
 fn absorb_round(t: &mut Transcript, coeffs: &Coeffs, degree: usize) -> Gf128 {
@@ -319,7 +343,8 @@ pub fn prove_routing_join(
                 }
                 local
             })
-            .reduce(combine, combine);
+            .reduce(zero_coeffs, combine);
+        round0_check(&rounds, &coeffs, degree, claim);
         let c = absorb_round(t, &coeffs, degree);
         rounds.push(coeffs[..degree + 1].to_vec());
         challenges.push(c);
@@ -414,7 +439,8 @@ pub fn prove_routing_join(
                 }
                 local
             })
-            .reduce(combine, combine);
+            .reduce(zero_coeffs, combine);
+        round0_check(&rounds, &coeffs, degree, claim);
         let c = absorb_round(t, &coeffs, degree);
         rounds.push(coeffs[..degree + 1].to_vec());
         challenges.push(c);
@@ -486,8 +512,9 @@ pub fn prove_routing_join(
                     }
                     local
                 })
-                .reduce(combine, combine)
+                .reduce(zero_coeffs, combine)
         };
+        round0_check(&rounds, &coeffs, degree, claim);
         let c = absorb_round(t, &coeffs, degree);
         rounds.push(coeffs[..degree + 1].to_vec());
         challenges.push(c);
@@ -513,8 +540,20 @@ pub fn prove_routing_join(
     let mut r_u = r_uh; // h fully folded: a vector over u.
     for k in 0..u_v {
         let half = 1usize << (u_v - k - 1);
+        // Bit 0 of the working tables is the round variable u_k (each
+        // round folds bit 0), so the line pairs are **strided**:
+        // r0[i] = r_u[2i] (u_k=0), r1[i] = r_u[2i+1] (u_k=1), with `i`
+        // enumerating the remaining high bits.
+        let (r0, r1): (Vec<Gf128>, Vec<Gf128>) = {
+            let mut a = vec![ZERO; half];
+            let mut b = vec![ZERO; half];
+            for i in 0..half {
+                a[i] = r_u[i << 1];
+                b[i] = r_u[(i << 1) | 1];
+            }
+            (a, b)
+        };
         let coeffs = {
-            let (r0, r1) = r_u.split_at(half);
             let x = &x_work;
             let wt = &w;
             cols.par_chunks(chunk_size(cycles))
@@ -525,13 +564,14 @@ pub fn prove_routing_join(
                             continue;
                         }
                         let xc = &x[(col.j << (u_v - k))..((col.j + 1) << (u_v - k))];
-                        let (x0, x1) = xc.split_at(half);
                         let mut d = [ZERO; 4];
                         for i in 0..half {
-                            d[0] += mul(r0[i], x0[i]);
-                            d[1] += mul(r0[i], x1[i]);
-                            d[2] += mul(r1[i], x0[i]);
-                            d[3] += mul(r1[i], x1[i]);
+                            let x0 = xc[i << 1];
+                            let x1 = xc[(i << 1) | 1];
+                            d[0] += mul(r0[i], x0);
+                            d[1] += mul(r0[i], x1);
+                            d[2] += mul(r1[i], x0);
+                            d[3] += mul(r1[i], x1);
                         }
                         let s = mul(mul(mul(wt[col.j], col.lam), col.lamh), e_o);
                         local[0] += mul(s, d[0]);
@@ -540,8 +580,9 @@ pub fn prove_routing_join(
                     }
                     local
                 })
-                .reduce(combine, combine)
+                .reduce(zero_coeffs, combine)
         };
+        round0_check(&rounds, &coeffs, degree, claim);
         let c = absorb_round(t, &coeffs, degree);
         rounds.push(coeffs[..degree + 1].to_vec());
         challenges.push(c);
@@ -550,9 +591,12 @@ pub fn prove_routing_join(
     }
 
     // ---- j-rounds: per-cycle factor vectors, pair-folded. ----
+    // The fully folded R and eq_o constants scale every j-round message
+    // (they depend on no j variable).
+    let s_fin = mul(e_o, r_u[0]);
     let mut xq = x_work; // the X j-part (cycles entries).
     let mut wv = w; // eq(r_j, ·).
-    let mut qv: Vec<Vec<Gf128>> = (0..n_sel)
+    let qv: Vec<Vec<Gf128>> = (0..n_sel)
         .map(|f| cols.iter().map(|c| c.lamh_f[f]).collect())
         .collect();
     let lv: Vec<Vec<Gf128>> = (0..n_off)
@@ -562,6 +606,7 @@ pub fn prove_routing_join(
                 .collect()
         })
         .collect();
+    let mut qv = qv;
     let mut lv = lv;
     for k in 0..n {
         let mut factor_refs: Vec<&Vec<Gf128>> = Vec::with_capacity(2 + n_sel + n_off);
@@ -574,18 +619,23 @@ pub fn prove_routing_join(
             factor_refs.push(l);
         }
         let len = 1usize << (n - k);
-        let coeffs = (0..len)
+        // One task per even-index pair group (bit 0 = the round variable
+        // j_k; each pair (2m, 2m+1) must be visited exactly once — twice
+        // would self-cancel in characteristic two).
+        let pairs = len / 2;
+        let coeffs = (0..pairs)
             .into_par_iter()
-            .chunks(chunk_size(len))
+            .chunks(chunk_size(pairs.max(1)))
             .map(|idxs| {
                 let mut local = zero_coeffs();
-                for i in idxs {
-                    // Per column: Π_f (f0 + (f0 + f1)·t) at the round bit 0.
+                for m in idxs {
+                    let i = m << 1; // the pair base (j_k = 0 / 1).
+                    // Per column: s_fin · Π_f (f0 + (f0 + f1)·t).
                     let mut poly = [ZERO; MAXC];
-                    poly[0] = ONE;
+                    poly[0] = s_fin;
                     let mut deg = 0usize;
                     for f in &factor_refs {
-                        let f0 = f[i & !1usize];
+                        let f0 = f[i];
                         let d = f0 + f[i | 1];
                         let mut next = [ZERO; MAXC];
                         for e in 0..=deg {
@@ -601,7 +651,8 @@ pub fn prove_routing_join(
                 }
                 local
             })
-            .reduce(combine, combine);
+            .reduce(zero_coeffs, combine);
+        round0_check(&rounds, &coeffs, degree, claim);
         let c = absorb_round(t, &coeffs, degree);
         rounds.push(coeffs[..degree + 1].to_vec());
         challenges.push(c);

@@ -37,8 +37,8 @@ use magnetar_memory::{
 };
 use magnetar_pcs::PcsParams;
 use magnetar_router::{
-    build_shift_tensor, build_store_tensor, prove_routing, verify_routing, PaddedDense,
-    PaddedTableFactor, RouterProof, RoutingLayout,
+    build_shift_tensor, build_store_tensor, prove_routing_join, verify_routing, JoinWitness,
+    PaddedTableFactor, RouterProof, RoutingLayout, RoutingTensor, SelCol,
 };
 use magnetar_spartan::{
     prove_virtual_spartan, verify_virtual_spartan, DualRelation, SegmentClaim, SegmentLayout,
@@ -97,16 +97,90 @@ pub struct PublicInput {
     pub output: u64,
 }
 
-/// The end-to-end proof.
+/// The public machine state at a segment boundary (the Remark-4
+/// initial/final-state binding): the full register file, the micro-PC,
+/// the halt latch, and the whole RAM.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Boundary {
+    /// The 64 register cells (x0 hardwired to zero).
+    pub regs: Vec<u64>,
+    /// The micro-PC (in virtual-instruction units).
+    pub pc: usize,
+    /// The halt latch.
+    pub halted: bool,
+    /// The whole RAM (`2^{RAM_WORDS_LOG2}` words).
+    pub ram: Vec<u64>,
+}
+
+impl Boundary {
+    /// The canonical machine start: zero registers and RAM, with the
+    /// public input words loaded at word 0.
+    pub fn initial(input: &[u64]) -> Self {
+        let mut ram = vec![0u64; 1usize << magnetar_cpu::RAM_WORDS_LOG2];
+        for (i, &w) in input.iter().enumerate() {
+            if i < ram.len() {
+                ram[i] = w;
+            }
+        }
+        Boundary {
+            regs: vec![0; magnetar_cpu::REGS],
+            pc: 0,
+            halted: false,
+            ram,
+        }
+    }
+
+    /// The output register (x10) — meaningful when halted.
+    pub fn output(&self) -> u64 {
+        self.regs.get(10).copied().unwrap_or(0)
+    }
+
+    /// The register-file m0 table (address low, bit high): 2^{12} bits.
+    fn reg_m0(&self) -> Vec<Gf128> {
+        let mut m0 = vec![ZERO; 1usize << 12];
+        for (k, &w) in self.regs.iter().enumerate().take(64) {
+            for o in 0..64usize {
+                m0[k | (o << 6)] = Gf128(((w >> o) & 1) as u128);
+            }
+        }
+        m0
+    }
+
+    /// The RAM m0 table (address low, bit high): 2^{14} bits.
+    fn ram_m0(&self) -> Vec<Gf128> {
+        let mut m0 = vec![ZERO; 1usize << 14];
+        for (k, &w) in self.ram.iter().enumerate() {
+            for o in 0..64usize {
+                m0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
+            }
+        }
+        m0
+    }
+}
+
+/// One segment's public statement: the public input/output binding plus
+/// the two boundary states (initial and final).
+#[derive(Clone, Debug)]
+pub struct SegmentStatement {
+    /// The program's public input words (segment 0 only; empty for the
+    /// continuation segments).
+    pub input: Vec<u64>,
+    /// The claimed output — bound only when the segment halts.
+    pub output: u64,
+    /// The initial boundary (registers and RAM bind via the Twists' m0;
+    /// the initial pc and halt latch via public-point claims).
+    pub init: Boundary,
+    /// The final boundary (registers and RAM bind via the final-state
+    /// sum-checks; the final halt latch via a public-point claim).
+    pub final_: Boundary,
+}
+
+/// The segment argument: every sub-proof of Construction 3's steps 2–6
+/// — everything **before** the (shared) commitment and its MosaicPCS
+/// discharge. The single-segment [`Proof`] wraps this; tree-IVC shares
+/// one commitment across many segments.
 #[derive(Clone)]
-pub struct Proof {
-    /// The Mosaic commitment root.
-    pub commitment_root: [u8; 32],
-    pub pcs_n: usize,
-    pub pcs_k: usize,
-    pub pcs_domain: String,
-    /// ℓ (the Mosaic bit-witness variable count).
-    pub ell: usize,
+pub struct InnerProof {
     /// Virtual Spartan's proof.
     pub vs: VirtualSpartanProof,
     /// Step 3: the register BinaryTwist.
@@ -138,6 +212,26 @@ pub struct Proof {
     pub sel_shift: SelectorShoutProof,
     /// Step 6: the store selector check.
     pub sel_store: SelectorShoutProof,
+    /// The Remark-4 final-state bindings (present iff the statement
+    /// carries boundary states): registers then RAM.
+    pub final_reg: Option<magnetar_memory::FinalStateProof>,
+    pub final_ram: Option<magnetar_memory::FinalStateProof>,
+    /// The Remark-4 cross-step transition argument.
+    pub cross_step: magnetar_memory::CrossStepProof,
+}
+
+/// The end-to-end proof.
+#[derive(Clone)]
+pub struct Proof {
+    /// The Mosaic commitment root.
+    pub commitment_root: [u8; 32],
+    pub pcs_n: usize,
+    pub pcs_k: usize,
+    pub pcs_domain: String,
+    /// ℓ (the Mosaic bit-witness variable count).
+    pub ell: usize,
+    /// The segment argument (steps 2–6).
+    pub inner: InnerProof,
     /// Step 7: the Mosaic discharge.
     pub mosaic: MosaicProof,
 }
@@ -169,6 +263,10 @@ const SEGMENTS: &[(&str, usize, bool)] = &[
     ("pc", 8, false),
     ("fetch", 64, false),
     ("eqaux", 64, true),
+    // The flag-derivation aux block (Remark 4): virtual — its values are
+    // R1CS-constrained against the bus and the ALU, so its VS claim needs
+    // no external discharge.
+    ("crossaux", 1024, false),
 ];
 
 /// Derive the keys from the public program.
@@ -185,6 +283,12 @@ pub fn keygen_with(
     pcs: PcsParams,
 ) -> (KeyGen, VerifyingKey) {
     assert!(trace_len.is_power_of_two() && trace_len >= 2);
+    // JALR's target is data-dependent; the cross-step transition table is
+    // static — reject the program (docs/STATUS.md).
+    assert!(
+        !program.iter().any(|w| w & 0x7f == 0x67),
+        "JALR is not supported (see docs/STATUS.md): the cross-step transition table is static"
+    );
     let circuit = build_circuit();
     let layout = SegmentLayout::build(
         WITNESS_LAYOUT::M / 2,
@@ -269,7 +373,7 @@ fn mosaic_components(n: usize, a_rom: usize) -> Vec<crate::mosaic::ComponentSpec
 }
 
 /// One prover-side witness bundle.
-struct WitnessData {
+pub struct WitnessData {
     joint_z: Vec<Gf128>,
     /// The direct component tables (bits), in Mosaic order.
     direct_tables: Vec<Vec<bool>>,
@@ -456,51 +560,28 @@ fn slice_weights(point: &[Gf128], pos: usize, width: usize) -> Vec<Gf128> {
 }
 
 /// Prove the execution (Construction 3, steps 1–7).
-pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
-    // ---- 1. Execute.
-    let trace = execute(&pk.program, &pub_in.input, pk.trace_len);
-    assert_eq!(
-        trace.final_state.output, pub_in.output,
-        "execution output mismatch"
-    );
-    assert!(trace.records.len() <= pk.trace_len, "trace exceeds bound");
+/// Run steps 1–6 (everything but the commitment and its discharge) for
+/// one segment. `stmt` carries the boundary states; when `None` the
+/// canonical single-segment statement is assumed (zero initial memory
+/// with the public input loaded, no final-state binding — the original
+/// Construction-3 shape). Returns the segment argument, the Mosaic
+/// component tables (for the caller's **shared** commitment), and the
+/// Mosaic claims.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_inner(
+    pk: &KeyGen,
+    pub_in: &PublicInput,
+    stmt: Option<&SegmentStatement>,
+    trace: &magnetar_cpu::interp::Trace,
+    wd: &WitnessData,
+    next_pc_public: Option<usize>,
+    t: &mut Transcript,
+) -> (InnerProof, Vec<MosaicClaim>) {
     let q = pk.trace_len;
     let m = WITNESS_LAYOUT::M;
     let n = q.trailing_zeros() as usize;
     let a_rom = pk.rom.a_rom;
     let _rows = &trace.program.rows;
-    let wd = build_witness(pk, pub_in, &trace);
-    // ---- 2. Commit.
-    // The component tables in Mosaic order.
-    let mut tables: Vec<Vec<bool>> = wd.direct_tables.clone();
-    for comp in wd.reg_wit.ports.iter().flat_map(|p| p.iter()) {
-        tables.push(comp.table.iter().map(|&v| v == ONE).collect());
-    }
-    tables.push(wd.reg_wit.inc.iter().map(|&v| v == ONE).collect());
-    for comp in wd.ram_wit.ports.iter().flat_map(|p| p.iter()) {
-        tables.push(comp.table.iter().map(|&v| v == ONE).collect());
-    }
-    tables.push(wd.ram_wit.inc.iter().map(|&v| v == ONE).collect());
-    tables.push(wd.fetch_comp.table.iter().map(|&v| v == ONE).collect());
-    let commitment: MosaicCommitment = commit_mosaic(&pk.pcs, &pk.mosaic, &tables);
-    // ---- 3. Virtual Spartan.
-    let mut t = Transcript::new(
-        "magnetar",
-        &[
-            b"construction-3-v2",
-            &pk.program
-                .iter()
-                .flat_map(|w| w.to_le_bytes())
-                .collect::<Vec<u8>>(),
-            &pub_in
-                .input
-                .iter()
-                .flat_map(|w| w.to_le_bytes())
-                .collect::<Vec<u8>>(),
-            &pub_in.output.to_le_bytes(),
-        ],
-    );
-    t.absorb_digest("cm-g", &commitment.stmt.root);
     let rel = DualRelation {
         m,
         a_bin: pk.circuit.a_bin.clone(),
@@ -510,7 +591,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         b_fld: pk.circuit.b_fld.clone(),
         c_fld: pk.circuit.c_fld.clone(),
     };
-    let (vs_proof, seg_claims) = prove_virtual_spartan(&rel, &pk.layout, &wd.joint_z, q, &mut t);
+    let (vs_proof, seg_claims) = prove_virtual_spartan(&rel, &pk.layout, &wd.joint_z, q, t);
     let seg = |name: &str| -> SegmentClaim {
         let i = pk.layout.index_of(name).expect("segment");
         seg_claims[i].clone()
@@ -519,19 +600,23 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     let r_val: Vec<Gf128> = seg("rs1").r_local; // 6 vars
     let r_local3: Vec<Gf128> = seg("pc").r_local; // 3 vars
     let r_inst: Vec<Gf128> = seg("rs1").r_inst;
-    // ---- 4a. BinaryTwist for registers.
+    // ---- 4a. BinaryTwist for registers. The initial memory is the
+    // boundary's register file when a segment statement is present
+    // (the Remark-4 initial-state binding), else the canonical zeros.
     let reg_inst = TwistInstance {
         a: 6,
         ell: 6,
         n,
         p: 2,
-        m0: vec![ZERO; 1 << 12],
+        m0: stmt
+            .map(|st| st.init.reg_m0())
+            .unwrap_or_else(|| vec![ZERO; 1 << 12]),
         rv_claims: vec![seg("rs1").value, seg("rs2").value],
         wv_claim: seg("rd").value,
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
-    let (reg_proof, reg_twist_claims) = prove_twist(&reg_inst, &wd.reg_wit, &mut t);
+    let (reg_proof, reg_twist_claims) = prove_twist(&reg_inst, &wd.reg_wit, t);
     // The register-index Ψ-sum-checks (read 1, read 2, write).
     let port_comps = [
         &wd.reg_wit.ports[0],
@@ -547,8 +632,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     let mut reg_index_claims = Vec::new();
     for (s, comps) in port_comps.iter().enumerate() {
         let weights = slice_weights(&r_val, positions[s], 6);
-        let (claim, proof) =
-            prove_psi_claim(comps, &r_inst, &weights, &format!("reg-psi-{s}"), &mut t);
+        let (claim, proof) = prove_psi_claim(comps, &r_inst, &weights, &format!("reg-psi-{s}"), t);
         reg_psi.push(proof);
         reg_index_claims.push(claim);
     }
@@ -556,7 +640,13 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     // The write-value claim: the new word per cycle (stores) or the
     // current content of cell 0 (no-op writes).
     let ram_wv_claim: Gf128 = {
-        let mut cell0: u64 = pub_in.input.first().copied().unwrap_or(0);
+        // The no-op write value on non-memory cycles: the current content
+        // of cell 0 — from the boundary's initial RAM for segments, from
+        // the public input word 0 otherwise.
+        let mut cell0: u64 = match stmt {
+            Some(st) => st.init.ram.first().copied().unwrap_or(0),
+            None => pub_in.input.first().copied().unwrap_or(0),
+        };
         let mut acc = ZERO;
         let eq_v = magnetar_field::EqBits::build(&r_val).values;
         let eq_c = magnetar_field::EqBits::build(&r_inst).values;
@@ -580,29 +670,34 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         }
         acc
     };
-    let ram_m0: Vec<Gf128> = {
-        let mut t0 = vec![ZERO; 1usize << 14];
-        for (k, &w) in pub_in.input.iter().enumerate() {
-            if k < (1usize << 8) {
-                for o in 0..64usize {
-                    t0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
+    // The RAM's initial memory: the boundary's RAM for segments, else the
+    // canonical zeros with the public input words loaded.
+    let ram_m0: Vec<Gf128> = match stmt {
+        Some(st) => st.init.ram_m0(),
+        None => {
+            let mut t0 = vec![ZERO; 1usize << 14];
+            for (k, &w) in pub_in.input.iter().enumerate() {
+                if k < (1usize << 8) {
+                    for o in 0..64usize {
+                        t0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
+                    }
                 }
             }
+            t0
         }
-        t0
     };
     let ram_inst = TwistInstance {
         a: 8,
         ell: 6,
         n,
         p: 1,
-        m0: ram_m0,
+        m0: ram_m0.clone(),
         rv_claims: vec![seg("load-val").value],
         wv_claim: ram_wv_claim,
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
-    let (ram_proof, ram_twist_claims) = prove_twist(&ram_inst, &wd.ram_wit, &mut t);
+    let (ram_proof, ram_twist_claims) = prove_twist(&ram_inst, &wd.ram_wit, t);
     // The RAM address Ψ-sum-checks (read, write) — checked against the
     // ram-addr segment's VS claim.
     let v_ramaddr = seg("ram-addr").value;
@@ -610,8 +705,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     let mut ram_addr_claims = Vec::new();
     for (s, comps) in wd.ram_wit.ports.iter().enumerate() {
         let weights = slice_weights(&r_local3, 0, 8);
-        let (claim, proof) =
-            prove_psi_claim(comps, &r_inst, &weights, &format!("ram-psi-{s}"), &mut t);
+        let (claim, proof) = prove_psi_claim(comps, &r_inst, &weights, &format!("ram-psi-{s}"), t);
         ram_psi.push(proof);
         ram_addr_claims.push(claim);
     }
@@ -635,7 +729,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         x
     };
     // The selector tables (over (h, j)) from the ROM at the fetched rows.
-    let (sel_lo, sel_hi, sel_st) = selector_tables_from_trace(&pk.rom, &trace, pk.amount_bits, q);
+    let (sel_lo, sel_hi, sel_st) = selector_tables_from_trace(&pk.rom, trace, pk.amount_bits, q);
     let (_, o_v, u_v, h_v) = pk.shift_tensor.clone();
     let shift_layout = RoutingLayout {
         o_vars: o_v,
@@ -644,60 +738,39 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         h_vars: h_v,
         a_vars: 0,
     };
-    let shift_r_pub = {
-        // The R tensor's own table over (o, u, h) with the joint active
-        // positions: o | u | h (j skipped).
-        let [_, _j_off, u_off, h_off, _] = shift_layout.offsets();
-        let mut active = (0..o_v).collect::<Vec<usize>>();
-        active.extend(u_off..u_off + u_v);
-        active.extend(h_off..h_off + h_v);
-        PaddedTableFactor::new(pk.shift_tensor.0.clone(), active, shift_layout.joint_vars())
+    // The shift router runs the join-enumeration prover (linear in T):
+    // the per-column X and selector tables, never a joint materialization.
+    let shift_wit = JoinWitness {
+        x: x_shift.clone(),
+        selectors: vec![
+            SelCol {
+                table: sel_lo.clone(),
+                h_off: 0,
+                h_vars: pk.amount_bits,
+            },
+            SelCol {
+                table: sel_hi.clone(),
+                h_off: pk.amount_bits,
+                h_vars: 2,
+            },
+        ],
+        offset_bits: Vec::new(),
     };
-    let shift_dense = vec![
-        PaddedDense::new(
-            x_shift.clone(),
-            {
-                let [_, j_off, u_off, _, _] = shift_layout.offsets();
-                let mut a = (u_off..u_off + u_v).collect::<Vec<usize>>();
-                a.extend(j_off..j_off + n);
-                a
-            },
-            shift_layout.joint_vars(),
-        ),
-        PaddedDense::new(
-            sel_lo.clone(),
-            {
-                let [_, j_off, _, h_off, _] = shift_layout.offsets();
-                // Q_lo over the h-block's low `amount_bits` positions.
-                let mut a: Vec<usize> = (h_off..h_off + pk.amount_bits).collect();
-                a.extend(j_off..j_off + n);
-                a
-            },
-            shift_layout.joint_vars(),
-        ),
-        PaddedDense::new(
-            sel_hi.clone(),
-            {
-                let [_, j_off, _, h_off, _] = shift_layout.offsets();
-                // Q_hi over the h-block's top 2 positions.
-                let mut a: Vec<usize> =
-                    (h_off + pk.amount_bits..h_off + pk.amount_bits + 2).collect();
-                a.extend(j_off..j_off + n);
-                a
-            },
-            shift_layout.joint_vars(),
-        ),
-    ];
     let shift_claim = seg("shift-out").value;
-    let shift_router = prove_routing(
+    let shift_router = prove_routing_join(
         &shift_layout,
         shift_claim,
         &r_val,
         &r_inst,
-        &shift_r_pub,
-        &shift_dense,
-        2,
-        &mut t,
+        &RoutingTensor::from_parts(
+            pk.shift_tensor.0.clone(),
+            pk.shift_tensor.1,
+            pk.shift_tensor.2,
+            pk.shift_tensor.3,
+            0,
+        ),
+        &shift_wit,
+        t,
     );
     // ---- 5b. BinaryRouter for sub-word stores.
     let (o_vs, u_vs, h_vs, a_vs) = (
@@ -726,67 +799,45 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         }
         x
     };
-    // The offset-link tables.
+    // The raw offset bits â_k(j) (per offset variable, one bool per cycle)
+    // — the join prover derives the eq-links (1 + a_k + â_k) itself.
     let off_off = pk.layout.offsets[pk.layout.index_of("off").expect("segment")];
-    let links: Vec<Vec<Gf128>> = (0..3)
+    let off_bits: Vec<Vec<bool>> = (0..3)
         .map(|k| {
-            let mut lk = vec![ZERO; 2 * q];
-            for (u, _) in trace.records.iter().enumerate() {
-                let bit = joint_bit(&wd.joint_z, u * m, off_off + k);
-                // eq(a_k, â_k(j)) = 1 + a_k + â_k.
-                lk[u << 1] = ONE + bit;
-                lk[1 | (u << 1)] = bit;
-            }
-            lk
+            trace
+                .records
+                .iter()
+                .map(|rec| (rec.byte_offset >> k) & 1 == 1)
+                .collect()
         })
         .collect();
-    let store_r_pub = {
-        let [_, _j_off, u_off, h_off, a_off] = store_layout.offsets();
-        let mut active = (0..o_vs).collect::<Vec<usize>>();
-        active.extend(u_off..u_off + u_vs);
-        active.extend(h_off..h_off + h_vs);
-        active.extend(a_off..a_off + a_vs);
-        PaddedTableFactor::new(pk.store_tensor.0.clone(), active, store_layout.joint_vars())
+    let _ = off_off;
+    // The store router runs the join-enumeration prover as well.
+    let store_wit = JoinWitness {
+        x: x_store.clone(),
+        selectors: vec![SelCol {
+            table: sel_st.clone(),
+            h_off: 0,
+            h_vars: h_vs,
+        }],
+        offset_bits: off_bits,
     };
-    let mut store_dense = vec![
-        PaddedDense::new(
-            x_store.clone(),
-            {
-                let [_, j_off, u_off, _, _] = store_layout.offsets();
-                let mut a = (u_off..u_off + u_vs).collect::<Vec<usize>>();
-                a.extend(j_off..j_off + n);
-                a
-            },
-            store_layout.joint_vars(),
-        ),
-        PaddedDense::new(
-            sel_st.clone(),
-            {
-                let [_, j_off, _, h_off, _] = store_layout.offsets();
-                let mut a = (h_off..h_off + h_vs).collect::<Vec<usize>>();
-                a.extend(j_off..j_off + n);
-                a
-            },
-            store_layout.joint_vars(),
-        ),
-    ];
-    for (k, lk) in links.iter().enumerate() {
-        let [_, j_off, _, _, a_off] = store_layout.offsets();
-        let mut a = vec![a_off + k];
-        a.extend(j_off..j_off + n);
-        store_dense.push(PaddedDense::new(lk.clone(), a, store_layout.joint_vars()));
-    }
     // The output claim: the Inc claim at the verifier-sampled point.
     let (r_inc_o, r_inc_j) = inc_point.split_at(6);
-    let store_router = prove_routing(
+    let store_router = prove_routing_join(
         &store_layout,
         inc_claim,
         r_inc_o,
         r_inc_j,
-        &store_r_pub,
-        &store_dense,
-        1,
-        &mut t,
+        &RoutingTensor::from_parts(
+            pk.store_tensor.0.clone(),
+            pk.store_tensor.1,
+            pk.store_tensor.2,
+            pk.store_tensor.3,
+            pk.store_tensor.4,
+        ),
+        &store_wit,
+        t,
     );
     // The store X split claims (the two segment MLEs at the router's
     // terminal point).
@@ -834,7 +885,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         pc_claim: seg("pc").value,
     };
     let (bus_shout, bus_shout_claims) =
-        prove_bus_shout(&bus_spec, std::slice::from_ref(&wd.fetch_comp), &mut t);
+        prove_bus_shout(&bus_spec, std::slice::from_ref(&wd.fetch_comp), t);
     // The selector checks.
     let shift_terminal = shift_router.terminal.clone();
     let sel_shift = {
@@ -865,7 +916,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         &sel_shift,
         std::slice::from_ref(&wd.fetch_comp),
         "sel-shift",
-        &mut t,
+        t,
     );
     let store_terminal = store_router.terminal.clone();
     let sel_store = {
@@ -887,10 +938,10 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         &sel_store,
         std::slice::from_ref(&wd.fetch_comp),
         "sel-store",
-        &mut t,
+        t,
     );
-    // ---- 7. MosaicPCS.
-    let mosaic_claims = collect_mosaic_claims(
+    // ---- 7. The Mosaic claims (the caller commits and discharges).
+    let mut mosaic_claims = collect_mosaic_claims(
         &pk.layout,
         &pk.mosaic,
         n,
@@ -910,13 +961,152 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         &store_terminal,
         &store_x_claims,
     );
-    let mosaic_proof = prove_mosaic(&pk.pcs, &pk.mosaic, &commitment, &mosaic_claims, &mut t);
-    Proof {
-        commitment_root: commitment.stmt.root,
-        pcs_n: commitment.stmt.n,
-        pcs_k: commitment.stmt.k,
-        pcs_domain: commitment.stmt.domain,
-        ell: commitment.ell,
+    // ---- 8. The Remark-4 boundary bindings (segments only).
+    //
+    // (a) The final-state sum-checks bind the public final register file
+    //     and RAM to the committed increments and write addresses (the
+    //     paper's Remark-4 mechanism).
+    // (b) Three public-point Mosaic claims pin the committed fetch
+    //     one-hot at cycle 0 to the public initial pc (value 1), and the
+    //     committed halt-flag bit at cycles 0 and T−1 to the public
+    //     initial/final halt latches. Together with the halt-latch R1CS
+    //     constraint this also soundly binds the public output.
+    let mut final_reg = None;
+    let mut final_ram = None;
+    if let Some(st) = stmt {
+        let reg_fs = magnetar_memory::FinalStateInstance {
+            a: 6,
+            ell: 6,
+            n,
+            m0: st.init.reg_m0(),
+            pub_final: st.final_.reg_m0(),
+        };
+        let (reg_fs_proof, reg_fs_claims) =
+            magnetar_memory::prove_final_state(&reg_fs, &wd.reg_wit, t);
+        let ram_fs = magnetar_memory::FinalStateInstance {
+            a: 8,
+            ell: 6,
+            n,
+            m0: st.init.ram_m0(),
+            pub_final: st.final_.ram_m0(),
+        };
+        let (ram_fs_proof, ram_fs_claims) =
+            magnetar_memory::prove_final_state(&ram_fs, &wd.ram_wit, t);
+        // Discharge the bindings' claims through the Mosaic.
+        let (reg_wfa_pt, reg_wfa_v) = &reg_fs_claims.component_points[0];
+        mosaic_claims.push(MosaicClaim::new(
+            pk.mosaic.index_of("reg-wfa").expect("component"),
+            reg_wfa_pt.clone(),
+            *reg_wfa_v,
+        ));
+        let (reg_inc_pt, reg_inc_v) = &reg_fs_claims.inc_point;
+        mosaic_claims.push(MosaicClaim::new(
+            pk.mosaic.index_of("reg-inc").expect("component"),
+            reg_inc_pt.clone(),
+            *reg_inc_v,
+        ));
+        let (ram_w_pt, ram_w_v) = &ram_fs_claims.component_points[0];
+        mosaic_claims.push(MosaicClaim::new(
+            pk.mosaic.index_of("ram-ra-write").expect("component"),
+            ram_w_pt.clone(),
+            *ram_w_v,
+        ));
+        let (ram_inc_pt, ram_inc_v) = &ram_fs_claims.inc_point;
+        mosaic_claims.push(MosaicClaim::new(
+            pk.mosaic.index_of("ram-inc").expect("component"),
+            ram_inc_pt.clone(),
+            *ram_inc_v,
+        ));
+        // The public-point claims.
+        for c in boundary_point_claims(&pk.mosaic, a_rom, n, st) {
+            mosaic_claims.push(c);
+        }
+        final_reg = Some(reg_fs_proof);
+        final_ram = Some(ram_fs_proof);
+    } else {
+        // The single-segment shape: the initial pc (row 0, cycle 0) and
+        // the final halt latch (cycle T−1) pin the chain's ends.
+        let zero_pt: Vec<Gf128> = vec![ZERO; a_rom + n];
+        mosaic_claims.push(MosaicClaim::new(
+            pk.mosaic.index_of("fetch-ra").expect("component"),
+            zero_pt,
+            ONE,
+        ));
+        let halt_sel: Vec<Gf128> = {
+            let h = magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT;
+            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((h >> i) & 1) as u128)).collect();
+            v.extend(vec![ONE; n]);
+            v
+        };
+        mosaic_claims.push(MosaicClaim::new(
+            pk.mosaic.index_of("seg-flags").expect("component"),
+            halt_sel,
+            ONE,
+        ));
+    }
+    // ---- 6b. The cross-step transition argument (Remark 4): the fetch
+    // chain pc(0) = init, fetch(j+1) = TT[fetch(j), taken(j), halt(j)].
+    let a_rom_cs = pk.rom.a_rom;
+    let n_rows = 1usize << a_rom_cs;
+    let taken_col: Vec<Gf128> = trace
+        .records
+        .iter()
+        .map(|r| Gf128(r.branch_taken as u128))
+        .collect();
+    let halt_col: Vec<Gf128> = trace
+        .records
+        .iter()
+        .map(|r| Gf128(r.halted_latch as u128))
+        .collect();
+    let cs_spec = magnetar_memory::CrossStepSpec {
+        a: a_rom_cs,
+        n,
+        tt: pk.rom.tt.clone(),
+        next_pc_public,
+    };
+    let (cs_proof, cs_claims) =
+        magnetar_memory::prove_cross_step(&cs_spec, &wd.fetch_comp, &taken_col, &halt_col, t);
+    let _ = n_rows;
+
+    // The cross-step claims: the two fetch-component evaluations and the
+    // taken/halt flag bits at S1's cycle point.
+    {
+        let fetch_idx = pk.mosaic.index_of("fetch-ra").expect("component");
+        mosaic_claims.push(MosaicClaim::new(
+            fetch_idx,
+            cs_claims.s1_a.point.clone(),
+            cs_claims.s1_a.value,
+        ));
+        mosaic_claims.push(MosaicClaim::new(
+            fetch_idx,
+            cs_claims.s2_a.point.clone(),
+            cs_claims.s2_a.value,
+        ));
+        let flags_idx = pk.mosaic.index_of("seg-flags").expect("component");
+        let flag_pt = |flag: usize, r_j: &[Gf128]| -> Vec<Gf128> {
+            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((flag >> i) & 1) as u128)).collect();
+            v.extend_from_slice(r_j);
+            v
+        };
+        mosaic_claims.push(MosaicClaim::new(
+            flags_idx,
+            flag_pt(
+                magnetar_cpu::circuit::WITNESS_LAYOUT::F_TAKEN,
+                &cs_claims.r_j,
+            ),
+            cs_claims.taken_value,
+        ));
+        mosaic_claims.push(MosaicClaim::new(
+            flags_idx,
+            flag_pt(
+                magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT,
+                &cs_claims.r_j,
+            ),
+            cs_claims.halt_value,
+        ));
+    }
+
+    let inner = InnerProof {
         vs: vs_proof,
         reg_twist: reg_proof,
         reg_psi: [reg_psi[0].clone(), reg_psi[1].clone(), reg_psi[2].clone()],
@@ -937,6 +1127,86 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         bus_shout,
         sel_shift: sel_shift_proof,
         sel_store: sel_store_proof,
+        final_reg,
+        final_ram,
+        cross_step: cs_proof,
+    };
+    (inner, mosaic_claims)
+}
+
+/// Build one segment's witness and Mosaic component tables (pure — no
+/// transcript interaction, so the caller can commit before proving).
+pub fn build_segment(
+    pk: &KeyGen,
+    pub_in: &PublicInput,
+    trace: &magnetar_cpu::interp::Trace,
+) -> (WitnessData, Vec<Vec<bool>>) {
+    let wd = build_witness(pk, pub_in, trace);
+    let mut tables: Vec<Vec<bool>> = wd.direct_tables.clone();
+    for comp in wd.reg_wit.ports.iter().flat_map(|p| p.iter()) {
+        tables.push(comp.table.iter().map(|&v| v == ONE).collect());
+    }
+    tables.push(wd.reg_wit.inc.iter().map(|&v| v == ONE).collect());
+    for comp in wd.ram_wit.ports.iter().flat_map(|p| p.iter()) {
+        tables.push(comp.table.iter().map(|&v| v == ONE).collect());
+    }
+    tables.push(wd.ram_wit.inc.iter().map(|&v| v == ONE).collect());
+    tables.push(wd.fetch_comp.table.iter().map(|&v| v == ONE).collect());
+    (wd, tables)
+}
+
+/// The single-segment protocol (paper §5.5, Construction 3): execute,
+/// run steps 2–6, then commit and discharge once.
+pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
+    // ---- 1. Execute (padded to exactly `trace_len` cycles).
+    let mut trace = execute(&pk.program, &pub_in.input, pk.trace_len);
+    assert_eq!(
+        trace.final_state.output, pub_in.output,
+        "execution output mismatch"
+    );
+    assert!(trace.records.len() <= pk.trace_len, "trace exceeds bound");
+    magnetar_cpu::interp::pad_records(
+        &mut trace.records,
+        &mut trace.final_state,
+        &trace.program,
+        pk.trace_len,
+    );
+    assert_eq!(trace.records.len(), pk.trace_len);
+    let (wd, tables) = build_segment(pk, pub_in, &trace);
+    // ---- 2. Commit (the protocol's only commitment), then bind it into
+    // the transcript before any challenge is drawn.
+    let commitment: MosaicCommitment = commit_mosaic(&pk.pcs, &pk.mosaic, &tables);
+    let mut t = Transcript::new(
+        "magnetar",
+        &[
+            b"construction-3-v2",
+            &pk.program
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &pub_in
+                .input
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &pub_in.output.to_le_bytes(),
+        ],
+    );
+    t.absorb_digest("cm-g", &commitment.stmt.root);
+    assert!(
+        trace.final_state.halted,
+        "the execution must halt within the trace bound"
+    );
+    let (inner, mosaic_claims) = prove_inner(pk, pub_in, None, &trace, &wd, None, &mut t);
+    // ---- 7. Discharge.
+    let mosaic_proof = prove_mosaic(&pk.pcs, &pk.mosaic, &commitment, &mosaic_claims, &mut t);
+    Proof {
+        commitment_root: commitment.stmt.root,
+        pcs_n: commitment.stmt.n,
+        pcs_k: commitment.stmt.k,
+        pcs_domain: commitment.stmt.domain,
+        ell: commitment.ell,
+        inner,
         mosaic: mosaic_proof,
     }
 }
@@ -989,6 +1259,48 @@ fn selector_tables_from_trace(
         }
     }
     (lo, hi, st)
+}
+
+/// The public-point Mosaic claims of the boundary binding:
+/// * the fetch one-hot at cycle 0 at the public initial pc — value 1;
+/// * the halt flag bit at cycles 0 and T−1 — the public halt latches.
+pub fn boundary_point_claims(
+    mosaic: &MosaicLayout,
+    a_rom: usize,
+    n: usize,
+    st: &SegmentStatement,
+) -> Vec<MosaicClaim> {
+    let mut out = Vec::with_capacity(3);
+    // fetch-ra at (init pc, cycle 0) = 1.
+    let mut pt: Vec<Gf128> = (0..a_rom)
+        .map(|i| Gf128(((st.init.pc >> i) & 1) as u128))
+        .collect();
+    pt.extend(vec![ZERO; n]);
+    out.push(MosaicClaim::new(
+        mosaic.index_of("fetch-ra").expect("component"),
+        pt,
+        ONE,
+    ));
+    // The halt flag at cycles 0 and T−1. The 16 flag bits are 4 MLE
+    // variables (little-endian), so the selector for flag bit F_HALT is
+    // the **bits of F_HALT**, not the index comparison.
+    let halt = magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT;
+    let sel: Vec<Gf128> = (0..4).map(|i| Gf128(((halt >> i) & 1) as u128)).collect();
+    let mut pt0 = sel.clone();
+    pt0.extend(vec![ZERO; n]);
+    out.push(MosaicClaim::new(
+        mosaic.index_of("seg-flags").expect("component"),
+        pt0,
+        Gf128(st.init.halted as u128),
+    ));
+    let mut ptl = sel;
+    ptl.extend(vec![ONE; n]);
+    out.push(MosaicClaim::new(
+        mosaic.index_of("seg-flags").expect("component"),
+        ptl,
+        Gf128(st.final_.halted as u128),
+    ));
+    out
 }
 
 /// Collect every Mosaic claim (the same collection on both sides; the
@@ -1164,8 +1476,9 @@ fn collect_mosaic_claims(
         let [_, j_off, _, _, a_off] = store_layout.offsets();
         let r_j = store_terminal[j_off..j_off + n].to_vec();
         for k in 0..3usize {
-            let mut pt = vec![ZERO; 3];
-            pt[k] = ONE;
+            // The point selects the k-th bit COLUMN: the little-endian
+            // binary of k (a unit point e_k would select column 2^k).
+            let mut pt: Vec<Gf128> = (0..3).map(|i| Gf128(((k >> i) & 1) as u128)).collect();
             pt.extend_from_slice(&r_j);
             let r_ak = store_terminal[a_off + k];
             let value = store_router.offset_values[k] + ONE + r_ak;
@@ -1175,29 +1488,21 @@ fn collect_mosaic_claims(
     out
 }
 
-/// Verify a proof.
-pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<(), &'static str> {
+/// Replay steps 2–6 of one segment and derive its Mosaic claims. The
+/// mirror of [`prove_inner`]. The caller seeds the transcript and
+/// discharges the returned claims against the shared commitment.
+pub fn verify_inner(
+    vk: &VerifyingKey,
+    pub_in: &PublicInput,
+    stmt: Option<&SegmentStatement>,
+    inner: &InnerProof,
+    next_pc_public: Option<usize>,
+    t: &mut Transcript,
+) -> Result<Vec<MosaicClaim>, &'static str> {
     let q = vk.trace_len;
     let m = WITNESS_LAYOUT::M;
     let n = q.trailing_zeros() as usize;
     let a_rom = vk.rom.a_rom;
-    let mut t = Transcript::new(
-        "magnetar",
-        &[
-            b"construction-3-v2",
-            &vk.program
-                .iter()
-                .flat_map(|w| w.to_le_bytes())
-                .collect::<Vec<u8>>(),
-            &pub_in
-                .input
-                .iter()
-                .flat_map(|w| w.to_le_bytes())
-                .collect::<Vec<u8>>(),
-            &pub_in.output.to_le_bytes(),
-        ],
-    );
-    t.absorb_digest("cm-g", &proof.commitment_root);
     // The public x per cycle (the I/O binding).
     let public: Vec<Vec<Gf128>> = {
         let mut v = vec![ZERO; m / 2 - 1];
@@ -1219,7 +1524,7 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         c_fld: vk.circuit.c_fld.clone(),
     };
     // ---- 3. Virtual Spartan.
-    let seg_claims = verify_virtual_spartan(&rel, &vk.layout, q, &public, &proof.vs, &mut t)?;
+    let seg_claims = verify_virtual_spartan(&rel, &vk.layout, q, &public, &inner.vs, t)?;
     let seg = |name: &str| -> SegmentClaim {
         let i = vk.layout.index_of(name).expect("segment");
         seg_claims[i].clone()
@@ -1227,19 +1532,22 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
     let r_val: Vec<Gf128> = seg("rs1").r_local;
     let r_local3: Vec<Gf128> = seg("pc").r_local;
     let r_inst: Vec<Gf128> = seg("rs1").r_inst;
-    // ---- 4a. The register Twist.
+    // ---- 4a. The register Twist. The initial memory comes from the
+    // boundary statement when present.
     let reg_inst = TwistInstance {
         a: 6,
         ell: 6,
         n,
         p: 2,
-        m0: vec![ZERO; 1 << 12],
+        m0: stmt
+            .map(|st| st.init.reg_m0())
+            .unwrap_or_else(|| vec![ZERO; 1 << 12]),
         rv_claims: vec![seg("rs1").value, seg("rs2").value],
         wv_claim: seg("rd").value,
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
-    let reg_claims = verify_twist(&reg_inst, 1, &proof.reg_twist, &mut t)?;
+    let reg_claims = verify_twist(&reg_inst, 1, &inner.reg_twist, t)?;
     // The register-index Ψ-sum-checks.
     let positions = [
         WITNESS_LAYOUT::BUS_RS1,
@@ -1254,23 +1562,26 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
             n,
             &r_inst,
             &weights,
-            proof.reg_index_claims[s],
-            &proof.reg_psi[s],
+            inner.reg_index_claims[s],
+            &inner.reg_psi[s],
             &format!("reg-psi-{s}"),
-            &mut t,
+            t,
         )?;
     }
     // ---- 4b. The RAM Twist.
-    let ram_m0: Vec<Gf128> = {
-        let mut t0 = vec![ZERO; 1usize << 14];
-        for (k, &w) in pub_in.input.iter().enumerate() {
-            if k < (1usize << 8) {
-                for o in 0..64usize {
-                    t0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
+    let ram_m0: Vec<Gf128> = match stmt {
+        Some(st) => st.init.ram_m0(),
+        None => {
+            let mut t0 = vec![ZERO; 1usize << 14];
+            for (k, &w) in pub_in.input.iter().enumerate() {
+                if k < (1usize << 8) {
+                    for o in 0..64usize {
+                        t0[k | (o << 8)] = Gf128(((w >> o) & 1) as u128);
+                    }
                 }
             }
+            t0
         }
-        t0
     };
     let ram_inst = TwistInstance {
         a: 8,
@@ -1279,11 +1590,11 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         p: 1,
         m0: ram_m0,
         rv_claims: vec![seg("load-val").value],
-        wv_claim: proof.ram_wv_claim,
+        wv_claim: inner.ram_wv_claim,
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
-    let ram_claims = verify_twist(&ram_inst, 1, &proof.ram_twist, &mut t)?;
+    let ram_claims = verify_twist(&ram_inst, 1, &inner.ram_twist, t)?;
     // The RAM address Ψ-sum-checks — the claims must equal the ram-addr
     // segment's VS claim (the eq identity; a single eq-folded claim
     // avoids the combination leak).
@@ -1296,21 +1607,21 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
             n,
             &r_inst,
             &weights,
-            proof.ram_addr_claims[s],
-            &proof.ram_psi[s],
+            inner.ram_addr_claims[s],
+            &inner.ram_psi[s],
             &format!("ram-psi-{s}"),
-            &mut t,
+            t,
         )?;
-        if proof.ram_addr_claims[s] != v_ramaddr {
+        if inner.ram_addr_claims[s] != v_ramaddr {
             return Err("ram: address claim does not match the segment");
         }
     }
     // The Inc point and claim.
     let inc_point: Vec<Gf128> = t.challenge_field_vec("ram-inc-point", 6 + n);
-    if inc_point != proof.inc_point {
+    if inc_point != inner.inc_point {
         return Err("ram: inc point mismatch");
     }
-    t.absorb_field("ram-inc-claim", &[proof.inc_claim]);
+    t.absorb_field("ram-inc-claim", &[inner.inc_claim]);
     // ---- 5a. The shift router.
     let (_, o_v, u_v, h_v) = vk.shift_tensor.clone();
     let shift_layout = RoutingLayout {
@@ -1321,8 +1632,8 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         a_vars: 0,
     };
     let shift_r_pub = {
-        let [_, _j_off, u_off, h_off, _] = shift_layout.offsets();
-        let mut active = (0..o_v).collect::<Vec<usize>>();
+        let [o_off, _j_off, u_off, h_off, _] = shift_layout.offsets();
+        let mut active = (0..o_v).map(|i| o_off + i).collect::<Vec<usize>>();
         active.extend(u_off..u_off + u_v);
         active.extend(h_off..h_off + h_v);
         PaddedTableFactor::new(vk.shift_tensor.0.clone(), active, shift_layout.joint_vars())
@@ -1335,8 +1646,8 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         &shift_r_pub,
         2,
         0,
-        &proof.shift_router,
-        &mut t,
+        &inner.shift_router,
+        t,
     )?;
     // ---- 5b. The store router.
     let (o_vs, u_vs, h_vs, a_vs) = (
@@ -1353,24 +1664,24 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         a_vars: a_vs,
     };
     let store_r_pub = {
-        let [_, _j_off, u_off, h_off, a_off] = store_layout.offsets();
-        let mut active = (0..o_vs).collect::<Vec<usize>>();
+        let [o_off, _j_off, u_off, h_off, a_off] = store_layout.offsets();
+        let mut active = (0..o_vs).map(|i| o_off + i).collect::<Vec<usize>>();
         active.extend(u_off..u_off + u_vs);
         active.extend(h_off..h_off + h_vs);
         active.extend(a_off..a_off + a_vs);
         PaddedTableFactor::new(vk.store_tensor.0.clone(), active, store_layout.joint_vars())
     };
-    let (r_inc_o, r_inc_j) = proof.inc_point.split_at(6);
+    let (r_inc_o, r_inc_j) = inner.inc_point.split_at(6);
     let store_claims = verify_routing(
         &store_layout,
-        proof.inc_claim,
+        inner.inc_claim,
         r_inc_o,
         r_inc_j,
         &store_r_pub,
         1,
         3,
-        &proof.store_router,
-        &mut t,
+        &inner.store_router,
+        t,
     )?;
     // The store X split: (1 + r_u[top])·v_old + r_u[top]·v_src == the X
     // claim, at the *replayed* terminal point.
@@ -1378,12 +1689,12 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         let x_pt = store_claims.x_point(&store_layout);
         let w_old = ONE + x_pt[u_vs - 1];
         let w_src = x_pt[u_vs - 1];
-        let combo = mul(w_old, proof.store_x_claims[0]) + mul(w_src, proof.store_x_claims[1]);
+        let combo = mul(w_old, inner.store_x_claims[0]) + mul(w_src, inner.store_x_claims[1]);
         if combo != store_claims.x_value {
             return Err("store: X split mismatch");
         }
     }
-    t.absorb_field("store-x", &proof.store_x_claims);
+    t.absorb_field("store-x", &inner.store_x_claims);
     // ---- 6. BinaryShout for the bytecode.
     let bus_spec = BusShoutSpec {
         a: a_rom,
@@ -1392,16 +1703,16 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         rom_bus: vk.rom.bus.clone(),
         bus_claim: seg("fetch").value,
         index_claims: vec![
-            (WITNESS_LAYOUT::BUS_RS1, 6, proof.reg_index_claims[0]),
-            (WITNESS_LAYOUT::BUS_RS2, 6, proof.reg_index_claims[1]),
-            (WITNESS_LAYOUT::BUS_RD, 6, proof.reg_index_claims[2]),
+            (WITNESS_LAYOUT::BUS_RS1, 6, inner.reg_index_claims[0]),
+            (WITNESS_LAYOUT::BUS_RS2, 6, inner.reg_index_claims[1]),
+            (WITNESS_LAYOUT::BUS_RD, 6, inner.reg_index_claims[2]),
         ],
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
         pc_r_local: r_local3.clone(),
         pc_claim: seg("pc").value,
     };
-    let bus_claims = verify_bus_shout(&bus_spec, 1, &proof.bus_shout, &mut t)?;
+    let bus_claims = verify_bus_shout(&bus_spec, 1, &inner.bus_shout, t)?;
     // The selector checks.
     let sel_shift = {
         let [_, j_off, _, h_off, _] = shift_layout.offsets();
@@ -1414,21 +1725,20 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
                 SelectorCheckSpec {
                     h_vars: vk.amount_bits,
                     r_h: shift_claims.r_joint[h_off..h_off + vk.amount_bits].to_vec(),
-                    claim: proof.shift_router.q_values[0],
+                    claim: inner.shift_router.q_values[0],
                     rom_sel: vk.rom.sel_lo.clone(),
                 },
                 SelectorCheckSpec {
                     h_vars: 2,
                     r_h: shift_claims.r_joint[h_off + vk.amount_bits..h_off + vk.amount_bits + 2]
                         .to_vec(),
-                    claim: proof.shift_router.q_values[1],
+                    claim: inner.shift_router.q_values[1],
                     rom_sel: vk.rom.sel_hi.clone(),
                 },
             ],
         }
     };
-    let sel_shift_claims =
-        verify_selector_shout(&sel_shift, 1, &proof.sel_shift, "sel-shift", &mut t)?;
+    let sel_shift_claims = verify_selector_shout(&sel_shift, 1, &inner.sel_shift, "sel-shift", t)?;
     let sel_store = {
         let [_, j_off, _, h_off, _] = store_layout.offsets();
         let r_j = store_claims.r_joint[j_off..j_off + n].to_vec();
@@ -1439,34 +1749,176 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
             factors: vec![SelectorCheckSpec {
                 h_vars: h_vs,
                 r_h: store_claims.r_joint[h_off..h_off + h_vs].to_vec(),
-                claim: proof.store_router.q_values[0],
+                claim: inner.store_router.q_values[0],
                 rom_sel: vk.rom.sel_st.clone(),
             }],
         }
     };
-    let sel_store_claims =
-        verify_selector_shout(&sel_store, 1, &proof.sel_store, "sel-store", &mut t)?;
+    let sel_store_claims = verify_selector_shout(&sel_store, 1, &inner.sel_store, "sel-store", t)?;
     // ---- 7. MosaicPCS.
-    let mosaic_claims = collect_mosaic_claims(
+    let mut mosaic_claims = collect_mosaic_claims(
         &vk.layout,
         &vk.mosaic,
         n,
         &seg_claims,
         &reg_claims,
         &ram_claims,
-        &proof.inc_point,
-        proof.inc_claim,
+        &inner.inc_point,
+        inner.inc_claim,
         &bus_claims,
         &sel_shift_claims,
         &sel_store_claims,
         &shift_layout,
-        &proof.shift_router,
+        &inner.shift_router,
         &shift_claims.r_joint,
         &store_layout,
-        &proof.store_router,
+        &inner.store_router,
         &store_claims.r_joint,
-        &proof.store_x_claims,
+        &inner.store_x_claims,
     );
+    // ---- 8. The Remark-4 boundary bindings (segments only).
+    if let Some(st) = stmt {
+        let inner_ref = inner;
+        let reg_fs = magnetar_memory::FinalStateInstance {
+            a: 6,
+            ell: 6,
+            n,
+            m0: st.init.reg_m0(),
+            pub_final: st.final_.reg_m0(),
+        };
+        let reg_fs_claims = magnetar_memory::verify_final_state(
+            &reg_fs,
+            inner_ref.final_reg.as_ref().expect("reg binding"),
+            t,
+        )?;
+        let ram_fs = magnetar_memory::FinalStateInstance {
+            a: 8,
+            ell: 6,
+            n,
+            m0: st.init.ram_m0(),
+            pub_final: st.final_.ram_m0(),
+        };
+        let ram_fs_claims = magnetar_memory::verify_final_state(
+            &ram_fs,
+            inner_ref.final_ram.as_ref().expect("ram binding"),
+            t,
+        )?;
+        for (name, claims) in [
+            ("reg-wfa", &reg_fs_claims),
+            ("ram-ra-write", &ram_fs_claims),
+        ] {
+            let comp = vk.mosaic.index_of(name).expect("component");
+            let (pt, v) = &claims.component_points[0];
+            mosaic_claims.push(MosaicClaim::new(comp, pt.clone(), *v));
+            let idx_inc = vk
+                .mosaic
+                .index_of(if name == "reg-wfa" {
+                    "reg-inc"
+                } else {
+                    "ram-inc"
+                })
+                .expect("component");
+            let (ipt, iv) = &claims.inc_point;
+            mosaic_claims.push(MosaicClaim::new(idx_inc, ipt.clone(), *iv));
+        }
+        for c in boundary_point_claims(&vk.mosaic, a_rom, n, st) {
+            mosaic_claims.push(c);
+        }
+    } else {
+        // The single-segment shape: the initial pc and the final halt.
+        let zero_pt: Vec<Gf128> = vec![ZERO; a_rom + n];
+        mosaic_claims.push(MosaicClaim::new(
+            vk.mosaic.index_of("fetch-ra").expect("component"),
+            zero_pt,
+            ONE,
+        ));
+        let halt_sel: Vec<Gf128> = {
+            let h = magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT;
+            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((h >> i) & 1) as u128)).collect();
+            v.extend(vec![ONE; n]);
+            v
+        };
+        mosaic_claims.push(MosaicClaim::new(
+            vk.mosaic.index_of("seg-flags").expect("component"),
+            halt_sel,
+            ONE,
+        ));
+    }
+    // ---- 6b. The cross-step transition argument.
+    let cs_spec = magnetar_memory::CrossStepSpec {
+        a: vk.rom.a_rom,
+        n,
+        tt: vk.rom.tt.clone(),
+        next_pc_public,
+    };
+    let cs_claims = magnetar_memory::verify_cross_step(
+        &cs_spec,
+        vk.rom.a_rom,
+        n,
+        ZERO,
+        ZERO,
+        &inner.cross_step,
+        t,
+    )?;
+    {
+        let fetch_idx = vk.mosaic.index_of("fetch-ra").expect("component");
+        mosaic_claims.push(MosaicClaim::new(
+            fetch_idx,
+            cs_claims.s1_a.point.clone(),
+            cs_claims.s1_a.value,
+        ));
+        mosaic_claims.push(MosaicClaim::new(
+            fetch_idx,
+            cs_claims.s2_a.point.clone(),
+            cs_claims.s2_a.value,
+        ));
+        let flags_idx = vk.mosaic.index_of("seg-flags").expect("component");
+        let flag_pt = |flag: usize, r_j: &[Gf128]| -> Vec<Gf128> {
+            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((flag >> i) & 1) as u128)).collect();
+            v.extend_from_slice(r_j);
+            v
+        };
+        mosaic_claims.push(MosaicClaim::new(
+            flags_idx,
+            flag_pt(
+                magnetar_cpu::circuit::WITNESS_LAYOUT::F_TAKEN,
+                &cs_claims.r_j,
+            ),
+            cs_claims.taken_value,
+        ));
+        mosaic_claims.push(MosaicClaim::new(
+            flags_idx,
+            flag_pt(
+                magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT,
+                &cs_claims.r_j,
+            ),
+            cs_claims.halt_value,
+        ));
+    }
+
+    Ok(mosaic_claims)
+}
+
+/// Verify a single-segment proof.
+pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<(), &'static str> {
+    let mut t = Transcript::new(
+        "magnetar",
+        &[
+            b"construction-3-v2",
+            &vk.program
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &pub_in
+                .input
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            &pub_in.output.to_le_bytes(),
+        ],
+    );
+    t.absorb_digest("cm-g", &proof.commitment_root);
+    let mosaic_claims = verify_inner(vk, pub_in, None, &proof.inner, None, &mut t)?;
     let cm_stmt = magnetar_pcs::PcsStatement {
         root: proof.commitment_root,
         n: proof.pcs_n,
@@ -1621,46 +2073,46 @@ mod tests {
         );
         // 2. A VS terminal.
         let mut p = proof.clone();
-        p.vs.terminals[0] += ONE;
+        p.inner.vs.terminals[0] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered vs terminal");
         // 3. A VS segment value (breaks Equation (1)).
         let mut p = proof.clone();
-        p.vs.segment_values[0] += ONE;
+        p.inner.vs.segment_values[0] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered segment value");
         // 4. A register-index claim (breaks the bytecode Shout).
         let mut p = proof.clone();
-        p.reg_index_claims[0] += ONE;
+        p.inner.reg_index_claims[0] += ONE;
         assert!(
             verify(&vk, &pub_in, &p).is_err(),
             "tampered reg index claim"
         );
         // 5. The RAM address claim (breaks the segment identity).
         let mut p = proof.clone();
-        p.ram_addr_claims[0] += ONE;
+        p.inner.ram_addr_claims[0] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered ram addr claim");
         // 6. The Inc claim (breaks the store router's output).
         let mut p = proof.clone();
-        p.inc_claim += ONE;
+        p.inner.inc_claim += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered inc claim");
         // 7. A shift router round.
         let mut p = proof.clone();
-        p.shift_router.rounds[0][1] += ONE;
+        p.inner.shift_router.rounds[0][1] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered shift router");
         // 8. A store router round.
         let mut p = proof.clone();
-        p.store_router.rounds[0][1] += ONE;
+        p.inner.store_router.rounds[0][1] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered store router");
         // 9. The store X split claim.
         let mut p = proof.clone();
-        p.store_x_claims[0] += ONE;
+        p.inner.store_x_claims[0] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered store X");
         // 10. The bus Shout's Φ round.
         let mut p = proof.clone();
-        p.bus_shout.phi_rounds[0][1] += ONE;
+        p.inner.bus_shout.phi_rounds[0][1] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered bus shout");
         // 11. A selector round.
         let mut p = proof.clone();
-        p.sel_shift.per_factor[0].rounds[0][1] += ONE;
+        p.inner.sel_shift.per_factor[0].rounds[0][1] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered selector");
         // 12. The commitment root.
         let mut p = proof.clone();
@@ -1668,15 +2120,146 @@ mod tests {
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered commitment");
         // 13. The RAM write-value claim.
         let mut p = proof.clone();
-        p.ram_wv_claim += ONE;
+        p.inner.ram_wv_claim += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered ram wv");
         // 14. A register Twist read round.
         let mut p = proof.clone();
-        p.reg_twist.read_runs[0].rounds[0][1] += ONE;
+        p.inner.reg_twist.read_runs[0].rounds[0][1] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered reg twist");
         // 15. A register Ψ round.
         let mut p = proof.clone();
-        p.reg_psi[0].rounds[0][1] += ONE;
+        p.inner.reg_psi[0].rounds[0][1] += ONE;
         assert!(verify(&vk, &pub_in, &p).is_err(), "tampered reg psi");
+    }
+}
+
+#[cfg(test)]
+mod cross_step_tests {
+    use super::*;
+
+    fn enc_i(imm: u32, rs1: u32, funct3: u32, rd: u32, op: u32) -> u32 {
+        ((imm & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | op
+    }
+
+    fn enc_b(imm: i32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
+        let imm = imm as u32;
+        (((imm >> 12) & 1) << 31)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | ((imm >> 1) & 0xf) << 8
+            | (((imm >> 11) & 1) << 7)
+            | 0x63
+    }
+
+    /// A jumped-pc trace: swap two order-independent instructions — the
+    /// memory arguments stay consistent but the cross-step chain breaks.
+    #[test]
+    fn tamper_jumped_pc_rejected() {
+        // addi x1, x0, 1; addi x2, x0, 2; addi x3, x0, 3; ecall.
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(2, 0, 0, 2, 0x13),
+            enc_i(3, 0, 0, 3, 0x13),
+            0x0000_0073,
+        ];
+        let (pk, vk) = keygen(program.clone(), 8);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: 0,
+        };
+        // The honest proof.
+        let honest = prove(&pk, &pub_in);
+        assert!(verify(&vk, &pub_in, &honest).is_ok());
+        // The jumped trace: swap records 1 and 2 (fetch order 0, 2, 1, 3).
+        let mut trace = execute(&pk.program, &pub_in.input, pk.trace_len);
+        magnetar_cpu::interp::pad_records(
+            &mut trace.records,
+            &mut trace.final_state,
+            &trace.program,
+            pk.trace_len,
+        );
+        trace.records.swap(1, 2);
+        let (wd, tables) = build_segment(&pk, &pub_in, &trace);
+        let mut t = Transcript::new(
+            "magnetar",
+            &[
+                b"construction-3-v2",
+                &pk.program
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                &pub_in
+                    .input
+                    .iter()
+                    .flat_map(|w| w.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                &pub_in.output.to_le_bytes(),
+            ],
+        );
+        let commitment = commit_mosaic(&pk.pcs, &pk.mosaic, &tables);
+        t.absorb_digest("cm-g", &commitment.stmt.root);
+        let (inner, mosaic_claims) = prove_inner(&pk, &pub_in, None, &trace, &wd, None, &mut t);
+        let mosaic_proof = prove_mosaic(&pk.pcs, &pk.mosaic, &commitment, &mosaic_claims, &mut t);
+        let proof = Proof {
+            commitment_root: commitment.stmt.root,
+            pcs_n: commitment.stmt.n,
+            pcs_k: commitment.stmt.k,
+            pcs_domain: commitment.stmt.domain,
+            ell: commitment.ell,
+            inner,
+            mosaic: mosaic_proof,
+        };
+        assert!(
+            verify(&vk, &pub_in, &proof).is_err(),
+            "a jumped pc must be rejected by the cross-step argument"
+        );
+    }
+
+    /// A branch program: the honest proof verifies, and a tampered
+    /// cross-step round is rejected.
+    #[test]
+    fn tamper_branch_cross_step_rejected() {
+        // li x1, 1; beq x0, x0, +8 (skip one); addi x2, x0, 99; addi x10, x0, 5;
+        // ecall → output 5.
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),  // addi x1, x0, 1
+            enc_b(8, 0, 0, 0),        // beq x0, x0, +8 → the addi x10
+            enc_i(99, 0, 0, 2, 0x13), // addi x2, x0, 99 (skipped)
+            enc_i(5, 0, 0, 10, 0x13), // addi x10, x0, 5
+            0x0000_0073,
+        ];
+        let (pk, vk) = keygen(program.clone(), 8);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: 5,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert!(verify(&vk, &pub_in, &proof).is_ok());
+        // A tampered cross-step round.
+        let mut p = proof.clone();
+        p.inner.cross_step.s1_rounds[0][1] += ONE;
+        assert!(verify(&vk, &pub_in, &p).is_err());
+        // A tampered taken-link claim.
+        let mut p = proof.clone();
+        p.inner.cross_step.s1_link_claims[0] += ONE;
+        assert!(verify(&vk, &pub_in, &p).is_err());
+        // A tampered S2 claim.
+        let mut p = proof.clone();
+        p.inner.cross_step.s2_a_claim += ONE;
+        assert!(verify(&vk, &pub_in, &p).is_err());
+    }
+
+    /// JALR is rejected at keygen (the static transition table).
+    #[test]
+    #[should_panic(expected = "JALR")]
+    fn jalr_rejected_at_keygen() {
+        let program = vec![
+            enc_i(4, 0, 0, 1, 0x13), // addi x1, x0, 4
+            (1 << 15) | 0x67,        // jalr x0, 0(x1)
+            0x0000_0073,
+        ];
+        let _ = keygen(program, 8);
     }
 }

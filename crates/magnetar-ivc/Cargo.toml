@@ -1,0 +1,17 @@
+[package]
+name = "magnetar-ivc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tree-IVC for Magnetar: segment proofs sharing one MosaicPCS commitment, with claim-batching at the tree's internal nodes."
+
+[dependencies]
+magnetar-field = { workspace = true }
+magnetar-hash = { workspace = true }
+magnetar-cpu = { workspace = true }
+magnetar-zkvm = { workspace = true }
+magnetar-pcs = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
