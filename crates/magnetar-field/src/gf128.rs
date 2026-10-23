@@ -47,6 +47,7 @@ impl<'a> std::iter::Sum<&'a Gf128> for Gf128 {
     }
 }
 
+#[allow(clippy::suspicious_arithmetic_impl)] // XOR is the characteristic-two +
 impl std::ops::Add for Gf128 {
     type Output = Gf128;
     #[inline(always)]

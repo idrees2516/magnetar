@@ -29,6 +29,8 @@ The reference is the Magnetar paper (eprint 2026-2423). Sections marked
 | Construction 3, all seven steps, end-to-end | §5.5 | `magnetar-zkvm::protocol` | fibonacci, load/store, sub-word, shift, hot-cell; 15+ tamper classes |
 | **Cross-step constraints** (the Remark-4 mechanism: the next-fetch transition argument + the flag-derivation constraints + the ECALL output binding) | §5.5 / Rmk 4 | `magnetar-memory::cross_step`, `magnetar-cpu::circuit` | jumped-pc, fake-halt, fake-taken, wrong-output tampers |
 | **Tree-IVC with shared commitments** (segments share one MosaicPCS commitment; boundary chaining via Remark-4 bindings; claim batching at the root) | roadmap §8.2 | `magnetar-ivc` | 1/4/8-segment roundtrips; 11 tamper classes |
+| **The streaming, parallel tree-IVC prover** (checkpointed trace replay, rayon segment parallelism, tables packed directly into the commitment leaves, byte-identical proofs) | §1.3 (the IVC layer) | `magnetar-ivc::streaming` | byte-equality vs. the sequential prover on 1/2/4 segments; record-level replay equality; tamper classes |
+| **The parallelism rulebook + kernels** (R1–R10: rayon Merkle/encode/sum-check/join/segments, thresholds, batching, caching) | engineering | `docs/PERFORMANCE.md`, the crates' kernels | `par_bind_matches_seq`, `pack_tables_matches_assemble_and_pack`, `join_matches_sparse_prover` |
 | Proof-size instrumentation (committed-bit inventory, per-component bytes) | roadmap §7 | `magnetar-zkvm::stats` | CLI smoke |
 
 ## Explicitly not implemented
@@ -59,14 +61,23 @@ No recursive composition. The verifying key's verifier work is measured
 verifier-as-guest wrap, which is the roadmap's approach.
 
 ### 4. GPU acceleration — roadmap H3
-Single-threaded CPU throughout. The prover's hot loops (the sum-check
-folding, the join enumeration, the Merkle hashing) are embarrassingly
-parallel across cube halves; no CUDA/OpenCL backend exists.
+CPU only. The prover's kernels are rayon-parallel across cores (the
+sum-check folds, the join enumeration, the Merkle hashing, the codeword
+encode, the tree-IVC segments — docs/PERFORMANCE.md); no CUDA/OpenCL
+backend exists.
 
-### 5. Streaming / small-space proving — roadmap H2
-All provers materialize their tables (the sparse prover keeps factors in
-their own spaces, which is already the memory-lean shape, but nothing
-streams). The paper's streaming sum-check (§1.3) is not implemented.
+### 5. Streaming — partially implemented (the paper's §1.3 sum-check
+### provers are not)
+**Implemented** — the tree-IVC layer now streams: the trace never
+resides (checkpointed `StreamCursor` replay), segments prove in parallel
+with their tables packed straight into the shared commitment leaves and
+dropped, and the commitment path never materializes the boolean union
+(`magnetar-ivc::streaming`, byte-identical to the sequential prover,
+tested on 1/2/4 segments). **Not implemented** — the per-segment
+Twist/Shout/Spartan provers still materialize their dense tables; the
+paper's linear-in-T per-cycle provers are the remaining work (they are
+also what unlocks the parallel speedup — the measured segment workers
+are memory-bandwidth-bound, docs/BENCHMARKS.md).
 
 ### 6. Production-scale parameters
 Test-scale configuration throughout: RAM = 2^8 words, registers padded to

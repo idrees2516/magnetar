@@ -37,7 +37,7 @@
 //! messages and terminal claims are bit-identical to the sparse prover's
 //! at the same layout (cross-validated by `join_matches_sparse_prover`).
 
-use crate::{RoutingLayout, RouterProof};
+use crate::{RouterProof, RoutingLayout};
 use magnetar_field::{bind_var, mul, par_bind_var, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
 use rayon::prelude::*;
@@ -330,7 +330,10 @@ pub fn prove_routing_join(
                         for m in (k + 1)..a_v {
                             l = mul(
                                 l,
-                                eqb(Gf128(witness.offset_bits[m][j] as u128), (r >> (m - k - 1)) & 1 == 1),
+                                eqb(
+                                    Gf128(witness.offset_bits[m][j] as u128),
+                                    (r >> (m - k - 1)) & 1 == 1,
+                                ),
                             );
                         }
                         p[0] += mul(l, col.tau[r << 1]);
@@ -630,7 +633,7 @@ pub fn prove_routing_join(
                 let mut local = zero_coeffs();
                 for m in idxs {
                     let i = m << 1; // the pair base (j_k = 0 / 1).
-                    // Per column: s_fin · Π_f (f0 + (f0 + f1)·t).
+                                    // Per column: s_fin · Π_f (f0 + (f0 + f1)·t).
                     let mut poly = [ZERO; MAXC];
                     poly[0] = s_fin;
                     let mut deg = 0usize;

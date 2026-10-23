@@ -11,6 +11,7 @@ name = "magnetar"
 path = "src/main.rs"
 
 [dependencies]
+rayon = { workspace = true }
 magnetar-pcs = { workspace = true }
 magnetar-field = { workspace = true }
 magnetar-ivc = { workspace = true }

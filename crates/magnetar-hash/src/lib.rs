@@ -20,9 +20,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use blake3::Hasher as Blake3Hasher;
+use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
 use std::io::Write;
-use rayon::prelude::*;
 
 /// Digest size used throughout (256-bit → 128-bit collision resistance,
 /// comfortably above the paper's 120-bit target).

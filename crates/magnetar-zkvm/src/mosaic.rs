@@ -445,7 +445,7 @@ mod pack_tests {
         // small ones, and a trailing hole (planes beyond the union stay
         // zero).
         let comps: Vec<(usize, usize)> = vec![
-            (10, 6),  // 2^16 bits
+            (10, 6), // 2^16 bits
             (10, 6),
             (10, 4),
             (10, 3),
@@ -463,7 +463,11 @@ mod pack_tests {
         );
         let tables: Vec<Vec<bool>> = comps
             .iter()
-            .map(|(n, v)| (0..(1usize << (n + v))).map(|_| rng.gen::<bool>()).collect())
+            .map(|(n, v)| {
+                (0..(1usize << (n + v)))
+                    .map(|_| rng.gen::<bool>())
+                    .collect()
+            })
             .collect();
         // Reference: assemble + pack.
         let bits = assemble_g(&layout, &tables);

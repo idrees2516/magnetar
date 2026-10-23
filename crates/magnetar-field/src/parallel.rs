@@ -44,17 +44,19 @@ pub fn par_bind_var(table: &mut Vec<Gf128>, var: usize, r: Gf128) {
     let mut out = vec![Gf128(0); out_len];
     let src = table.as_slice();
     let step = PAR_CHUNK.min(out_len);
-    out.par_chunks_mut(step).enumerate().for_each(|(ci, chunk)| {
-        let start = ci * step;
-        for (rel, o) in chunk.iter_mut().enumerate() {
-            let k = start + rel;
-            // Source pair: k with a hole at bit `var` (bit=0 / bit=1).
-            let lo = insert_bit(k, var, false);
-            let a = src[lo];
-            let b = src[lo | block];
-            *o = a + mul(r, a + b);
-        }
-    });
+    out.par_chunks_mut(step)
+        .enumerate()
+        .for_each(|(ci, chunk)| {
+            let start = ci * step;
+            for (rel, o) in chunk.iter_mut().enumerate() {
+                let k = start + rel;
+                // Source pair: k with a hole at bit `var` (bit=0 / bit=1).
+                let lo = insert_bit(k, var, false);
+                let a = src[lo];
+                let b = src[lo | block];
+                *o = a + mul(r, a + b);
+            }
+        });
     *table = out;
 }
 

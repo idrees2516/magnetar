@@ -80,14 +80,36 @@ computation of the same table is a defect.
 `O(T)`-per-cycle materializations are forbidden where a linear pass
 suffices:
 - witness generation uses **checkpoints** (state snapshots every `C`
-  cycles) so any chunk regenerates on demand and in parallel;
-- the Twist value histories are maintained **incrementally**
-  (eq-weighted memory updates, O(L) per cycle);
-- commitments pack and hash in streaming chunk order.
+  cycles) so any chunk regenerates on demand and in parallel —
+  realized: `magnetar-cpu::StreamCursor` + `magnetar-ivc::streaming`
+  (the trace never resides; segment replay is byte-identical, tested);
+- commitments pack and hash in streaming chunk order — realized:
+  `pack_tables`/`pack_tables_slice` write the Mosaic leaves directly
+  from the component tables (no boolean union, ~16x less commitment
+  memory) and per-segment packs compose into the shared vector;
+- the per-segment witness tables live only in flight: each parallel
+  worker packs its tables into the shared leaves and drops them
+  immediately (the in-flight bound is one segment per worker,
+  measured in `StreamingStats`).
 
-The only per-cycle storage kept for a whole proof run is per-column
-scalars/vectors (`≤ L·T` field elements). Peak prover memory is a
-tracked metric (docs/BENCHMARKS.md) — a regression is a bug.
+The remaining violation is the dense Twist/Shout/Spartan provers
+(the roadmap's linear-in-T versions are the fix); everything the IVC
+layer owns streams. The only per-cycle storage kept for a whole proof
+run is per-column scalars/vectors. Peak prover memory is a tracked
+metric (`StreamingStats::peak_rss_bytes`, docs/BENCHMARKS.md) — a
+regression is a bug.
+
+## R7.1 — Parallel scheduling of independent Fiat–Shamir work
+
+Tree-IVC segments are independent arguments (own transcript, shared
+commitment): prove them with `into_par_iter` over segments — never
+sequentially. Workers must not share mutable state; the one exception
+in this stack is the shared packed-leaf vector, whose per-segment
+OR-packs overlap in leaf words (different bit-planes of the same
+`u128`), so the packs serialize under a coarse mutex — the pack is
+O(leaves) against O(leaves·polylog) of proving, measured negligible.
+Worker diagnostics: `MAGNETAR_TRACE_WORKERS=1` prints per-segment
+thread, duration, and start offset.
 
 ## R8 — No false sharing, no shared mutable state
 

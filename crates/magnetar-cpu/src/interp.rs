@@ -163,7 +163,7 @@ pub fn pad_records(
         records.push(frozen_record(st, prog, last_pc));
         // The frozen record is a fixed point of the transition (next_pc =
         // frozen), so the chain is stable from here on.
-        last_pc = last_pc % prog.rows.len();
+        last_pc %= prog.rows.len();
     }
 }
 
@@ -228,21 +228,14 @@ impl StreamCursor {
                 st.ram[i] = w;
             }
         }
-        StreamCursor {
-            st,
-            next_fetch: 0,
-        }
+        StreamCursor { st, next_fetch: 0 }
     }
 
     /// Run exactly `seg_len` cycles: live `step`s while the machine runs,
     /// halt-latch padding once halted (the same record shapes as
     /// `pad_records`, chained across calls through `next_fetch`). The
     /// state advances in place; records never exceed this segment.
-    pub fn run_segment(
-        &mut self,
-        prog: &ExpandedProgram,
-        seg_len: usize,
-    ) -> Vec<CycleRecord> {
+    pub fn run_segment(&mut self, prog: &ExpandedProgram, seg_len: usize) -> Vec<CycleRecord> {
         let mut records = Vec::with_capacity(seg_len);
         while records.len() < seg_len {
             if !self.st.halted {

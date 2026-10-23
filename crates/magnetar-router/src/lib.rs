@@ -683,11 +683,7 @@ mod tests {
         };
         // Per-variable offset bits for the join witness: bits[k][j].
         let off_bools: Vec<Vec<bool>> = (0..3)
-            .map(|k| {
-                (0..cycles)
-                    .map(|j| off_bits[k + j * 3] == ONE)
-                    .collect()
-            })
+            .map(|k| (0..cycles).map(|j| off_bits[k + j * 3] == ONE).collect())
             .collect();
         let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, a_vars);
         let sels = vec![SelCol {
@@ -858,11 +854,7 @@ mod tests {
         let sparse = prove_routing(&layout, claim, &r_o, &r_j, &r_pub, &dense, 1, &mut t1);
         // Join proof.
         let off_bools: Vec<Vec<bool>> = (0..3)
-            .map(|k| {
-                (0..cycles)
-                    .map(|j| off_bits[k + j * 3] == ONE)
-                    .collect()
-            })
+            .map(|k| (0..cycles).map(|j| off_bits[k + j * 3] == ONE).collect())
             .collect();
         let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, a_vars);
         let sels = vec![SelCol {

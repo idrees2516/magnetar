@@ -99,18 +99,20 @@ impl SumcheckProver {
                 let target = (out_len / (threads * 4)).clamp(block, out_len);
                 let task = target.next_multiple_of(block).clamp(block, out_len);
                 let mut buf = vec![ZERO; out_len];
-                buf.par_chunks_mut(task).enumerate().for_each(|(ci, ochunk)| {
-                    let groups = ochunk.len() / block;
-                    let gi0 = (ci * task) / block;
-                    for g in 0..groups {
-                        let base = (gi0 + g) * 2 * block;
-                        for j in 0..block {
-                            let a = table[base + j];
-                            let t1 = table[(base + j) | block];
-                            ochunk[g * block + j] = a + mul(x, a + t1);
+                buf.par_chunks_mut(task)
+                    .enumerate()
+                    .for_each(|(ci, ochunk)| {
+                        let groups = ochunk.len() / block;
+                        let gi0 = (ci * task) / block;
+                        for g in 0..groups {
+                            let base = (gi0 + g) * 2 * block;
+                            for j in 0..block {
+                                let a = table[base + j];
+                                let t1 = table[(base + j) | block];
+                                ochunk[g * block + j] = a + mul(x, a + t1);
+                            }
                         }
-                    }
-                });
+                    });
                 buf
             } else {
                 let mut out = Vec::with_capacity(out_len);

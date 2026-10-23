@@ -163,7 +163,14 @@ fn streaming_matches_sequential() {
     let output = 49u64;
     for segments in [1usize, 2, 4] {
         let total = 32;
-        let seq = prove_ivc(&program, &input, output, total, segments, &PcsParams::default());
+        let seq = prove_ivc(
+            &program,
+            &input,
+            output,
+            total,
+            segments,
+            &PcsParams::default(),
+        );
         let (stream, stats) = magnetar_ivc::prove_ivc_streaming(
             &program,
             &input,
@@ -186,7 +193,15 @@ fn streaming_matches_sequential() {
         assert_eq!(format!("{:?}", seq.inners), format!("{:?}", stream.inners));
         assert_eq!(format!("{:?}", seq.mosaic), format!("{:?}", stream.mosaic));
         // And the streaming proof verifies.
-        assert!(verify_ivc(&program, &input, output, total, &stream, &PcsParams::default()).is_ok());
+        assert!(verify_ivc(
+            &program,
+            &input,
+            output,
+            total,
+            &stream,
+            &PcsParams::default()
+        )
+        .is_ok());
         // The stats are populated (R10).
         assert!(stats.wall_total >= stats.wall_checkpoints + stats.wall_root);
         assert!(stats.packed_bytes > 0);
@@ -204,21 +219,23 @@ fn streaming_roundtrip_and_tamper() {
     let program = sum_program();
     let input = vec![5u64];
     let output = 35u64;
-    let (proof, _stats) = magnetar_ivc::prove_ivc_streaming(
-        &program,
-        &input,
-        output,
-        32,
-        4,
-        &PcsParams::default(),
-    );
+    let (proof, _stats) =
+        magnetar_ivc::prove_ivc_streaming(&program, &input, output, 32, 4, &PcsParams::default());
     assert!(verify_ivc(&program, &input, output, 32, &proof, &PcsParams::default()).is_ok());
     // Tamper: a broken boundary chain.
     let mut p = clone_of(&proof);
     p.statements[2].init.regs[2] += 1;
     assert!(verify_ivc(&program, &input, output, 32, &p, &PcsParams::default()).is_err());
     // Tamper: a wrong output.
-    assert!(verify_ivc(&program, &input, output + 1, 32, &proof, &PcsParams::default()).is_err());
+    assert!(verify_ivc(
+        &program,
+        &input,
+        output + 1,
+        32,
+        &proof,
+        &PcsParams::default()
+    )
+    .is_err());
 }
 
 /// The checkpointed replay regenerates the exact full padded trace
@@ -234,7 +251,12 @@ fn stream_cursor_matches_full_trace() {
     let seg_len = 16usize;
     // The sequential path: execute + pad to total.
     let mut full = execute(&program, &input, total);
-    pad_records(&mut full.records, &mut full.final_state, &full.program, total);
+    pad_records(
+        &mut full.records,
+        &mut full.final_state,
+        &full.program,
+        total,
+    );
     assert_eq!(full.records.len(), total);
     // The streaming path: checkpoint + per-segment replay.
     let prog = expand_program(&program);

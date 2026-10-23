@@ -173,6 +173,7 @@ dependencies = [
  "magnetar-memory",
  "magnetar-pcs",
  "magnetar-zkvm",
+ "rayon",
 ]
 
 [[package]]

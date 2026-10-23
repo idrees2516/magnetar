@@ -44,8 +44,8 @@ use magnetar_pcs::code::CodeParams;
 use magnetar_pcs::PcsStatement;
 use magnetar_zkvm::mosaic::{pack_tables_slice, prove_mosaic, MosaicClaim};
 use magnetar_zkvm::{
-    build_segment, keygen_with, prove_inner, Boundary, InnerProof, PublicInput,
-    SegmentStatement, AMOUNT_BITS,
+    build_segment, keygen_with, prove_inner, Boundary, InnerProof, PublicInput, SegmentStatement,
+    AMOUNT_BITS,
 };
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,9 +87,11 @@ pub fn peak_rss_bytes() -> u64 {
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("VmHWM:"))
-                    .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+                s.lines().find(|l| l.starts_with("VmHWM:")).and_then(|l| {
+                    l.split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse::<u64>().ok())
+                })
             })
             .map(|kb| kb * 1024)
             .unwrap_or(0)
@@ -161,18 +163,14 @@ pub fn prove_ivc_streaming(
             + 64);
 
     // ---- The shared proving key + the combined layout. ----
-    let (pk, _vk) = keygen_with(
-        program.to_vec(),
-        seg_len,
-        AMOUNT_BITS,
-        pcs.clone(),
-    );
+    let (pk, _vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone());
     let combined = combined_layout(&pk, segments);
     let n_comp = pk.mosaic.components.len();
     let n = combined.ell - 7;
 
     // ---- Phase 2: the parallel segment proofs + streaming pack. ----
     let t1 = Instant::now();
+    let __phase0 = t1;
     let mut packed = vec![magnetar_field::ZERO; 1usize << n];
     // The pack OR-slices share leaf words across segments, so the slice
     // packs serialize (each is a single O(leaves) pass — a rounding error
@@ -180,10 +178,20 @@ pub fn prove_ivc_streaming(
     let packed_lock = Mutex::new(&mut packed);
     let max_tables = AtomicUsize::new(0);
 
-    let results: Vec<(usize, SegmentStatement, InnerProof, Vec<MosaicClaim>, [u8; 32])> = (0
-        ..segments)
+    /// One segment worker's outputs: (segment index, statement, inner
+    /// proof, remapped claims, transcript digest).
+    type SegResult = (
+        usize,
+        SegmentStatement,
+        InnerProof,
+        Vec<MosaicClaim>,
+        [u8; 32],
+    );
+    let results: Vec<SegResult> = (0..segments)
         .into_par_iter()
         .map(|s| {
+            let __t_start = std::time::Instant::now();
+            let __tid = std::thread::current().id();
             // 2a. Replay this segment from its snapshot — byte-identical
             // to the sequential prover's full-trace slice.
             let mut cur = checkpoints[s].clone();
@@ -256,6 +264,13 @@ pub fn prove_ivc_streaming(
                     c
                 })
                 .collect();
+            if std::env::var_os("MAGNETAR_TRACE_WORKERS").is_some() {
+                eprintln!(
+                    "[worker {s}] thread {__tid:?} took {:?} (start offset {:?})",
+                    __t_start.elapsed(),
+                    __phase0.elapsed() - __t_start.elapsed(),
+                );
+            }
             (s, stmt, inner, claims, digest)
         })
         .collect();
