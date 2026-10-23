@@ -111,6 +111,38 @@
 =======
 ## 0.3.0 (unreleased)
 
+### GPU proving program, Phase 1: the bitsliced sum-check (`magnetar-bitsum`)
+
+- New crate `magnetar-bitsum` (roadmap build-order item 1, "GPU
+  sum-check kernels"): the bitsliced multilinear sum-check over GF(2^128)
+  in the tower basis — the statement shape of MosaicPCS's first-phase
+  sum-check and Ligerito's proximity phase.
+- **Tower field with computationally verified constants**
+  (`NUS[k] = 1 << (2^k - 1)`, single-coordinate at every level):
+  trace-1 irreducibility per level, field axioms, group order, and
+  inverses are all re-checked by unit tests.
+- **The kernel algorithm as tested host functions**: 32-way bitsliced
+  groups (group-major `[groups, 128]`, identical to the GPU tensor
+  layout), the Karatsuba tower-multiplier tree (pruned == unpruned,
+  tree == scalar multiplication), bind/reduce vs scalar references, and
+  the planes prover bit-identical to the scalar prover.
+- **Repo synchronization**: Fiat-Shamir now runs over the repo-standard
+  SHA3-256 duplex (`magnetar-hash`) instead of the study's private
+  SHA-256 transcript, and a **verified tower ↔ K isomorphism**
+  (`interop`) bridges the kernel's tower basis to the stack's GCM
+  polynomial basis — round trip, homomorphism, and generator relations
+  tested; `prove_gcm` / `eval_mle_gcm` prove over `K` tables, and the
+  e2e test discharges the final claim with `magnetar-field`'s own
+  `eval_mle`.
+- **NVlabs cuTile GPU kernels behind the `cutile` feature**
+  (`pack_planes`, `bind_round`, `reduce_partial`): a 1:1 transliteration
+  of the tested host functions; the `gpu_parity` integration test is the
+  hardware acceptance gate. The default build is pure Rust — CI stays
+  green without CUDA; the feature-on path is run by the manual
+  `bitsum-cuda` workflow.
+- Tamper coverage per the contributing rules: c1, mid-proof c0, last-c0
+  (caught by the outer evaluation check), and wrong-claim rejections.
+
 ### The register-shift stage-select extension (complete)
 
 - Register shifts (`SLL/SRL/SRA` by register) now prove end to end: the

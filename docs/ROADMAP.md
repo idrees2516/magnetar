@@ -56,9 +56,20 @@ every factor in a published, measured anchor; the build order:
 |-------|--------|-------|----------------|
 | 1. Single-GPU port | 0–3 | `cudarc` host plane; `cutile-rs` bit-sliced sum-check + Merkle kernels; ICICLE as reference | ≥ 2× over the CPU baseline on one H100 (≥ 15M c/s); the commitment kernel < 1 ms |
 | 2. Fusion and tiling | 3–9 | Fused message+fold passes; 2^13-entry shared-memory tiles running 13 rounds on-chip; TMA loads; persistent CUDA graphs; the Bolt encoder | ≥ 40M c/s on one H100; ≤ 60 GiB effective traffic per chunk |
-| 3. Sharding and accumulation | 9–15 | 2–4 GPU segment sharding (the `segments.rs` interface); Arc folds on the chunk tail; Tree-IVC + DeepFold batching; the FRI-Binius wrap | ≥ 100M on 2× H100 / 1× B300; proofs ≤ 105 KiB at 120-bit |
+| 3. Sharding and accumulation | 9–15 | 2–4 GPU segment sharding (`segments.rs` interface); Arc folds on the chunk tail; Tree-IVC + DeepFold batching; the FRI-Binius wrap | ≥ 100M on 2× H100 / 1× B300; proofs ≤ 105 KiB at 120-bit |
 | 4. The tracer | 12–18 | GPU tracer (chunk-parallel, limb-packed) or a 96-core host pool; double-buffered upload | End-to-end ≥ 150M on 2× B300-class |
 | 5. Research integration | 15–24 | AG-sumcheck constants; log-star rounds; tensor-core spike; the VEIL ZK layer | Stretch: 250M+ and/or ZK proofs at unchanged size |
+
+**Phase 1, first item landed**: the bitsliced GF(2^128) sum-check core is
+implemented and tested as `magnetar-bitsum` — verified tower constants, the
+32-way bit-plane layout with the tree multiplier as a tested host oracle, the
+repo-standard SHA3-256 Fiat–Shamir transcript, a verified tower↔K isomorphism
+with `prove_gcm`/`eval_mle_gcm` bridges into the stack's own field, and the
+NVlabs cuTile GPU kernels behind the `cutile` feature (default build stays
+pure Rust and CI-green; hardware bring-up is gated by the manual `bitsum-cuda`
+workflow and the `gpu_parity` acceptance test — see
+[`docs/architecture/bitsum.md`](architecture/bitsum.md)). Wiring the engine's
+factor interface to the kernels is the remaining step of this item.
 
 The multiplicative stack behind the numbers:
 

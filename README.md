@@ -49,6 +49,7 @@ field/utils/proof/arith/cpu split), one crate per component:
 | `magnetar-router` | §5.4 | **BinaryRouter**: routing-identity sum-checks over the joint (o,j,u,h) space for shifts (`R_sh`, Eq. 5, two one-hot selector fields) and sub-word stores (`R_st`, Eq. 6, byte-offset variables linked via `eq(a_k, â_k(j))`), with the **join-enumeration prover** — the paper's linear-in-T prover work (§5.4) |
 | `magnetar-cpu` | §5.1 | The complete RV64I decoder, microcode expansion (register shifts → 6 static-routing stages), the interpreter with the virtual-cycle trace, and the **dual SIMD R1CS circuit** (the F₂ bit constraints: booleanity + the 64-bit adder carry chain; the K packed products: the word-wide write mux, the packed sum identity, the halt-latch I/O binding) |
 | `magnetar-zkvm` | §5.2, §5.5 | **MosaicPCS** with the component layout (direct segments + the auxiliary one-hot/increment polynomials on aligned subcubes, the Equation-4 suffix lift), the **complete Construction-3 protocol** (all seven steps), the bytecode ROM tables, and the **proof-size instrumentation** |
+| `magnetar-bitsum` | GPU study | the **bitsliced GF(2^128) sum-check** (Phase 1 of the GPU program): verified tower constants, 32-way bit-plane layout, the tree multiplier as a tested host oracle, SHA3-256 Fiat–Shamir, a verified tower↔K isomorphism with `prove_gcm`/`eval_mle_gcm` bridges, and NVlabs cuTile GPU kernels behind the `cutile` feature |
 | `magnetar-cli` | — | The `magnetar` binary |
 | `magnetar-ivc` | roadmap §8.2 | **Tree-IVC**: segments proved independently in their own transcripts, sharing ONE MosaicPCS commitment; boundary chaining via the Remark-4 final-state bindings and public point claims; claim batching at the root — with the **streaming parallel prover** (checkpointed replay, rayon segments, tables packed directly into the commitment leaves) |
 
@@ -76,6 +77,19 @@ field/utils/proof/arith/cpu split), one crate per component:
    commitment with exact `φ_c` bit-extraction checks at random
    `(x, ε=0)` positions.
 
+## The GPU proving program (Phase 1 landed)
+
+The roadmap's first GPU build-order item — *GPU sum-check kernels* — is
+implemented as `magnetar-bitsum`
+([`docs/architecture/bitsum.md`](docs/architecture/bitsum.md)): a fully
+tested bitsliced sum-check core (tower GF(2^128) with computationally
+verified constants, the exact GPU op sequence as host functions, the
+repo-standard SHA3-256 transcript, and a verified tower↔K isomorphism so
+the kernel proves statements over the stack's own field), plus cuTile GPU
+kernels behind the `cutile` feature. The default build stays pure Rust
+and CI-green; the feature-on path is gated by the manual `bitsum-cuda`
+workflow and the `gpu_parity` acceptance test on CUDA hardware.
+
 ## Security
 
 * **Hashes only**: SHA-3 (FIPS 202) for Fiat–Shamir, BLAKE3 for
@@ -96,11 +110,20 @@ field/utils/proof/arith/cpu split), one crate per component:
 
 ```sh
 cargo build --release
-cargo test --workspace      # 69 tests: field, hash, sum-check (dense +
+cargo test --workspace      # 119 tests: field, hash, sum-check (dense +
                              # sparse), PCS + ring switching, Virtual Spartan,
-                             # Twist, Shout, the discharge helpers, Router, CPU,
-                             # end-to-end + 15 tamper classes
+                             # Twist, Shout, the discharge helpers, Router
+                             # (routing + join enumeration), CPU, tree-IVC
+                             # (recursive + streaming), the bitsliced
+                             # sum-check core + tower↔K interop, end-to-end +
+                             # tamper classes
 cargo run --release --bin magnetar -- fib 5
+
+# GPU proving program, Phase 1 (CUDA 13.x toolkit + sm_80+ required):
+cargo build -p magnetar-bitsum --features cutile
+BITSUM_GPU_TESTS=1 cargo test -p magnetar-bitsum --features cutile \
+    --test gpu_parity --release                    # acceptance gate
+cargo run --release -p magnetar-bitsum --features cutile --example bench_gpu -- 20
 ```
 
 ## Status and scope

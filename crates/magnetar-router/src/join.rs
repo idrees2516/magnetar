@@ -174,12 +174,14 @@ fn eqb(x: Gf128, b: bool) -> Gf128 {
 }
 
 /// The round-0 self-check: the first round message must sum to the stated
-/// claim (`p(0) + p(1) = Σ coeffs` in characteristic two).
+/// claim. In characteristic two `m(0) + m(1) = Σ_{j≥1} m_j` — the constant
+/// coefficient cancels — matching the engine's round check
+/// (`Σ_{j≥1} m_{i,j} = running`).
 #[inline]
 fn round0_check(rounds: &[Vec<Gf128>], coeffs: &Coeffs, degree: usize, claim: Gf128) {
     if rounds.is_empty() {
         debug_assert_eq!(
-            coeffs[..degree + 1].iter().copied().sum::<Gf128>(),
+            coeffs[1..degree + 1].iter().copied().sum::<Gf128>(),
             claim,
             "join prover round 0 must sum to the claim"
         );
