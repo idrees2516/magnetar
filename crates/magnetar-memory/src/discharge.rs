@@ -189,10 +189,10 @@ pub fn prove_psi_claim(
         }],
         claim,
     };
-    let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
+    let mut prover = SumcheckProver::new_owned(spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(a + n);
     for _ in 0..(a + n) {
-        let msg = prover.message();
+        let msg = prover.message_cached();
         rounds.push(msg.0.clone());
         prover.absorb_and_fold(t, label);
     }
@@ -454,10 +454,10 @@ pub fn prove_bus_shout(
         terms,
         claim,
     };
-    let mut prover = SumcheckProver::new(&spec_sc, BindOrder::Increasing);
+    let mut prover = SumcheckProver::new_owned(spec_sc, BindOrder::Increasing);
     let mut phi_rounds = Vec::with_capacity(a + ell + n);
     for _ in 0..(a + ell + n) {
-        let msg = prover.message();
+        let msg = prover.message_cached();
         phi_rounds.push(msg.0.clone());
         prover.absorb_and_fold(t, "bus-phi");
     }
@@ -683,10 +683,10 @@ pub fn prove_selector_shout(
             terms,
             claim: f.claim,
         };
-        let mut prover = SumcheckProver::new(&sc_spec, BindOrder::Increasing);
+        let mut prover = SumcheckProver::new_owned(sc_spec, BindOrder::Increasing);
         let mut rounds = Vec::with_capacity(jv);
         for _ in 0..jv {
-            let msg = prover.message();
+            let msg = prover.message_cached();
             rounds.push(msg.0.clone());
             prover.absorb_and_fold(t, &format!("{label}-{fi}"));
         }

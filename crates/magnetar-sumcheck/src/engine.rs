@@ -13,8 +13,12 @@
 //! evaluation claims of the reduction (paper Definition 5).
 
 use crate::{interpolate, BindOrder, RoundMsg, SumcheckSpec};
-use magnetar_field::{bind_var, mul, Gf128, ZERO};
+use magnetar_field::{bind_var, mul, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
+
+/// Below this many remaining entries the round passes run serially (the
+/// rayon fork-join overhead dominates on small tables).
+const PARALLEL_THRESHOLD: usize = 1 << 13;
 
 /// Prover-side state: the folding tables plus the running claim.
 pub struct SumcheckProver {
@@ -27,6 +31,9 @@ pub struct SumcheckProver {
     num_vars: usize,
     round: usize,
     challenges: Vec<Gf128>,
+    /// The last computed round message, reused by `fold` so that the
+    /// standard `message → absorb → fold` sequence computes the round once.
+    cached_msg: Option<RoundMsg>,
 }
 
 impl SumcheckProver {
@@ -43,7 +50,35 @@ impl SumcheckProver {
             num_vars: spec.num_vars,
             round: 0,
             challenges: Vec::new(),
+            cached_msg: None,
         }
+    }
+
+    /// Build a prover **taking ownership** of the dense tables and terms —
+    /// the hot-path constructor: no `O(2^m)` table copies. The public
+    /// factors are materialized (they are folded like dense tables, so the
+    /// prover needs its own copies regardless).
+    pub fn new_owned(spec: SumcheckSpec, order: BindOrder) -> Self {
+        spec.validate().expect("invalid sumcheck spec");
+        let public_tables = spec.public.iter().map(|f| f.materialize()).collect();
+        SumcheckProver {
+            spec_terms: spec.terms,
+            dense: spec.dense,
+            public_tables,
+            coeffs: Vec::new(),
+            running: spec.claim,
+            order,
+            num_vars: spec.num_vars,
+            round: 0,
+            challenges: Vec::new(),
+            cached_msg: None,
+        }
+        .with_coeffs()
+    }
+
+    fn with_coeffs(mut self) -> Self {
+        self.coeffs = self.spec_terms.iter().map(|t| t.coeff).collect();
+        self
     }
 
     /// Number of remaining variables.
@@ -51,10 +86,20 @@ impl SumcheckProver {
         self.num_vars - self.round
     }
 
-    /// Current round's message: coefficients of the round polynomial,
-    /// computed by evaluating the summand at `X = 0, 1, …, d` on the
-    /// remaining cube and interpolating.
+    /// Current round's message: coefficients of the round polynomial.
+    ///
+    /// One fused pass over the half-table: for every remaining entry the
+    /// per-factor slice pair `(a, d = a + a₁)` (the value at `X = 0` and
+    /// its `X`-coefficient) yields the term's product at each node
+    /// `X = 0..degree` with `degree` field multiplications per node — no
+    /// intermediate views, no per-round allocations. The per-term `coeff`
+    /// is applied once per node at the reduction, not per entry. Large
+    /// tables are split across threads (the accumulators reduce at the
+    /// end).
     pub fn message(&self) -> RoundMsg {
+        if let Some(ref m) = self.cached_msg {
+            return m.clone();
+        }
         let degree = self
             .spec_terms
             .iter()
@@ -62,87 +107,140 @@ impl SumcheckProver {
             .max()
             .unwrap_or(0);
         let npts = degree + 1;
+        let bit = self.order.current_bit(self.num_vars, self.round);
+        let block = 1usize << bit;
+        let len = self
+            .dense
+            .first()
+            .map(|d| d.len())
+            .or_else(|| self.public_tables.first().map(|p| p.len()))
+            .unwrap_or(0);
+        let half = len / 2;
+        let nterms = self.spec_terms.len();
+        let terms = &self.spec_terms;
+        let coeffs = &self.coeffs;
+        let dense = &self.dense;
+        let public = &self.public_tables;
+        // The interpolation nodes X = 0, 1, 2, …, degree.
+        let xs: Vec<Gf128> = (0..npts).map(|i| Gf128(i as u128)).collect();
+        // Per (term, point) sums, possibly accumulated across threads.
+        let mut acc = vec![ZERO; nterms * npts];
+        // A factor-free (constant) term contributes `coeff` per Boolean
+        // point of the post-round cube: `2^{remaining-1} · coeff`, nonzero
+        // only on the final round (characteristic two).
+        let const_contrib = self.remaining_vars() == 1;
+        let term_has_factors = |t: &crate::Term| !t.dense.is_empty() || !t.public.is_empty();
+        let run_range = |range: std::ops::Range<usize>, acc: &mut [Gf128]| {
+            for n in range {
+                // De-interleave: post-round entry `n` corresponds to the
+                // pair (idx0, idx1) = (bit-0, bit-1) slices at the round bit.
+                let lo = n & (block - 1);
+                let hi = n >> bit;
+                let idx0 = (hi << (bit + 1)) | lo;
+                let j1 = idx0 | block;
+                for (ti, t) in terms.iter().enumerate() {
+                    if !term_has_factors(t) {
+                        continue;
+                    }
+                    let base = ti * npts;
+                    'points: for p in 0..npts {
+                        let mut prod = ONE;
+                        for &d in &t.dense {
+                            let tab = &dense[d];
+                            let a = tab[idx0];
+                            let d1 = a + tab[j1];
+                            let v = if p == 0 {
+                                a
+                            } else if p == 1 {
+                                a + d1
+                            } else {
+                                a + mul(xs[p], d1)
+                            };
+                            prod = mul(prod, v);
+                            if prod == ZERO {
+                                continue 'points;
+                            }
+                        }
+                        for &pf in &t.public {
+                            let tab = &public[pf];
+                            let a = tab[idx0];
+                            let d1 = a + tab[j1];
+                            let v = if p == 0 {
+                                a
+                            } else if p == 1 {
+                                a + d1
+                            } else {
+                                a + mul(xs[p], d1)
+                            };
+                            prod = mul(prod, v);
+                            if prod == ZERO {
+                                continue 'points;
+                            }
+                        }
+                        acc[base + p] += prod;
+                    }
+                }
+            }
+        };
+        if half >= PARALLEL_THRESHOLD && nterms > 0 {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let merged = (0..half)
+                .into_par_iter()
+                .fold(
+                    || vec![ZERO; nterms * npts],
+                    |mut acc, j| {
+                        run_range(j..j + 1, &mut acc);
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![ZERO; nterms * npts],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(b.into_iter()) {
+                            *x += y;
+                        }
+                        a
+                    },
+                );
+            for (i, v) in merged.into_iter().enumerate() {
+                acc[i] += v;
+            }
+        } else {
+            run_range(0..half, &mut acc);
+        }
+        // Scale by each term's coefficient and fold in the factor-free
+        // constants.
         let mut values = Vec::with_capacity(npts);
-        for i in 0..npts {
-            let x = Gf128(i as u128);
-            values.push(self.summand_sum_at(x));
+        for p in 0..npts {
+            let mut total = ZERO;
+            for ti in 0..nterms {
+                total += mul(coeffs[ti], acc[ti * npts + p]);
+            }
+            if const_contrib {
+                for (ti, t) in terms.iter().enumerate() {
+                    if !term_has_factors(t) {
+                        total += coeffs[ti];
+                    }
+                }
+            }
+            values.push(total);
         }
         RoundMsg(interpolate(&values))
     }
 
-    /// `Σ_{rest} g(X, rest)` over the remaining Boolean cube, with the round
-    /// variable fixed to the field value `X`.
-    fn summand_sum_at(&self, x: Gf128) -> Gf128 {
-        // Per factor: the table viewed at (X, rest) = A + X·B where A is the
-        // bit-0 slice and B = A + bit-1 slice (characteristic two).
-        let bit = self.order.current_bit(self.num_vars, self.round);
-        // Value of the MLE at (X, rest) = A + X·(A + T1), where A is the
-        // bit-0 slice and T1 the bit-1 slice (characteristic two).
-        let view = |table: &Vec<Gf128>| -> Vec<Gf128> {
-            let block = 1usize << bit;
-            let mut out = Vec::with_capacity(table.len() / 2);
-            let mut i = 0;
-            while i < table.len() {
-                for j in 0..block {
-                    let a = table[i + j];
-                    let t1 = table[(i + j) | block];
-                    out.push(a + mul(x, a + t1));
-                }
-                i += 2 * block;
-            }
-            out
-        };
-        let dense_views: Vec<Vec<Gf128>> = self.dense.iter().map(view).collect();
-        let public_views: Vec<Vec<Gf128>> = self.public_tables.iter().map(view).collect();
-        // Sum terms elementwise on the product of the views.
-        let mut total = ZERO;
-        for (ti, t) in self.spec_terms.iter().enumerate() {
-            let mut prod: Option<Vec<Gf128>> = None;
-            for &d in &t.dense {
-                prod = Some(match prod {
-                    None => dense_views[d].clone(),
-                    Some(p) => p
-                        .iter()
-                        .zip(dense_views[d].iter())
-                        .map(|(&a, &b)| mul(a, b))
-                        .collect(),
-                });
-            }
-            for &p in &t.public {
-                prod = Some(match prod {
-                    None => public_views[p].clone(),
-                    Some(pr) => pr
-                        .iter()
-                        .zip(public_views[p].iter())
-                        .map(|(&a, &b)| mul(a, b))
-                        .collect(),
-                });
-            }
-            let coeff = self.coeffs[ti];
-            match prod {
-                None => {
-                    // Constant term (no factors): contributes coeff per
-                    // remaining Boolean point.
-                    let n = 1u128 << self.remaining_vars();
-                    // n mod 2 == 0 for ≥1 vars; only nonzero when n == 1.
-                    if n == 1 {
-                        total += coeff;
-                    }
-                }
-                Some(p) => {
-                    for &v in &p {
-                        total += mul(coeff, v);
-                    }
-                }
-            }
-        }
-        total
+    /// Compute and **cache** the current round message — for drivers that
+    /// read the message before folding (`message → absorb_and_fold` and the
+    /// Virtual-Spartan lockstep): the subsequent fold reuses it.
+    pub fn message_cached(&mut self) -> RoundMsg {
+        let m = self.message();
+        self.cached_msg = Some(m.clone());
+        m
     }
 
     /// Absorb the message into the transcript, check nothing (prover side),
     /// sample the challenge, fold, and advance. Returns the challenge.
     pub fn absorb_and_fold(&mut self, t: &mut Transcript, label: &str) -> Gf128 {
-        let msg = self.message();
+        let msg = self.message_cached();
         let mut buf = Vec::with_capacity(msg.0.len() * 16);
         for c in &msg.0 {
             buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
@@ -155,10 +253,11 @@ impl SumcheckProver {
 
     /// Fold all tables at `r` (the round variable) and update the running
     /// claim to `m(r)`. Used by the lockstep driver with *external*
-    /// challenges (Virtual Spartan, paper §5.3 step 1).
+    /// challenges (Virtual Spartan, paper §5.3 step 1). Reuses the cached
+    /// round message when the driver already computed it.
     pub fn fold(&mut self, r: Gf128) {
         self.challenges.push(r);
-        let msg = self.message();
+        let msg = self.cached_msg.take().unwrap_or_else(|| self.message());
         // running := m(r)
         let mut mr = ZERO;
         let mut xp = Gf128(1);
@@ -175,6 +274,7 @@ impl SumcheckProver {
             bind_var(p, bit, r);
         }
         self.round += 1;
+        self.cached_msg = None;
     }
 
     /// After all rounds: the dense factors' claimed evaluations at the
@@ -564,5 +664,150 @@ mod tests {
         });
         assert_eq!(claims[0], magnetar_field::eval_mle(&table, &point));
         let _ = bit_table;
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    use super::*;
+    use crate::public::{EqFactor, TableFactor};
+    use magnetar_field::{mul, Gf128, ONE};
+
+    fn rg(rng: &mut impl rand::Rng) -> Gf128 {
+        Gf128(rand::Rng::gen::<u128>(rng))
+    }
+
+    /// Reference (pre-rewrite) round message: evaluate the summand at
+    /// X = 0..deg over the remaining cube, interpolating from per-point
+    /// passes with explicit factor views.
+    fn reference_message(
+        dense: &[Vec<Gf128>],
+        public_tables: &[Vec<Gf128>],
+        terms: &[crate::Term],
+        coeffs: &[Gf128],
+        order: BindOrder,
+        num_vars: usize,
+        round: usize,
+    ) -> RoundMsg {
+        let degree = terms
+            .iter()
+            .map(|t| t.dense.len() + t.public.len())
+            .max()
+            .unwrap_or(0);
+        let npts = degree + 1;
+        let bit = order.current_bit(num_vars, round);
+        let block = 1usize << bit;
+        let view = |table: &Vec<Gf128>, x: Gf128| -> Vec<Gf128> {
+            let mut out = Vec::with_capacity(table.len() / 2);
+            let mut i = 0;
+            while i < table.len() {
+                for j in 0..block {
+                    let a = table[i + j];
+                    let t1 = table[(i + j) | block];
+                    out.push(a + mul(x, a + t1));
+                }
+                i += 2 * block;
+            }
+            out
+        };
+        let mut values = Vec::with_capacity(npts);
+        for p in 0..npts {
+            let x = Gf128(p as u128);
+            let dv: Vec<Vec<Gf128>> = dense.iter().map(|d| view(d, x)).collect();
+            let pv: Vec<Vec<Gf128>> = public_tables.iter().map(|d| view(d, x)).collect();
+            let mut total = ZERO;
+            for (ti, t) in terms.iter().enumerate() {
+                let mut prod: Option<Vec<Gf128>> = None;
+                for &d in &t.dense {
+                    prod = Some(match prod {
+                        None => dv[d].clone(),
+                        Some(p) => p
+                            .iter()
+                            .zip(dv[d].iter())
+                            .map(|(&a, &b)| mul(a, b))
+                            .collect(),
+                    });
+                }
+                for &pf in &t.public {
+                    prod = Some(match prod {
+                        None => pv[pf].clone(),
+                        Some(p) => p
+                            .iter()
+                            .zip(pv[pf].iter())
+                            .map(|(&a, &b)| mul(a, b))
+                            .collect(),
+                    });
+                }
+                if let Some(p) = prod {
+                    for &v in &p {
+                        total += mul(coeffs[ti], v);
+                    }
+                }
+            }
+            values.push(total);
+        }
+        RoundMsg(interpolate(&values))
+    }
+
+    /// The rewrite must reproduce the reference messages round for round,
+    /// serially and in the parallel regime, in both bind orders.
+    #[test]
+    fn rewrite_matches_reference_all_orders() {
+        let mut rng = rand::thread_rng();
+        for &(m, high) in &[(8, 3usize), (10, 0usize), (12, 5usize), (15, 6usize)] {
+            let order = if high == 0 {
+                BindOrder::Increasing
+            } else {
+                BindOrder::HighBitsFirst { high }
+            };
+            let d0: Vec<Gf128> = (0..(1usize << m)).map(|_| rg(&mut rng)).collect();
+            let d1: Vec<Gf128> = (0..(1usize << m)).map(|_| rg(&mut rng)).collect();
+            let d2: Vec<Gf128> = (0..(1usize << m)).map(|_| rg(&mut rng)).collect();
+            let tau: Vec<Gf128> = (0..m).map(|_| rg(&mut rng)).collect();
+            // Terms: (d0·d1·eq) + (d2·eq).
+            let spec = SumcheckSpec {
+                num_vars: m,
+                dense: vec![d0.clone(), d1.clone(), d2.clone()],
+                public: vec![Box::new(EqFactor::new(tau.clone()))],
+                terms: vec![
+                    crate::Term {
+                        coeff: ONE,
+                        dense: vec![0, 1],
+                        public: vec![0],
+                    },
+                    crate::Term {
+                        coeff: rg(&mut rng),
+                        dense: vec![2],
+                        public: vec![0],
+                    },
+                ],
+                claim: ZERO,
+            };
+            let terms = spec.terms.clone();
+            let coeffs: Vec<Gf128> = terms.iter().map(|t| t.coeff).collect();
+            let pub_tables: Vec<Vec<Gf128>> = spec.public.iter().map(|f| f.materialize()).collect();
+            let mut prover = SumcheckProver::new_owned(spec, order);
+            // The reference keeps its own folded copies in lockstep.
+            let mut ref_dense = vec![d0.clone(), d1.clone(), d2.clone()];
+            let mut ref_pub = pub_tables.clone();
+            for round in 0..m {
+                let want =
+                    reference_message(&ref_dense, &ref_pub, &terms, &coeffs, order, m, round);
+                let got = prover.message();
+                assert_eq!(got, want, "m={m} high={high} round={round}");
+                // Advance with a fixed pseudo-random challenge.
+                let rb = (round as u32).to_le_bytes();
+                let mut tr = magnetar_hash::Transcript::new("t", &[&rb]);
+                let r = tr.challenge_field("r");
+                prover.fold(r);
+                let bit = order.current_bit(m, round);
+                for d in ref_dense.iter_mut() {
+                    magnetar_field::bind_var(d, bit, r);
+                }
+                for p in ref_pub.iter_mut() {
+                    magnetar_field::bind_var(p, bit, r);
+                }
+            }
+        }
     }
 }

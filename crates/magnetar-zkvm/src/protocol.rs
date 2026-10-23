@@ -45,9 +45,16 @@ use magnetar_spartan::{
     SegmentSpec, VirtualSpartanProof,
 };
 
-/// The shift-amount routing width (test-scale default; the production
-/// envelope uses 6 for the full 64-amount space).
-pub const AMOUNT_BITS: usize = 2;
+/// The shift-amount routing width: 6 covers the full 64-entry shamt space
+/// (RV64I shamt is 6 bits). The routing tensor grows to 2^(6+6+8) entries
+/// and the ROM's sel_lo columns to 64 per row — both trivial against the
+/// other commitments.
+pub const AMOUNT_BITS: usize = 6;
+
+/// The (kind × stage) one-hot width (5 bits: 4 kinds × 8 stages).
+fn magnetar_zkvm_rom_ks_bits() -> usize {
+    crate::rom::SEL_KS_BITS
+}
 
 /// The proving key (transparent: derived from the public program).
 #[derive(Clone)]
@@ -64,6 +71,9 @@ pub struct KeyGen {
     pub rom: RomTables,
     /// The shift routing tensor `(values, o_vars, u_vars, h_vars)`.
     pub shift_tensor: (Vec<Gf128>, usize, usize, usize),
+    /// The register-shift stage routing tensor
+    /// `(values, o_vars, u_vars, h_vars)`.
+    pub stage_tensor: (Vec<Gf128>, usize, usize, usize),
     /// The store routing tensor `(values, o_vars, u_vars, h_vars, a_vars)`.
     pub store_tensor: (Vec<Gf128>, usize, usize, usize, usize),
     pub amount_bits: usize,
@@ -82,6 +92,7 @@ pub struct VerifyingKey {
     pub mosaic: MosaicLayout,
     pub rom: RomTables,
     pub shift_tensor: (Vec<Gf128>, usize, usize, usize),
+    pub stage_tensor: (Vec<Gf128>, usize, usize, usize),
     pub store_tensor: (Vec<Gf128>, usize, usize, usize, usize),
     pub amount_bits: usize,
     pub trace_len: usize,
@@ -128,6 +139,14 @@ pub struct Proof {
     pub inc_claim: Gf128,
     /// Step 5: the shift router.
     pub shift_router: RouterProof,
+    /// Step 5: the register-shift stage router (the 6-stage chain's
+    /// routing validation; the b-select factor's claim is
+    /// `stage_g_claim`).
+    pub stage_router: RouterProof,
+    /// The stage routing's b-select factor claim `Ĝ'(r_b, r_s, r_j)` —
+    /// the verifier derives the shamt-segment claim
+    /// `Ŝ(r_s, r_j) = stage_g_claim + 1 + r_b` from it.
+    pub stage_g_claim: Gf128,
     /// Step 5: the store router.
     pub store_router: RouterProof,
     /// Step 5: the store X split claims (old, src).
@@ -136,6 +155,12 @@ pub struct Proof {
     pub bus_shout: BusShoutProof,
     /// Step 6: the shift selector check.
     pub sel_shift: SelectorShoutProof,
+    /// Step 6: the stage selector check (the (kind, stage) one-hot
+    /// against the ROM's sel_ks columns).
+    pub sel_stage: SelectorShoutProof,
+    /// Step 6: the class-selector check (the decode-class one-hot
+    /// against the ROM's class columns — the flag folds' anchor).
+    pub sel_class: SelectorShoutProof,
     /// Step 6: the store selector check.
     pub sel_store: SelectorShoutProof,
     /// Step 7: the Mosaic discharge.
@@ -156,19 +181,23 @@ const SEGMENTS: &[(&str, usize, bool)] = &[
     ("rd", 64, false),
     ("load-val", 64, false),
     ("shift-out", 64, false),
-    ("t1", 64, true),
+    ("stage-out", 64, true),
     ("t2", 64, true),
     ("carry", 64, true),
     ("alu", 64, true),
+    ("pand", 64, true),
     ("shift-src", 64, true),
     ("store-old", 64, true),
     ("store-src", 64, true),
+    ("class", 32, true),
     ("flags", 16, true),
     ("off", 8, true),
     ("ram-addr", 8, true),
     ("pc", 8, false),
+    ("aux", 16, true),
     ("fetch", 64, false),
     ("eqaux", 64, true),
+    ("shamt", 8, true),
 ];
 
 /// Derive the keys from the public program.
@@ -204,6 +233,7 @@ pub fn keygen_with(
     let a_rom = rom.a_rom;
     let mosaic = MosaicLayout::build(mosaic_components(n, a_rom));
     let shift_tensor = build_shift_tensor(64, amount_bits);
+    let stage_tensor = magnetar_router::build_stage_tensor(64);
     let store_tensor = build_store_tensor(64);
     let pk = KeyGen {
         program: program.clone(),
@@ -212,6 +242,7 @@ pub fn keygen_with(
         mosaic: mosaic.clone(),
         rom: rom.clone(),
         shift_tensor: shift_tensor.clone(),
+        stage_tensor: stage_tensor.clone(),
         store_tensor: store_tensor.clone(),
         amount_bits,
         trace_len,
@@ -224,6 +255,7 @@ pub fn keygen_with(
         mosaic,
         rom,
         shift_tensor,
+        stage_tensor,
         store_tensor,
         amount_bits,
         trace_len,
@@ -241,17 +273,21 @@ fn mosaic_components(n: usize, a_rom: usize) -> Vec<crate::mosaic::ComponentSpec
         vars: lv + n,
     };
     let mut v = vec![
-        seg("seg-t1", 6),
+        seg("seg-stage-out", 6),
         seg("seg-t2", 6),
         seg("seg-carry", 6),
         seg("seg-alu", 6),
+        seg("seg-pand", 6),
         seg("seg-shift-src", 6),
         seg("seg-store-old", 6),
         seg("seg-store-src", 6),
+        seg("seg-class", 5),
         seg("seg-flags", 4),
         seg("seg-off", 3),
         seg("seg-ram-addr", 3),
+        seg("seg-aux", 4),
         seg("seg-eqaux", 6),
+        seg("seg-shamt", 3),
         // The register BinaryTwist's components (d = 1).
         seg("reg-ra-1", 6),
         seg("reg-ra-2", 6),
@@ -458,12 +494,15 @@ fn slice_weights(point: &[Gf128], pos: usize, width: usize) -> Vec<Gf128> {
 /// Prove the execution (Construction 3, steps 1–7).
 pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     // ---- 1. Execute.
-    let trace = execute(&pk.program, &pub_in.input, pk.trace_len);
+    let mut trace = execute(&pk.program, &pub_in.input, pk.trace_len);
     assert_eq!(
         trace.final_state.output, pub_in.output,
         "execution output mismatch"
     );
     assert!(trace.records.len() <= pk.trace_len, "trace exceeds bound");
+    // Pad the records up to the proving key's trace length (the witness
+    // covers every cycle of the trace).
+    trace.records = magnetar_cpu::interp::pad_records(&trace, pk.trace_len);
     let q = pk.trace_len;
     let m = WITNESS_LAYOUT::M;
     let n = q.trailing_zeros() as usize;
@@ -623,7 +662,7 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
     let inc_claim: Gf128 = magnetar_field::eval_mle(&wd.ram_wit.inc, &inc_point);
     t.absorb_field("ram-inc-claim", &[inc_claim]);
     // ---- 5a. BinaryRouter for shifts.
-    // The X table: the shift_src segment's bits.
+    // The X table: the shift-src copy segment's bits.
     let shift_src_off = pk.layout.offsets[pk.layout.index_of("shift-src").expect("segment")];
     let x_shift: Vec<Gf128> = {
         let mut x = vec![ZERO; (1usize << 6) * q];
@@ -699,6 +738,114 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         2,
         &mut t,
     );
+    // ---- 5a'. BinaryRouter for register-shift stages.
+    // Each stage row is a static routing (paper §5.4): the h space is
+    // kind(2) | stage(3) | b(1); the runtime amount bit b selects the
+    // identity (b=0) or the static 2^stage shift (b=1). Q_ks is the
+    // (kind, stage) one-hot from the ROM (the selector check
+    // authenticates it); the b-select factor G' = 1 + h_b + shamt(stage, j)
+    // reads the committed shamt segment (rs2's low 6 bits), so its
+    // terminal claim discharges to a shamt-segment claim.
+    let (st_o, st_u, st_h) = (pk.stage_tensor.1, pk.stage_tensor.2, pk.stage_tensor.3);
+    let stage_layout = RoutingLayout {
+        o_vars: st_o,
+        j_vars: n,
+        u_vars: st_u,
+        h_vars: st_h,
+        a_vars: 0,
+    };
+    // The Q_ks table over (h_ks, j) from the ROM at the fetched rows.
+    let sel_ks_j: Vec<Gf128> = {
+        let w = 1usize << magnetar_zkvm_rom_ks_bits();
+        let mut tab = vec![ZERO; w * q];
+        for (u, rec) in trace.records.iter().enumerate() {
+            let k = rec.micro_pc % (1usize << a_rom);
+            for h in 0..w {
+                tab[h | (u << magnetar_zkvm_rom_ks_bits())] =
+                    pk.rom.sel_ks[h | (k << magnetar_zkvm_rom_ks_bits())];
+            }
+        }
+        tab
+    };
+    // The G' table over (b, stage, j): 1 + b + shamt(stage, j).
+    let (g_tab, shamt_cols) = {
+        let shamt_off = pk.layout.offsets[pk.layout.index_of("shamt").expect("segment")];
+        let cols: Vec<Vec<Gf128>> = (0..8)
+            .map(|s| {
+                let mut c = vec![ZERO; q];
+                for (u, _) in trace.records.iter().enumerate() {
+                    c[u] = joint_bit(&wd.joint_z, u * m, shamt_off + s);
+                }
+                c
+            })
+            .collect();
+        let mut tab = vec![ZERO; 16 * q];
+        for u in 0..q {
+            for b in 0..2usize {
+                for s in 0..8usize {
+                    tab[b | (s << 1) | (u << 4)] = Gf128(b as u128) + cols[s][u] + ONE;
+                }
+            }
+        }
+        (tab, cols)
+    };
+    let _ = shamt_cols;
+    let stage_r_pub = {
+        let [_, j_off, u_off, h_off, _] = stage_layout.offsets();
+        let mut active = (0..st_o).collect::<Vec<usize>>();
+        active.extend(u_off..u_off + st_u);
+        active.extend(h_off..h_off + st_h);
+        PaddedTableFactor::new(pk.stage_tensor.0.clone(), active, stage_layout.joint_vars())
+    };
+    let stage_dense = vec![
+        PaddedDense::new(
+            x_shift.clone(),
+            {
+                let [_, j_off, u_off, _, _] = stage_layout.offsets();
+                let mut a = (u_off..u_off + st_u).collect::<Vec<usize>>();
+                a.extend(j_off..j_off + n);
+                a
+            },
+            stage_layout.joint_vars(),
+        ),
+        PaddedDense::new(
+            sel_ks_j.clone(),
+            {
+                let [_, j_off, _, h_off, _] = stage_layout.offsets();
+                // Q_ks over the h block's low 5 positions (kind|stage).
+                let mut a: Vec<usize> = (h_off..h_off + 5).collect();
+                a.extend(j_off..j_off + n);
+                a
+            },
+            stage_layout.joint_vars(),
+        ),
+        PaddedDense::new(
+            g_tab,
+            {
+                let [_, j_off, _, h_off, _] = stage_layout.offsets();
+                // G' over (b = h bit 5, stage = h bits 2..5, j): the
+                // table's own order is (b, stage, j).
+                let mut a: Vec<usize> = vec![h_off + 5];
+                a.extend(h_off + 2..h_off + 5);
+                a.extend(j_off..j_off + n);
+                a
+            },
+            stage_layout.joint_vars(),
+        ),
+    ];
+    let stage_claim = seg("stage-out").value;
+    let stage_router = prove_routing(
+        &stage_layout,
+        stage_claim,
+        &r_val,
+        &r_inst,
+        &stage_r_pub,
+        &stage_dense,
+        2,
+        &mut t,
+    );
+    let stage_g_claim = stage_router.q_values[1];
+    let stage_terminal = stage_router.terminal.clone();
     // ---- 5b. BinaryRouter for sub-word stores.
     let (o_vs, u_vs, h_vs, a_vs) = (
         pk.store_tensor.1,
@@ -867,6 +1014,51 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         "sel-shift",
         &mut t,
     );
+    // The class-selector check: the decode-class one-hot vs the ROM's
+    // class columns (the anchor of every flag fold).
+    let class_sel_spec = {
+        let cls = seg("class");
+        SelectorShoutSpec {
+            a: a_rom,
+            n,
+            r_j: r_inst.clone(),
+            factors: vec![SelectorCheckSpec {
+                h_vars: 5,
+                r_h: cls.r_local.clone(),
+                claim: cls.value,
+                rom_sel: pk.rom.class.clone(),
+            }],
+        }
+    };
+    let (sel_class_proof, sel_class_claims) = prove_selector_shout(
+        &class_sel_spec,
+        std::slice::from_ref(&wd.fetch_comp),
+        "sel-class",
+        &mut t,
+    );
+    // The stage selector check (the (kind, stage) one-hot vs sel_ks).
+    let sel_stage_spec = {
+        let terminal = stage_router.terminal.clone();
+        let [_, j_off, _, h_off, _] = stage_layout.offsets();
+        let r_j = terminal[j_off..j_off + n].to_vec();
+        SelectorShoutSpec {
+            a: a_rom,
+            n,
+            r_j,
+            factors: vec![SelectorCheckSpec {
+                h_vars: 5,
+                r_h: terminal[h_off..h_off + 5].to_vec(),
+                claim: stage_router.q_values[0],
+                rom_sel: pk.rom.sel_ks.clone(),
+            }],
+        }
+    };
+    let (sel_stage_proof, sel_stage_claims) = prove_selector_shout(
+        &sel_stage_spec,
+        std::slice::from_ref(&wd.fetch_comp),
+        "sel-stage",
+        &mut t,
+    );
     let store_terminal = store_router.terminal.clone();
     let sel_store = {
         let [_, j_off, _, h_off, _] = store_layout.offsets();
@@ -901,10 +1093,16 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         inc_claim,
         &bus_shout_claims,
         &sel_shift_claims,
+        &sel_stage_claims,
+        &sel_class_claims,
         &sel_store_claims,
         &shift_layout,
         &shift_router,
         &shift_terminal,
+        &stage_layout,
+        &stage_router,
+        &stage_terminal,
+        stage_g_claim,
         &store_layout,
         &store_router,
         &store_terminal,
@@ -932,10 +1130,14 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         inc_point: inc_point.clone(),
         inc_claim,
         shift_router,
+        stage_router,
+        stage_g_claim,
         store_router,
         store_x_claims,
         bus_shout,
         sel_shift: sel_shift_proof,
+        sel_stage: sel_stage_proof,
+        sel_class: sel_class_proof,
         sel_store: sel_store_proof,
         mosaic: mosaic_proof,
     }
@@ -994,6 +1196,7 @@ fn selector_tables_from_trace(
 /// Collect every Mosaic claim (the same collection on both sides; the
 /// claim values and points come from symmetric proof structures).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn collect_mosaic_claims(
     layout: &SegmentLayout,
     mosaic: &MosaicLayout,
@@ -1005,10 +1208,16 @@ fn collect_mosaic_claims(
     inc_claim: Gf128,
     bus_claims: &ShoutPcsClaims,
     sel_shift_claims: &magnetar_memory::SelectorPcsClaims,
+    sel_stage_claims: &magnetar_memory::SelectorPcsClaims,
+    sel_class_claims: &magnetar_memory::SelectorPcsClaims,
     sel_store_claims: &magnetar_memory::SelectorPcsClaims,
     shift_layout: &RoutingLayout,
     shift_router: &RouterProof,
     shift_terminal: &[Gf128],
+    stage_layout: &RoutingLayout,
+    stage_router: &RouterProof,
+    stage_terminal: &[Gf128],
+    stage_g_claim: Gf128,
     store_layout: &RoutingLayout,
     store_router: &RouterProof,
     store_terminal: &[Gf128],
@@ -1127,12 +1336,39 @@ fn collect_mosaic_claims(
         }
     }
     // 6. The selector checks' claims.
-    for src in [sel_shift_claims, sel_store_claims] {
+    for src in [
+        sel_shift_claims,
+        sel_stage_claims,
+        sel_class_claims,
+        sel_store_claims,
+    ] {
         for c in &src.components {
             out.push(MosaicClaim::new(idx("fetch-ra"), c.point.clone(), c.value));
         }
     }
-    // 7. The shift router's X claim → the shift-src segment.
+    // 6b. The stage routing's claims: the X claim lifts onto the
+    // shift-src copy; the b-select factor's claim gives the shamt
+    // segment's claim: Ŝ(r_s, r_j) = Ĝ' + 1 + r_b.
+    {
+        let x_pt = terminal_x_point(stage_layout, stage_terminal);
+        // The u-slice IS the bit index (6 vars) ++ the j-slice.
+        let mut pt = x_pt[..6].to_vec();
+        pt.extend_from_slice(&x_pt[stage_layout.u_vars..]);
+        out.push(MosaicClaim::new(
+            idx("seg-shift-src"),
+            pt,
+            stage_router.x_value,
+        ));
+        let [_, j_off, _, h_off, _] = stage_layout.offsets();
+        let r_b = stage_terminal[h_off + 5];
+        let r_s: Vec<Gf128> = stage_terminal[h_off + 2..h_off + 5].to_vec();
+        let r_j: Vec<Gf128> = stage_terminal[j_off..j_off + n].to_vec();
+        let mut sh_pt = r_s;
+        sh_pt.extend_from_slice(&r_j);
+        let sh_val = stage_g_claim + ONE + r_b;
+        out.push(MosaicClaim::new(idx("seg-shamt"), sh_pt, sh_val));
+    }
+    // 7. The shift router's X claim → the shift-src copy segment.
     {
         let x_pt = terminal_x_point(shift_layout, shift_terminal);
         // The u-slice IS the bit index (6 vars) ++ the j-slice.
@@ -1144,7 +1380,7 @@ fn collect_mosaic_claims(
             shift_router.x_value,
         ));
     }
-    // 8. The store router's X split claims.
+    // 8. The store router's X split claims → the copy segments.
     {
         let [p_old, p_src] = terminal_store_src_points(store_layout, store_terminal);
         out.push(MosaicClaim::new(
@@ -1338,6 +1574,33 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         &proof.shift_router,
         &mut t,
     )?;
+    // ---- 5a'. The stage router (the register-shift chain).
+    let (st_o, st_u, st_h) = (vk.stage_tensor.1, vk.stage_tensor.2, vk.stage_tensor.3);
+    let stage_layout = RoutingLayout {
+        o_vars: st_o,
+        j_vars: n,
+        u_vars: st_u,
+        h_vars: st_h,
+        a_vars: 0,
+    };
+    let stage_r_pub = {
+        let [_, _j_off, u_off, h_off, _] = stage_layout.offsets();
+        let mut active = (0..st_o).collect::<Vec<usize>>();
+        active.extend(u_off..u_off + st_u);
+        active.extend(h_off..h_off + st_h);
+        PaddedTableFactor::new(vk.stage_tensor.0.clone(), active, stage_layout.joint_vars())
+    };
+    let stage_claims = verify_routing(
+        &stage_layout,
+        seg("stage-out").value,
+        &r_val,
+        &r_inst,
+        &stage_r_pub,
+        2,
+        0,
+        &proof.stage_router,
+        &mut t,
+    )?;
     // ---- 5b. The store router.
     let (o_vs, u_vs, h_vs, a_vs) = (
         vk.store_tensor.1,
@@ -1429,6 +1692,42 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
     };
     let sel_shift_claims =
         verify_selector_shout(&sel_shift, 1, &proof.sel_shift, "sel-shift", &mut t)?;
+    // The class-selector check (the decode-class one-hot vs the ROM).
+    let sel_class = {
+        let cls = seg("class");
+        SelectorShoutSpec {
+            a: a_rom,
+            n,
+            r_j: r_inst.clone(),
+            factors: vec![SelectorCheckSpec {
+                h_vars: 5,
+                r_h: cls.r_local.clone(),
+                claim: cls.value,
+                rom_sel: vk.rom.class.clone(),
+            }],
+        }
+    };
+    let sel_class_claims =
+        verify_selector_shout(&sel_class, 1, &proof.sel_class, "sel-class", &mut t)?;
+    // The stage selector check (the (kind, stage) one-hot vs sel_ks).
+    let sel_stage = {
+        let [_, j_off, _, h_off, _] = stage_layout.offsets();
+        let r_j = stage_claims.r_joint[j_off..j_off + n].to_vec();
+        SelectorShoutSpec {
+            a: a_rom,
+            n,
+            r_j,
+            factors: vec![SelectorCheckSpec {
+                h_vars: 5,
+                r_h: stage_claims.r_joint[h_off..h_off + 5].to_vec(),
+                claim: proof.stage_router.q_values[0],
+                rom_sel: vk.rom.sel_ks.clone(),
+            }],
+        }
+    };
+    let sel_stage_claims =
+        verify_selector_shout(&sel_stage, 1, &proof.sel_stage, "sel-stage", &mut t)?;
+    // The store selector check.
     let sel_store = {
         let [_, j_off, _, h_off, _] = store_layout.offsets();
         let r_j = store_claims.r_joint[j_off..j_off + n].to_vec();
@@ -1458,10 +1757,16 @@ pub fn verify(vk: &VerifyingKey, pub_in: &PublicInput, proof: &Proof) -> Result<
         proof.inc_claim,
         &bus_claims,
         &sel_shift_claims,
+        &sel_stage_claims,
+        &sel_class_claims,
         &sel_store_claims,
         &shift_layout,
         &proof.shift_router,
         &shift_claims.r_joint,
+        &stage_layout,
+        &proof.stage_router,
+        &stage_claims.r_joint,
+        proof.stage_g_claim,
         &store_layout,
         &proof.store_router,
         &store_claims.r_joint,
@@ -1594,6 +1899,134 @@ mod tests {
         );
         // A wrong output must fail to even produce a proof (the prover
         // asserts the execution matches).
+    }
+
+    #[test]
+    fn end_to_end_logic_and_control() {
+        // Logic ops (XOR/OR/AND through T2 + the PAND aux), a large
+        // immediate shift (shamt 40 > 3, exercising the full 6-bit amount
+        // space), a register shift by a large amount (the 6-stage chain
+        // through the scratch cell), JAL/JALR (the expansion's link rows),
+        // and LUI/AUIPC (the pre-adjusted immediates).
+        let lui = |imm: u32, rd: u32| (imm << 12) | (rd << 7) | 0x37;
+        let slli = |sh: u32, rs1: u32, rd: u32| {
+            ((sh & 0x3f) << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x13
+        };
+        let xor =
+            |rs2: u32, rs1: u32, rd: u32| (rs2 << 20) | (rs1 << 15) | (4 << 12) | (rd << 7) | 0x33;
+        let or =
+            |rs2: u32, rs1: u32, rd: u32| (rs2 << 20) | (rs1 << 15) | (6 << 12) | (rd << 7) | 0x33;
+        let and =
+            |rs2: u32, rs1: u32, rd: u32| (rs2 << 20) | (rs1 << 15) | (7 << 12) | (rd << 7) | 0x33;
+        let sll =
+            |rs2: u32, rs1: u32, rd: u32| (rs2 << 20) | (rs1 << 15) | (1 << 12) | (rd << 7) | 0x33;
+        let srl =
+            |rs2: u32, rs1: u32, rd: u32| (rs2 << 20) | (rs1 << 15) | (5 << 12) | (rd << 7) | 0x33;
+        let program = vec![
+            lui(0x12345, 1),              // x1 = 0x12345_000
+            enc_i(0x67, 0, 0, 2, 0x13),   // x2 = 0x67
+            xor(2, 1, 3),                 // x3 = x1 ^ x2
+            or(2, 1, 4),                  // x4 = x1 | x2
+            and(2, 1, 5),                 // x5 = x1 & x2
+            slli(40, 1, 6),               // x6 = x1 << 40
+            enc_i(41, 0, 0, 7, 0x13),     // x7 = 41 (a big shift amount)
+            sll(7, 1, 8),                 // x8 = x1 << 41 (the stage chain)
+            srl(7, 6, 9),                 // x9 = x6 >> 41
+            (9 << 15) | (10 << 7) | 0x33, // x10 = x9 + x0
+            0x0000_0073,
+        ];
+        let trace = magnetar_cpu::interp::execute(&program, &[], 256);
+        let out = trace.final_state.regs[10];
+        // Sanity: the semantics.
+        assert_eq!(trace.final_state.regs[3], 0x12345_000 ^ 0x67);
+        assert_eq!(trace.final_state.regs[8], 0x12345_000u64 << 41);
+        let (pk, vk) = keygen(program, 256);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: out,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert!(
+            verify(&vk, &pub_in, &proof).is_ok(),
+            "honest logic/control proof must verify"
+        );
+    }
+
+    #[test]
+    fn tamper_class_and_stage_rejected() {
+        // A register shift exercises the class one-hot, the stage routing,
+        // and the shamt machinery; each tamper must be rejected.
+        let program = vec![
+            enc_i(0xF0, 0, 0, 1, 0x13),                          // x1 = 0xF0
+            enc_i(5, 0, 0, 2, 0x13),                             // x2 = 5 (the amount)
+            (2 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x33, // sll x3, x1, x2
+            (3 << 15) | (10 << 7) | 0x33,                        // x10 = x3
+            0x0000_0073,
+        ];
+        let (pk, vk) = keygen(program, 64);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: 0xF0 << 5,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert!(verify(&vk, &pub_in, &proof).is_ok());
+        let cls_idx = pk.layout.index_of("class").expect("class segment");
+        // 1. A tampered class segment value: the class-selector check
+        //    binds it to the ROM — the claim can no longer match.
+        let mut p = proof.clone();
+        p.vs.segment_values[cls_idx] += ONE;
+        assert!(
+            verify(&vk, &pub_in, &p).is_err(),
+            "tampered class segment value"
+        );
+        // 2. A tampered stage-router X claim.
+        let mut p = proof.clone();
+        p.stage_router.x_value += ONE;
+        assert!(verify(&vk, &pub_in, &p).is_err(), "tampered stage X claim");
+        // 3. A tampered b-select claim (breaks the shamt identity).
+        let mut p = proof.clone();
+        p.stage_g_claim += ONE;
+        assert!(
+            verify(&vk, &pub_in, &p).is_err(),
+            "tampered stage b-select claim"
+        );
+        // 4. A tampered stage selector round message.
+        let mut p = proof.clone();
+        if let Some(r0) = p.sel_stage.per_factor.first_mut() {
+            if let Some(c0) = r0.rounds.first_mut() {
+                if let Some(cc) = c0.first_mut() {
+                    *cc += ONE;
+                }
+            }
+        }
+        assert!(
+            verify(&vk, &pub_in, &p).is_err(),
+            "tampered stage selector round"
+        );
+        // 5. A tampered class selector round message.
+        let mut p = proof.clone();
+        if let Some(r0) = p.sel_class.per_factor.first_mut() {
+            if let Some(c0) = r0.rounds.first_mut() {
+                if let Some(cc) = c0.first_mut() {
+                    *cc += ONE;
+                }
+            }
+        }
+        assert!(
+            verify(&vk, &pub_in, &p).is_err(),
+            "tampered class selector round"
+        );
+        // 6. A tampered stage routing round message.
+        let mut p = proof.clone();
+        if let Some(c0) = p.stage_router.rounds.first_mut() {
+            if let Some(cc) = c0.first_mut() {
+                *cc += ONE;
+            }
+        }
+        assert!(
+            verify(&vk, &pub_in, &p).is_err(),
+            "tampered stage routing round"
+        );
     }
 
     #[test]

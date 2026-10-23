@@ -159,8 +159,8 @@ fn shared_round(
     t: &mut Transcript,
     label: &str,
 ) -> (Gf128, (Vec<Gf128>, Vec<Gf128>)) {
-    let m1 = p1.message().0;
-    let m2 = p2.message().0;
+    let m1 = p1.message_cached().0;
+    let m2 = p2.message_cached().0;
     let mut buf = Vec::with_capacity((m1.len() + m2.len()) * 16);
     for c in m1.iter().chain(m2.iter()) {
         buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
@@ -179,8 +179,8 @@ fn separate_round(
     t: &mut Transcript,
     label: &str,
 ) -> ((Gf128, Gf128), (Vec<Gf128>, Vec<Gf128>)) {
-    let m1 = p1.message().0;
-    let m2 = p2.message().0;
+    let m1 = p1.message_cached().0;
+    let m2 = p2.message_cached().0;
     let mut buf = Vec::with_capacity((m1.len() + m2.len()) * 16);
     for c in m1.iter().chain(m2.iter()) {
         buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
@@ -191,6 +191,24 @@ fn separate_round(
     p1.fold(r1);
     p2.fold(r2);
     ((r1, r2), (m1, m2))
+}
+
+// DEBUG helpers.
+fn base_unused() {}
+fn inner_p_segment_value(
+    layout: &SegmentLayout,
+    i: usize,
+    z_fold: &[Gf128],
+    r_low: &[Gf128],
+) -> Gf128 {
+    let lv = layout.local_vars(i);
+    let base = layout.offsets[i];
+    let seg: Vec<Gf128> = z_fold[base..base + (1usize << lv)].to_vec();
+    if lv == 0 {
+        seg[0]
+    } else {
+        eval_mle(&seg, &r_low[..lv])
+    }
 }
 
 fn outer_spec(
@@ -264,8 +282,8 @@ pub fn prove_virtual_spartan(
     // Lockstep: instance rounds share challenges (HighBitsFirst(s) binds the
     // high s instance variables first), row rounds separate.
     let order = BindOrder::HighBitsFirst { high: s };
-    let mut p_bin = SumcheckProver::new(&spec_bin, order);
-    let mut p_fld = SumcheckProver::new(&spec_fld, order);
+    let mut p_bin = SumcheckProver::new_owned(spec_bin, order);
+    let mut p_fld = SumcheckProver::new_owned(spec_fld, order);
     let mut outer_shared = Vec::with_capacity(s);
     let mut r_inst_ch = Vec::with_capacity(s);
     for i in 0..s {
@@ -334,11 +352,11 @@ pub fn prove_virtual_spartan(
         }],
         claim: v_star,
     };
-    let mut inner_p = SumcheckProver::new(&inner_spec, BindOrder::Increasing);
+    let mut inner_p = SumcheckProver::new_owned(inner_spec, BindOrder::Increasing);
     let mut inner = Vec::with_capacity(row_vars);
     let mut r_col_ch = Vec::with_capacity(row_vars);
     for _ in 0..row_vars {
-        let msg = inner_p.message();
+        let msg = inner_p.message_cached();
         inner.push(msg.0.clone());
         r_col_ch.push(inner_p.absorb_and_fold(t, "vs-inner"));
     }

@@ -157,10 +157,10 @@ pub fn prove_shout(
         }],
         claim: lhs,
     };
-    let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
+    let mut prover = SumcheckProver::new_owned(spec, BindOrder::Increasing);
     let mut phi_rounds = Vec::with_capacity(a);
     for _ in 0..a {
-        let msg = prover.message();
+        let msg = prover.message_cached();
         phi_rounds.push(msg.0.clone());
         prover.absorb_and_fold(t, "shout-phi");
     }
@@ -222,10 +222,10 @@ pub fn prove_onehot(
         ],
         claim: ZERO,
     };
-    let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
+    let mut prover = SumcheckProver::new_owned(spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(comp.cycle_vars);
     for _ in 0..comp.cycle_vars {
-        let msg = prover.message();
+        let msg = prover.message_cached();
         rounds.push(msg.0.clone());
         prover.absorb_and_fold(t, label);
     }

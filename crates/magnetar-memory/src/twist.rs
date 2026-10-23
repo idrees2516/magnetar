@@ -206,10 +206,10 @@ fn run_port_sumcheck(
         }],
         claim,
     };
-    let mut p = SumcheckProver::new(&spec, BindOrder::Increasing);
+    let mut p = SumcheckProver::new_owned(spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(joint_vars);
     for _ in 0..joint_vars {
-        let msg = p.message();
+        let msg = p.message_cached();
         rounds.push(msg.0.clone());
         p.absorb_and_fold(t, label);
     }
@@ -289,10 +289,10 @@ fn run_reconstruction(
         }],
         claim: val_claim + m0_at,
     };
-    let mut p = SumcheckProver::new(&spec, BindOrder::Increasing);
+    let mut p = SumcheckProver::new_owned(spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(n);
     for _ in 0..n {
-        let msg = p.message();
+        let msg = p.message_cached();
         rounds.push(msg.0.clone());
         p.absorb_and_fold(t, label);
     }
@@ -467,10 +467,10 @@ pub fn prove_twist(
                 }],
                 claim: ONE,
             };
-            let mut pr = SumcheckProver::new(&spec, BindOrder::Increasing);
+            let mut pr = SumcheckProver::new_owned(spec, BindOrder::Increasing);
             let mut rounds = Vec::new();
             for _ in 0..kj_vars {
-                let msg = pr.message();
+                let msg = pr.message_cached();
                 rounds.push(msg.0.clone());
                 pr.absorb_and_fold(t, &format!("twist-st1-{port}-{i}"));
             }

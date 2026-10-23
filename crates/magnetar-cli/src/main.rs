@@ -59,7 +59,11 @@ fn cmd_fib(rounds: u32) {
     let prove_ms = t0.elapsed().as_millis();
 
     let t1 = Instant::now();
-    let ok = verify(&vk, &pub_in, &proof).is_ok();
+    let vres = verify(&vk, &pub_in, &proof);
+    let ok = vres.is_ok();
+    if let Err(e) = &vres {
+        println!("verify error: {e}");
+    }
     let verify_ms = t1.elapsed().as_millis();
 
     println!("prove: {prove_ms} ms, verify: {verify_ms} ms, accepted: {ok}");

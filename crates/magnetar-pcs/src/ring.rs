@@ -101,11 +101,11 @@ pub fn prove_ring_switch(
         }],
         claim: y,
     };
-    let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
+    let mut prover = SumcheckProver::new_owned(spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
     for _ in 0..n {
-        let msg = prover.message();
+        let msg = prover.message_cached();
         rounds.push(msg.0.clone());
         challenges.push(prover.absorb_and_fold(t, "ring-eval"));
     }

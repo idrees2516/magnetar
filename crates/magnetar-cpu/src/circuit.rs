@@ -43,7 +43,7 @@
 //! idiom: the selector times the *difference*, vacuous when the selector
 //! is zero).
 
-use crate::expand::RomRow;
+use crate::expand::{row_class, RomRow, VirtualKind};
 use crate::interp::CycleRecord;
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 use magnetar_spartan::SparseMatrix;
@@ -58,15 +58,18 @@ impl WITNESS_LAYOUT {
     pub const OP_BITS: usize = 7;
     pub const IDX_BITS: usize = 6;
     pub const FUNCT3_BITS: usize = 3;
-    pub const IMM_BITS: usize = 13;
+    pub const IMM_BITS: usize = 36;
     // Total witness columns (before padding).
-    pub const W_COLS: usize = 1024;
+    pub const W_COLS: usize = 2048;
     /// The `1` column index in `z`.
     pub const ONE_COL: usize = Self::W_COLS;
     /// Public inputs per cycle.
     pub const X_COLS: usize = Self::M / 2 - 1;
-    /// Total columns `m = 2·|w|` (power of two).
-    pub const M: usize = 2048;
+    /// Total columns `m = 2·|w|` (power of two). v5 grew the square to
+    /// 4096: the class one-hot, the stage-routing output, and the AND
+    /// product aux join the router-source copies (~1088 used columns;
+    /// the paper's own witness is far wider).
+    pub const M: usize = 4096;
 
     // ---- Virtual segments ----
     pub const RS1: usize = 0;
@@ -74,33 +77,49 @@ impl WITNESS_LAYOUT {
     pub const RD: usize = 128;
     pub const LOAD_VAL: usize = 192;
     pub const SHIFT_OUT: usize = 256;
-    // ---- Direct segments ----
-    pub const T1: usize = 320;
+    // ---- Direct segments (v5) ----
+    /// The per-cycle stage-routing output (zero off stage cycles).
+    pub const STAGE_OUT: usize = 320;
     pub const T2: usize = 384;
     pub const CARRY_OFF: usize = 448;
     pub const ALU: usize = 512;
-    pub const SHIFT_SRC: usize = 576;
-    pub const STORE_OLD: usize = 640;
-    pub const STORE_SRC: usize = 704;
-    pub const FLAGS: usize = 768; // 16 flag bits
-    pub const OFF: usize = 784; // 3 offset bits + padding
-    pub const RAM_ADDR: usize = 792; // 8 address bits
+    /// The per-bit AND product `P_i = rs1_i · t2_i` (the shared aux for
+    /// the AND/OR value rows; defined unconditionally by its product row).
+    pub const PAND: usize = 576;
+    /// The router-source copies (committed so the BinaryRouter X claims
+    /// lift onto the Mosaic directly — the paper's step-4 interface).
+    pub const SHIFT_SRC: usize = 640;
+    pub const STORE_OLD: usize = 704;
+    pub const STORE_SRC: usize = 768;
+    /// The decode-class one-hot (32 classes; authenticated against the
+    /// ROM by the class-selector sum-check, and the source of every
+    /// per-cycle flag via linear folds).
+    pub const CLASS: usize = 832;
+    pub const CLASS_COUNT: usize = 32;
+    pub const FLAGS: usize = 864; // 16 flag bits
+    pub const OFF: usize = 880; // 3 offset bits + padding
+    pub const RAM_ADDR: usize = 888; // 8 address bits
                                      // ---- Virtual (cont'd) ----
-    pub const PC: usize = 800; // 8 micro-PC bits
-    /// The fetch bus at a 64-aligned offset (808..832 is zero padding).
-    pub const FETCH: usize = 832; // 64-bit instruction bus
-                                  // ---- Byte-lane mux aux (direct, 896..960) ----
-    pub const EQA: usize = 896; // 8: [off == a]
-    pub const PA: usize = 904; // 8: partial products
-    pub const EQB: usize = 912; // 8: [off+1 ≡ a (mod 8)]
-    pub const PB: usize = 920; // 8
-    pub const CA: usize = 928; // 8: EQA·is_load_byte
-    pub const CH: usize = 936; // 8: EQA·is_load_half
-    pub const CH2: usize = 944; // 8: EQB·is_load_half
-    pub const NH: usize = 952; // (1+is_word)(1+is_half)
-    pub const WNL: usize = 953; // we·(1+is_load) — the write mux gate
+    pub const PC: usize = 896; // 8 micro-PC bits
+    /// The control aux (16-aligned): NH, WNL, the load-extension gates.
+    pub const AUX: usize = 912;
+    pub const NH: usize = 912; // (1+is_word)(1+is_half)
+    pub const WNL: usize = 913; // we·(1+is_load) — the write mux gate
+                                // The fetch bus at a 64-aligned offset.
+    pub const FETCH: usize = 960; // 64-bit instruction bus
+                                  // ---- Byte-lane mux aux (direct, 1024..1088) ----
+    pub const EQA: usize = 1024; // 8: [off == a]
+    pub const PA: usize = 1032; // 8: partial products
+    pub const EQB: usize = 1040; // 8: [off+1 ≡ a (mod 8)]
+    pub const PB: usize = 1048; // 8
+    pub const CA: usize = 1056; // 8: EQA·is_load_byte
+    pub const CH: usize = 1064; // 8: EQA·is_load_half
+    pub const CH2: usize = 1072; // 8: EQB·is_load_half
+    /// The shift-amount bits: rs2's low 6 bits per cycle (the stage
+    /// routing's runtime b-select source; copy-constrained to rs2).
+    pub const SHAMT: usize = 1088; // 8 bits (6 used)
     /// First unused witness column.
-    pub const USED: usize = 960;
+    pub const USED: usize = 1096;
 
     // Flag bit positions (within FLAGS).
     pub const F_SUB: usize = 0;
@@ -114,6 +133,21 @@ impl WITNESS_LAYOUT {
     pub const F_LD_BYTE: usize = 8;
     pub const F_LD_HALF: usize = 9;
     pub const F_LD_WORD: usize = 10;
+    /// The signed-load flag (`funct3` ∈ {0, 1, 2}: LB/LH/LW).
+    pub const F_LDS: usize = 11;
+    /// The 32-bit-load flag (`funct3` ∈ {2, 6}: LW/LWU).
+    pub const F_LW32: usize = 12;
+    /// The load-family gates: `G_LB = is_load·ld_byte`, `G_LH = is_load·ld_half`,
+    /// `G_LW = is_load·ld_w32`, then the signed/unsigned split per width.
+    pub const G_LB: usize = 914;
+    pub const G_LH: usize = 915;
+    pub const G_LW: usize = 916;
+    pub const G_BZ: usize = 917;
+    pub const G_BS: usize = 918;
+    pub const G_HZ: usize = 919;
+    pub const G_HS: usize = 920;
+    pub const G_WZ: usize = 921;
+    pub const G_WS: usize = 922;
 
     // The fetch bus field positions.
     pub const BUS_OP: usize = 0;
@@ -147,29 +181,56 @@ pub fn witness_row(rec: &CycleRecord, row: &RomRow, public_x: &[Gf128]) -> Vec<G
     put_word(&mut z, WITNESS_LAYOUT::SHIFT_OUT, rec.shift_out);
     // The adder operands.
     let sub = (rec.is_arith && rec.is_sub_op) as u64;
-    let t1 = rec.alu_a;
     let t2 = rec.alu_b ^ if sub != 0 { u64::MAX } else { 0 };
-    put_word(&mut z, WITNESS_LAYOUT::T1, t1);
     put_word(&mut z, WITNESS_LAYOUT::T2, t2);
     let mut carry = 0u64;
     let mut c = sub;
     for i in 0..64 {
         carry |= c << i;
-        let a = (t1 >> i) & 1;
+        let a = (rec.alu_a >> i) & 1;
         let b = (t2 >> i) & 1;
         c = (a & b) | (a & c) | (b & c);
     }
     put_word(&mut z, WITNESS_LAYOUT::CARRY_OFF, carry);
     let alu = if rec.is_arith {
-        t1 ^ t2 ^ carry
+        rec.alu_a ^ t2 ^ carry
     } else {
         rec.alu_out
     };
     put_word(&mut z, WITNESS_LAYOUT::ALU, alu);
-    // The router source copies.
+    // The decode-class one-hot (authenticated against the ROM by the
+    // class-selector sum-check; every flag is a linear fold of it).
+    {
+        let cls = row_class(row);
+        for c in 0..WITNESS_LAYOUT::CLASS_COUNT {
+            z[WITNESS_LAYOUT::CLASS + c] = Gf128((c == cls) as u128);
+        }
+    }
+    // The stage-routing output: the written value on shift-stage cycles,
+    // zero elsewhere (the stage routing's Y).
+    {
+        let is_stage = matches!(row.kind, VirtualKind::ShiftStage { .. });
+        put_word(
+            &mut z,
+            WITNESS_LAYOUT::STAGE_OUT,
+            if is_stage { rec.rd_val } else { 0 },
+        );
+    }
+    // The router source copies (the BinaryRouter X interface).
     put_word(&mut z, WITNESS_LAYOUT::SHIFT_SRC, rec.rs1_val);
     put_word(&mut z, WITNESS_LAYOUT::STORE_OLD, rec.ram_word);
     put_word(&mut z, WITNESS_LAYOUT::STORE_SRC, rec.rs2_val);
+    // The AND product aux: P_i = rs1_i · t2_i (defined by its product
+    // row; consumed only by the class-selected AND/OR value rows).
+    {
+        let pv = rec.alu_a & t2;
+        put_word(&mut z, WITNESS_LAYOUT::PAND, pv);
+    }
+    // The shift-amount bits: rs2's low 6 bits (zero-padded to 8).
+    for k in 0..8 {
+        z[WITNESS_LAYOUT::SHAMT + k] =
+            Gf128((((rec.rs2_val >> k) & 1) as u128) * ((k < 6) as u128));
+    }
     // Flags.
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_SUB] = Gf128(sub as u128);
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_WE] = Gf128(rec.we as u128);
@@ -182,6 +243,12 @@ pub fn witness_row(rec: &CycleRecord, row: &RomRow, public_x: &[Gf128]) -> Vec<G
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_BYTE] = Gf128(rec.ld_byte as u128);
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_HALF] = Gf128(rec.ld_half as u128);
     z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_WORD] = Gf128(rec.ld_word as u128);
+    // The signed / 32-bit load flags from the ROM row's funct3.
+    let f3 = row.funct3;
+    z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LDS] =
+        Gf128((rec.is_load && matches!(f3, 0 | 1 | 2)) as u128);
+    z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LW32] =
+        Gf128((rec.is_load && matches!(f3, 2 | 6)) as u128);
     // The store offset bits.
     for k in 0..3 {
         z[WITNESS_LAYOUT::OFF + k] = Gf128(((rec.byte_offset >> k) & 1) as u128);
@@ -221,6 +288,28 @@ pub fn witness_row(rec: &CycleRecord, row: &RomRow, public_x: &[Gf128]) -> Vec<G
     }
     let _ = off;
     z[WITNESS_LAYOUT::NH] = Gf128((!rec.ld_word && !rec.ld_half) as u128);
+    // The load-extension gates (products of the flags; the circuit
+    // constrains each gate to its product).
+    let is_load_f = z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_IS_LOAD];
+    let lds = z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LDS];
+    let g_lb = mul(
+        is_load_f,
+        z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_BYTE],
+    );
+    let g_lh = mul(
+        is_load_f,
+        z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_HALF],
+    );
+    let g_lw = mul(is_load_f, z[WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LW32]);
+    z[WITNESS_LAYOUT::G_LB] = g_lb;
+    z[WITNESS_LAYOUT::G_LH] = g_lh;
+    z[WITNESS_LAYOUT::G_LW] = g_lw;
+    z[WITNESS_LAYOUT::G_BZ] = mul(g_lb, ONE + lds);
+    z[WITNESS_LAYOUT::G_BS] = mul(g_lb, lds);
+    z[WITNESS_LAYOUT::G_HZ] = mul(g_lh, ONE + lds);
+    z[WITNESS_LAYOUT::G_HS] = mul(g_lh, lds);
+    z[WITNESS_LAYOUT::G_WZ] = mul(g_lw, ONE + lds);
+    z[WITNESS_LAYOUT::G_WS] = mul(g_lw, lds);
     z[WITNESS_LAYOUT::WNL] = Gf128((rec.we && !rec.is_load) as u128);
     z[WITNESS_LAYOUT::ONE_COL] = ONE;
     for (j, &xv) in public_x.iter().enumerate() {
@@ -294,9 +383,10 @@ pub fn build_circuit() -> CircuitSpec {
             &[(col, ONE)],
         );
     }
-    // 2. The adder carry recurrence: (t1_i + c_i)(t2_i + c_i) = c_{i+1} + c_i.
+    // 2. The adder carry recurrence: (rs1_i + c_i)(t2_i + c_i) = c_{i+1} + c_i
+    //    (t1 was a pure copy of rs1 — removed in layout v3).
     for i in 0..63 {
-        let t1i = WITNESS_LAYOUT::T1 + i;
+        let t1i = WITNESS_LAYOUT::RS1 + i;
         let t2i = WITNESS_LAYOUT::T2 + i;
         let ci = WITNESS_LAYOUT::CARRY_OFF + i;
         let cn = WITNESS_LAYOUT::CARRY_OFF + i + 1;
@@ -309,7 +399,7 @@ pub fn build_circuit() -> CircuitSpec {
             &[(cn, ONE), (ci, ONE)],
         );
     }
-    // 3. Copy bindings (linear): (x + y)·1 = 0.
+    // 3. The router-source copy bindings (linear): (x + y)·1 = 0.
     for i in 0..64 {
         for (x, y) in [
             (WITNESS_LAYOUT::SHIFT_SRC + i, WITNESS_LAYOUT::RS1 + i),
@@ -322,6 +412,332 @@ pub fn build_circuit() -> CircuitSpec {
                 &mut c1,
                 &[(x, ONE), (y, ONE)],
                 &[(WITNESS_LAYOUT::ONE_COL, ONE)],
+                &[],
+            );
+        }
+    }
+    // 3b. The T2 operand binding (class-gated): register forms set
+    //     T2 = rs2, immediate forms T2 = the bus immediate — so the adder
+    //     validates the right operand per class.
+    {
+        use crate::expand::class as cl;
+        let reg_classes = [
+            cl::ADD_REG,
+            cl::SUBSLT_REG,
+            cl::XOR_REG,
+            cl::OR_REG,
+            cl::AND_REG,
+            cl::BRANCH,
+        ];
+        let imm_classes = [
+            cl::ADD_IMM,
+            cl::SUBSLT_IMM,
+            cl::XOR_IMM,
+            cl::OR_IMM,
+            cl::AND_IMM,
+            cl::SHIFT_IMM,
+            cl::LB,
+            cl::LBU,
+            cl::LH,
+            cl::LHU,
+            cl::LW,
+            cl::LWU,
+            cl::LD,
+            cl::STORE,
+        ];
+        let fold = |cs: &[usize]| -> Vec<(usize, Gf128)> {
+            cs.iter()
+                .map(|&c| (WITNESS_LAYOUT::CLASS + c, ONE))
+                .collect()
+        };
+        for i in 0..64 {
+            // reg forms: fold·(T2_i + rs2_i) = 0
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &fold(&reg_classes),
+                &[
+                    (WITNESS_LAYOUT::T2 + i, ONE),
+                    (WITNESS_LAYOUT::RS2 + i, ONE),
+                ],
+                &[],
+            );
+            // imm forms: fold·(T2_i + bus_imm_i) = 0. The bus carries
+            // the immediate's low 36 bits (its word's whole upper
+            // half: the 12-bit I/S immediates, the 20-bit U-immediates,
+            // and the JAL links); the top bits are the sign extension
+            // (bit 35).
+            let imm_bit = if i < WITNESS_LAYOUT::IMM_BITS {
+                WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_IMM + i
+            } else {
+                WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_IMM + WITNESS_LAYOUT::IMM_BITS - 1
+            };
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &fold(&imm_classes),
+                &[(WITNESS_LAYOUT::T2 + i, ONE), (imm_bit, ONE)],
+                &[],
+            );
+        }
+        for i in 0..64 {
+            // The AND product: P_i = rs1_i · t2_i (unconditional).
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &[(WITNESS_LAYOUT::RS1 + i, ONE)],
+                &[(WITNESS_LAYOUT::T2 + i, ONE)],
+                &[(WITNESS_LAYOUT::PAND + i, ONE)],
+            );
+            // XOR: fold_xor·(alu_i + rs1_i + t2_i) = 0 (char-2 XOR is +).
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &fold(&[cl::XOR_REG, cl::XOR_IMM]),
+                &[
+                    (WITNESS_LAYOUT::ALU + i, ONE),
+                    (WITNESS_LAYOUT::RS1 + i, ONE),
+                    (WITNESS_LAYOUT::T2 + i, ONE),
+                ],
+                &[],
+            );
+            // OR: fold_or·(alu_i + rs1_i + t2_i + P_i) = 0 (a|b = a+b+ab).
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &fold(&[cl::OR_REG, cl::OR_IMM]),
+                &[
+                    (WITNESS_LAYOUT::ALU + i, ONE),
+                    (WITNESS_LAYOUT::RS1 + i, ONE),
+                    (WITNESS_LAYOUT::T2 + i, ONE),
+                    (WITNESS_LAYOUT::PAND + i, ONE),
+                ],
+                &[],
+            );
+            // AND: fold_and·(alu_i + P_i) = 0.
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &fold(&[cl::AND_REG, cl::AND_IMM]),
+                &[
+                    (WITNESS_LAYOUT::ALU + i, ONE),
+                    (WITNESS_LAYOUT::PAND + i, ONE),
+                ],
+                &[],
+            );
+        }
+    }
+    // 3d. The class one-hot and the flag folds: the one-hot sums to one,
+    //     and every per-cycle flag is a linear fold of the class columns
+    //     (so the flag-conditioned rows cannot be bypassed — the class
+    //     itself is authenticated against the ROM by the class-selector
+    //     sum-check).
+    {
+        use crate::expand::class as cl;
+        // Σ_c class_c = 1.
+        {
+            let all: Vec<(usize, Gf128)> = (0..WITNESS_LAYOUT::CLASS_COUNT)
+                .map(|c| (WITNESS_LAYOUT::CLASS + c, ONE))
+                .collect();
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &all,
+                &[(WITNESS_LAYOUT::ONE_COL, ONE)],
+                &[(WITNESS_LAYOUT::ONE_COL, ONE)],
+            );
+        }
+        let we_classes = [
+            cl::ADD_REG,
+            cl::ADD_IMM,
+            cl::SUBSLT_REG,
+            cl::SUBSLT_IMM,
+            cl::XOR_REG,
+            cl::XOR_IMM,
+            cl::OR_REG,
+            cl::OR_IMM,
+            cl::AND_REG,
+            cl::AND_IMM,
+            cl::SHIFT_IMM,
+            cl::STAGE,
+            cl::LB,
+            cl::LBU,
+            cl::LH,
+            cl::LHU,
+            cl::LW,
+            cl::LWU,
+            cl::LD,
+            cl::SYSTEM,
+        ];
+        let flag_folds: [(usize, Vec<usize>); 13] = [
+            (
+                WITNESS_LAYOUT::F_SUB,
+                vec![cl::SUBSLT_REG, cl::SUBSLT_IMM, cl::BRANCH],
+            ),
+            (WITNESS_LAYOUT::F_WE, we_classes.to_vec()),
+            (
+                WITNESS_LAYOUT::F_IS_LOAD,
+                vec![cl::LB, cl::LBU, cl::LH, cl::LHU, cl::LW, cl::LWU, cl::LD],
+            ),
+            (WITNESS_LAYOUT::F_IS_STORE, vec![cl::STORE]),
+            (
+                WITNESS_LAYOUT::F_IS_ARITH,
+                vec![
+                    cl::ADD_REG,
+                    cl::ADD_IMM,
+                    cl::SUBSLT_REG,
+                    cl::SUBSLT_IMM,
+                    cl::LB,
+                    cl::LBU,
+                    cl::LH,
+                    cl::LHU,
+                    cl::LW,
+                    cl::LWU,
+                    cl::LD,
+                    cl::STORE,
+                    cl::BRANCH,
+                ],
+            ),
+            (WITNESS_LAYOUT::F_HALT, vec![cl::SYSTEM]),
+            (WITNESS_LAYOUT::F_IS_SHIFT, vec![cl::SHIFT_IMM]),
+            (
+                WITNESS_LAYOUT::F_IS_LOGIC,
+                vec![
+                    cl::XOR_REG,
+                    cl::XOR_IMM,
+                    cl::OR_REG,
+                    cl::OR_IMM,
+                    cl::AND_REG,
+                    cl::AND_IMM,
+                ],
+            ),
+            (WITNESS_LAYOUT::F_LD_BYTE, vec![cl::LB, cl::LBU]),
+            (WITNESS_LAYOUT::F_LD_HALF, vec![cl::LH, cl::LHU]),
+            (WITNESS_LAYOUT::F_LD_WORD, vec![cl::LD]),
+            (WITNESS_LAYOUT::F_LDS, vec![cl::LB, cl::LH, cl::LW]),
+            (WITNESS_LAYOUT::F_LW32, vec![cl::LW, cl::LWU]),
+        ];
+        for (flag, classes) in flag_folds {
+            let f: Vec<(usize, Gf128)> = classes
+                .iter()
+                .map(|&c| (WITNESS_LAYOUT::CLASS + c, ONE))
+                .collect();
+            // flag = Σ_c class_c: (Σ class)·1 − flag = 0.
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &f,
+                &[(WITNESS_LAYOUT::ONE_COL, ONE)],
+                &[(WITNESS_LAYOUT::FLAGS + flag, ONE)],
+            );
+        }
+        // The stage-select: class_stage·(Σβ·stage_out + Σβ·rd) = 0.
+        {
+            let mut b_entries: Vec<(usize, Gf128)> = Vec::new();
+            for i in 0..64 {
+                b_entries.push((WITNESS_LAYOUT::STAGE_OUT + i, Gf128(1u128 << i)));
+                b_entries.push((WITNESS_LAYOUT::RD + i, Gf128(1u128 << i)));
+            }
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &[(WITNESS_LAYOUT::CLASS + cl::STAGE, ONE)],
+                &b_entries,
+                &[],
+            );
+        }
+    }
+    // 3a. The shamt copy: shamt_k = rs2_k for k < 6; zero above.
+    for k in 0..8 {
+        let lhs = if k < 6 {
+            vec![
+                (WITNESS_LAYOUT::SHAMT + k, ONE),
+                (WITNESS_LAYOUT::RS2 + k, ONE),
+            ]
+        } else {
+            vec![(WITNESS_LAYOUT::SHAMT + k, ONE)]
+        };
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lhs,
+            &[(WITNESS_LAYOUT::ONE_COL, ONE)],
+            &[],
+        );
+    }
+    // 3b. The T2 operand binding (class-gated): register forms set
+    //     T2 = rs2, immediate forms T2 = the bus immediate — so the adder
+    //     validates the right operand per class.
+    {
+        use crate::expand::class as cl;
+        let reg_classes = [
+            cl::ADD_REG,
+            cl::SUBSLT_REG,
+            cl::XOR_REG,
+            cl::OR_REG,
+            cl::AND_REG,
+            cl::BRANCH,
+        ];
+        let imm_classes = [
+            cl::ADD_IMM,
+            cl::SUBSLT_IMM,
+            cl::XOR_IMM,
+            cl::OR_IMM,
+            cl::AND_IMM,
+            cl::SHIFT_IMM,
+            cl::LB,
+            cl::LBU,
+            cl::LH,
+            cl::LHU,
+            cl::LW,
+            cl::LWU,
+            cl::LD,
+            cl::STORE,
+        ];
+        let fold = |cs: &[usize]| -> Vec<(usize, Gf128)> {
+            cs.iter()
+                .map(|&c| (WITNESS_LAYOUT::CLASS + c, ONE))
+                .collect()
+        };
+        for i in 0..64 {
+            // reg forms: fold·(T2_i + rs2_i) = 0
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &fold(&reg_classes),
+                &[
+                    (WITNESS_LAYOUT::T2 + i, ONE),
+                    (WITNESS_LAYOUT::RS2 + i, ONE),
+                ],
+                &[],
+            );
+            // imm forms: fold·(T2_i + bus_imm_i) = 0. The bus carries
+            // the immediate's low 36 bits (its word's whole upper
+            // half: the 12-bit I/S immediates, the 20-bit U-immediates,
+            // and the JAL links); the top bits are the sign extension
+            // (bit 35).
+            let imm_bit = if i < WITNESS_LAYOUT::IMM_BITS {
+                WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_IMM + i
+            } else {
+                WITNESS_LAYOUT::FETCH + WITNESS_LAYOUT::BUS_IMM + WITNESS_LAYOUT::IMM_BITS - 1
+            };
+            add(
+                &mut a1,
+                &mut b1,
+                &mut c1,
+                &fold(&imm_classes),
+                &[(WITNESS_LAYOUT::T2 + i, ONE), (imm_bit, ONE)],
                 &[],
             );
         }
@@ -438,28 +854,171 @@ pub fn build_circuit() -> CircuitSpec {
             &[(WITNESS_LAYOUT::NH, ONE)],
         );
     }
-    // 6. Zero-extension: (1+ld_word)·rd_b = 0 for b ≥ 16; NH·rd_b = 0 for
-    // 8 ≤ b < 16.
+    // 6. The load-extension gates: G_LB = is_load·ld_byte, then the
+    // signed/unsigned splits per width. Each gate is one product row.
+    {
+        let f = |i: usize| WITNESS_LAYOUT::FLAGS + i;
+        let lin = |x: usize| vec![(x, ONE)];
+        let lin1 = |x: usize| vec![(x, ONE), (WITNESS_LAYOUT::ONE_COL, ONE)];
+        // G_LB = is_load · ld_byte
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(f(WITNESS_LAYOUT::F_IS_LOAD)),
+            &lin(f(WITNESS_LAYOUT::F_LD_BYTE)),
+            &[(WITNESS_LAYOUT::G_LB, ONE)],
+        );
+        // G_LH = is_load · ld_half
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(f(WITNESS_LAYOUT::F_IS_LOAD)),
+            &lin(f(WITNESS_LAYOUT::F_LD_HALF)),
+            &[(WITNESS_LAYOUT::G_LH, ONE)],
+        );
+        // G_LW = is_load · ld_w32
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(f(WITNESS_LAYOUT::F_IS_LOAD)),
+            &lin(f(WITNESS_LAYOUT::F_LW32)),
+            &[(WITNESS_LAYOUT::G_LW, ONE)],
+        );
+        // Byte: G_BZ = G_LB·(1+lds), G_BS = G_LB·lds
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(WITNESS_LAYOUT::G_LB),
+            &lin1(f(WITNESS_LAYOUT::F_LDS)),
+            &[(WITNESS_LAYOUT::G_BZ, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(WITNESS_LAYOUT::G_LB),
+            &lin(f(WITNESS_LAYOUT::F_LDS)),
+            &[(WITNESS_LAYOUT::G_BS, ONE)],
+        );
+        // Half: G_HZ = G_LH·(1+lds), G_HS = G_LH·lds
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(WITNESS_LAYOUT::G_LH),
+            &lin1(f(WITNESS_LAYOUT::F_LDS)),
+            &[(WITNESS_LAYOUT::G_HZ, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(WITNESS_LAYOUT::G_LH),
+            &lin(f(WITNESS_LAYOUT::F_LDS)),
+            &[(WITNESS_LAYOUT::G_HS, ONE)],
+        );
+        // W32: G_WZ = G_LW·(1+lds), G_WS = G_LW·lds
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(WITNESS_LAYOUT::G_LW),
+            &lin1(f(WITNESS_LAYOUT::F_LDS)),
+            &[(WITNESS_LAYOUT::G_WZ, ONE)],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &lin(WITNESS_LAYOUT::G_LW),
+            &lin(f(WITNESS_LAYOUT::F_LDS)),
+            &[(WITNESS_LAYOUT::G_WS, ONE)],
+        );
+    }
+    // 7. The load extensions, gated to the load cycles (the fix for the
+    // ungated zero-extension bug — non-load cycles carry full 64-bit
+    // results freely):
+    //   byte loads: bits ≥ 8 zero (LBU) or the sign copy of bit 7 (LB);
+    //   half loads: bits ≥ 16 zero (LHU) or the sign copy of bit 15 (LH);
+    //   32-bit loads: bits ≥ 32 zero (LWU) or the sign copy of bit 31 (LW);
+    //   32-bit loads: bits < 32 copy the loaded word's low half.
+    for b in 8..64 {
+        // LBU: rd_b = 0.
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::G_BZ, ONE)],
+            &[(WITNESS_LAYOUT::RD + b, ONE)],
+            &[],
+        );
+        // LB: rd_b = rd_7.
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::G_BS, ONE)],
+            &[(WITNESS_LAYOUT::RD + b, ONE), (WITNESS_LAYOUT::RD + 7, ONE)],
+            &[],
+        );
+    }
     for b in 16..64 {
         add(
             &mut a1,
             &mut b1,
             &mut c1,
-            &[
-                (WITNESS_LAYOUT::FLAGS + WITNESS_LAYOUT::F_LD_WORD, ONE),
-                (WITNESS_LAYOUT::ONE_COL, ONE),
-            ],
+            &[(WITNESS_LAYOUT::G_HZ, ONE)],
             &[(WITNESS_LAYOUT::RD + b, ONE)],
             &[],
         );
-    }
-    for b in 8..16 {
         add(
             &mut a1,
             &mut b1,
             &mut c1,
-            &[(WITNESS_LAYOUT::NH, ONE)],
+            &[(WITNESS_LAYOUT::G_HS, ONE)],
+            &[
+                (WITNESS_LAYOUT::RD + b, ONE),
+                (WITNESS_LAYOUT::RD + 15, ONE),
+            ],
+            &[],
+        );
+    }
+    for b in 32..64 {
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::G_WZ, ONE)],
             &[(WITNESS_LAYOUT::RD + b, ONE)],
+            &[],
+        );
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::G_WS, ONE)],
+            &[
+                (WITNESS_LAYOUT::RD + b, ONE),
+                (WITNESS_LAYOUT::RD + 31, ONE),
+            ],
+            &[],
+        );
+    }
+    for b in 0..32 {
+        // LW/LWU: rd_b = load_val_b for the low 32 bits.
+        add(
+            &mut a1,
+            &mut b1,
+            &mut c1,
+            &[(WITNESS_LAYOUT::G_LW, ONE)],
+            &[
+                (WITNESS_LAYOUT::RD + b, ONE),
+                (WITNESS_LAYOUT::LOAD_VAL + b, ONE),
+            ],
             &[],
         );
     }
@@ -516,11 +1075,11 @@ pub fn build_circuit() -> CircuitSpec {
             &[],
         );
     }
-    // The masked adder sum: is_arith·Σβ(t1+t2+c+alu) = 0.
+    // The masked adder sum: is_arith·Σβ(rs1+t2+c+alu) = 0.
     {
         let mut a_entries: Vec<(usize, Gf128)> = Vec::new();
         for i in 0..64 {
-            a_entries.push((WITNESS_LAYOUT::T1 + i, Gf128(1u128 << i)));
+            a_entries.push((WITNESS_LAYOUT::RS1 + i, Gf128(1u128 << i)));
             a_entries.push((WITNESS_LAYOUT::T2 + i, Gf128(1u128 << i)));
             a_entries.push((WITNESS_LAYOUT::CARRY_OFF + i, Gf128(1u128 << i)));
             a_entries.push((WITNESS_LAYOUT::ALU + i, Gf128(1u128 << i)));
@@ -647,8 +1206,9 @@ pub fn build_circuit() -> CircuitSpec {
             &[],
         );
     }
-    // Both relations share the same padded row count (paper §5.3).
-    let total_rows = rows.max(rows2).next_power_of_two().max(1);
+    // Both relations share the same padded row count (paper §5.3), and
+    // the square layout pins it to M (the extra rows are zero rows).
+    let total_rows = rows.max(rows2).next_power_of_two().max(1).max(m);
     a1.rows = total_rows;
     b1.rows = total_rows;
     c1.rows = total_rows;
@@ -718,7 +1278,8 @@ mod tests {
             0x0000_0073,
         ];
         let trace = crate::interp::execute(&prog, &[], 128);
-        assert_eq!(trace.final_state.regs[3], 0xAB);
+        // RV64I: LB(0xAB) sign-extends; LH(0x00AB) stays positive.
+        assert_eq!(trace.final_state.regs[3], 0xFFFF_FFFF_FFFF_FFAB);
         assert_eq!(trace.final_state.regs[4], 0xAB);
         let spec = build_circuit();
         for rec in &trace.records {

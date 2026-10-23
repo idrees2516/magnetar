@@ -2,8 +2,24 @@
 //! bus bits and the one-hot routing-selector columns the BinaryShout
 //! selector checks authenticate.
 
-use magnetar_cpu::expand::{VirtualInst, VirtualKind};
+use magnetar_cpu::expand::{row_class, VirtualInst, VirtualKind};
 use magnetar_field::{Gf128, ONE, ZERO};
+
+/// The (kind × stage) one-hot selector layout for the stage routing:
+/// `h_ks = kind | (stage << 2)` — 4 kinds (SLL/SRL/SRA/pad) × 8 stages
+/// = 32 entries per row (5 one-hot vars).
+pub const SEL_KS_BITS: usize = 5;
+
+/// The stage routing's kind for a register-shift row.
+fn stage_kind(row: &magnetar_cpu::expand::RomRow) -> usize {
+    if row.funct3 == 1 {
+        0 // SLL
+    } else if (row.raw >> 25) == 0x20 {
+        2 // SRA
+    } else {
+        1 // SRL
+    }
+}
 
 /// The ROM's public tables.
 #[derive(Clone, Debug)]
@@ -20,6 +36,13 @@ pub struct RomTables {
     pub sel_hi: Vec<Gf128>,
     /// The store width one-hot columns: `sel_st[h | (k << 2)]`.
     pub sel_st: Vec<Gf128>,
+    /// The decode-class one-hot columns: `class[c | (k << 5)]` — the
+    /// class-selector check binds the committed per-cycle class to it.
+    pub class: Vec<Gf128>,
+    /// The (kind × stage) one-hot for the register-shift stage routing:
+    /// `sel_ks[h_ks | (k << 5)]` with `h_ks = kind | (stage << 2)`
+    /// (zero on non-stage rows).
+    pub sel_ks: Vec<Gf128>,
 }
 
 impl RomTables {
@@ -31,6 +54,8 @@ impl RomTables {
         let mut sel_lo = vec![ZERO; (1usize << amount_bits) * row_count];
         let mut sel_hi = vec![ZERO; 4 * row_count];
         let mut sel_st = vec![ZERO; 4 * row_count];
+        let mut class = vec![ZERO; (1usize << SEL_KS_BITS) * row_count];
+        let mut sel_ks = vec![ZERO; (1usize << SEL_KS_BITS) * row_count];
         for (k, inst) in rows.iter().enumerate() {
             let row = &inst.row;
             // The instruction bus: op(7) | rd(6) | rs1(6) | rs2(6) |
@@ -73,8 +98,15 @@ impl RomTables {
                     };
                     sel_st[h | (k << 2)] = ONE;
                 }
+                VirtualKind::ShiftStage { stage } => {
+                    // The stage routing's (kind, stage) one-hot.
+                    let h_ks = stage_kind(row) | (stage << 2);
+                    sel_ks[h_ks | (k << SEL_KS_BITS)] = ONE;
+                }
                 _ => {}
             }
+            // The decode class.
+            class[row_class(row) | (k << SEL_KS_BITS)] = ONE;
         }
         RomTables {
             a_rom,
@@ -82,6 +114,8 @@ impl RomTables {
             sel_lo,
             sel_hi,
             sel_st,
+            class,
+            sel_ks,
         }
     }
 }

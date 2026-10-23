@@ -239,10 +239,10 @@ pub fn prove_mosaic(
         claim: lhs,
     };
     let order = BindOrder::HighBitsFirst { high: 7 };
-    let mut prover = SumcheckProver::new(&spec, order);
+    let mut prover = SumcheckProver::new_owned(spec, order);
     let mut batch_rounds = Vec::with_capacity(ell);
     for _ in 0..ell {
-        let msg = prover.message();
+        let msg = prover.message_cached();
         batch_rounds.push(msg.0.clone());
         prover.absorb_and_fold(t, "mosaic-batch");
     }
