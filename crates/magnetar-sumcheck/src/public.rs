@@ -120,6 +120,56 @@ impl PublicFactor for TableFactor {
     }
 }
 
+/// A table over a **subset** of the joint variables, padded across the
+/// rest: a public factor whose own variables live at `active` positions of
+/// a larger joint space. Used whenever a sum-check's public factor (an eq
+/// table, a routing tensor, a Ψ table) spans only part of the joint cube —
+/// the verifier evaluates it at the point restricted to `active` in
+/// `O(own vars)`, and the padded MLE equals the own-space MLE (padding
+/// over idle variables leaves the sum unchanged).
+#[derive(Clone, Debug)]
+pub struct PaddedFactor {
+    pub table: Vec<Gf128>,
+    /// `active[t]` = the joint bit position of the table's variable `t`.
+    pub active: Vec<usize>,
+    pub joint_vars: usize,
+}
+
+impl PaddedFactor {
+    pub fn new(table: Vec<Gf128>, active: Vec<usize>, joint_vars: usize) -> Self {
+        let table_vars = table.len().trailing_zeros() as usize;
+        assert_eq!(active.len(), table_vars);
+        PaddedFactor {
+            table,
+            active,
+            joint_vars,
+        }
+    }
+}
+
+impl PublicFactor for PaddedFactor {
+    fn num_vars(&self) -> usize {
+        self.joint_vars
+    }
+    fn materialize(&self) -> Vec<Gf128> {
+        let mut out = vec![Gf128(0); 1usize << self.joint_vars];
+        for (idx, o) in out.iter_mut().enumerate() {
+            let mut ti = 0usize;
+            for (tv, &av) in self.active.iter().enumerate() {
+                if (idx >> av) & 1 == 1 {
+                    ti |= 1usize << tv;
+                }
+            }
+            *o = self.table[ti];
+        }
+        out
+    }
+    fn eval_at(&self, point: &[Gf128]) -> Gf128 {
+        let sub: Vec<Gf128> = self.active.iter().map(|&a| point[a]).collect();
+        magnetar_field::eval_mle(&self.table, &sub)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

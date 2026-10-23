@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+rayon = { workspace = true }
 magnetar-field = { workspace = true }
 magnetar-hash = { workspace = true }
 magnetar-sumcheck = { workspace = true }

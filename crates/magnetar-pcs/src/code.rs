@@ -6,9 +6,13 @@
 
 use magnetar_field::{mul, Gf128, ZERO};
 use magnetar_hash::blake3_domain;
+use rayon::prelude::*;
 
 /// Public parameters of the code: `n` table variables, `k` extension
 /// variables, and the seed-derived substitution vectors `γ_1..γ_k`.
+/// Minimum block length before codeword blocks encode in parallel (R2).
+const PAR_ENCODE_THRESHOLD: usize = 1 << 13;
+
 #[derive(Clone, Debug)]
 pub struct CodeParams {
     pub n: usize,
@@ -88,14 +92,29 @@ impl Codeword {
         // Step 1: values -> monomial coefficients (standard Möbius).
         let coeffs = values_to_monomials(table, n);
         let mut values = vec![ZERO; params.codeword_len()];
-        for eps in 0..(1usize << params.k) {
-            let eps_bits: Vec<bool> = (0..params.k).map(|j| (eps >> j) & 1 == 1).collect();
-            let delta = params.l_of(&eps_bits);
-            // Step 2: shift coefficients by δ.
-            let shifted = shift_monomials(&coeffs, n, &delta);
-            // Step 3: evaluate the shifted multilinear on the x-cube.
-            let block = eps << n;
-            write_cube_values(&shifted, n, &mut values[block..block + (1 << n)]);
+        // Each ε-block writes a disjoint output slice (docs/PERFORMANCE.md
+        // R3/R8): encode the blocks with chunked parallelism — bit-identical
+        // to the sequential encode.
+        let block_len = 1usize << n;
+        let n_blocks = 1usize << params.k;
+        if block_len >= PAR_ENCODE_THRESHOLD {
+            values
+                .par_chunks_mut(block_len)
+                .enumerate()
+                .for_each(|(eps, out)| {
+                    let eps_bits: Vec<bool> = (0..params.k).map(|j| (eps >> j) & 1 == 1).collect();
+                    let delta = params.l_of(&eps_bits);
+                    let shifted = shift_monomials(&coeffs, n, &delta);
+                    write_cube_values(&shifted, n, out);
+                });
+        } else {
+            for eps in 0..n_blocks {
+                let eps_bits: Vec<bool> = (0..params.k).map(|j| (eps >> j) & 1 == 1).collect();
+                let delta = params.l_of(&eps_bits);
+                let shifted = shift_monomials(&coeffs, n, &delta);
+                let block = eps << n;
+                write_cube_values(&shifted, n, &mut values[block..block + block_len]);
+            }
         }
         Codeword {
             params: params.clone(),

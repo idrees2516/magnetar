@@ -28,11 +28,13 @@
 mod eq;
 mod gf128;
 mod multilinear;
+pub mod parallel;
 mod pack;
 
 pub use eq::{eq_char2, eq_table, EqBits};
 pub use gf128::{inv, mul, pow, square, Gf128, ONE, ZERO};
 pub use multilinear::{bind_var, eval_mle, fold_pairs, Multilinear};
+pub use parallel::{par_bind_var, par_dot_xor, PAR_CHUNK, PAR_THRESHOLD};
 pub use pack::{
     c_fold_table, eq_coefficients, pack_bits, pack_bytes_le, pack_table, phi_c, unpack_bits,
     PHIBITS,
