@@ -42,6 +42,9 @@ pub mod segments;
 pub mod stats;
 
 pub use mosaic::{MosaicClaim, MosaicCommitment, MosaicLayout, MosaicProof};
-pub use protocol::{keygen, keygen_with, prove, verify, KeyGen, Proof, PublicInput, VerifyingKey};
+pub use protocol::{
+    keygen, keygen_with, prove, prove_padded_trace, verify, KeyGen, Proof, PublicInput,
+    VerifyingKey,
+};
 pub use rom::RomTables;
 pub use stats::{proof_stats, ProofStats};

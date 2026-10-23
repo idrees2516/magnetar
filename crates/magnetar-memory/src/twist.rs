@@ -31,8 +31,17 @@ pub struct TwistInstance {
     pub n: usize,
     pub p: usize,
     /// Initial memory `M0: {0,1}^{a+ell} → B` (address low bits, bit index
-    /// high).
+    /// high). The prover always evaluates the true table; the verifier
+    /// uses it only when [`Self::m0_public`] — the tree-IVC chunks carry a
+    /// **committed** entry image (the `ram-init` Mosaic component) and the
+    /// verifier instead takes the reconstruction's `M̂0` values as
+    /// transmitted claims, discharged against that component.
     pub m0: Vec<Gf128>,
+    /// Whether the initial memory is verifier-known (public). When
+    /// `false`, every reconstruction run transmits its `M̂0(point)` value
+    /// (absorbed into the transcript) and leaves a PCS claim at its
+    /// `(r_k ‖ r_v)` point.
+    pub m0_public: bool,
     /// Claimed read values `rv_s(r_val, r_cycle)` per port.
     pub rv_claims: Vec<Gf128>,
     /// Claimed write value `wv(r_val, r_cycle)`.
@@ -83,6 +92,9 @@ pub struct ReconRun {
     pub inc_claim: Gf128,
     /// The recon's random cycle point (binding order = variable order).
     pub r_cycle: Vec<Gf128>,
+    /// The transmitted `M̂0(r_k, r_v)` value — meaningful (and bound into
+    /// the transcript) only when the instance's memory is not public.
+    pub m0_at: Gf128,
 }
 
 /// A BinaryTwist proof.
@@ -223,7 +235,11 @@ fn run_port_sumcheck(
     }
 }
 
-/// Run one reconstruction sum-check at a joint point.
+/// Run one reconstruction sum-check at a joint point. When the memory is
+/// not public the `M̂0(r_k, r_v)` value is absorbed before the rounds and
+/// returned as a transmitted claim (discharged against the committed
+/// entry-image component by the zkvm layer).
+#[allow(clippy::too_many_arguments)]
 fn run_reconstruction(
     wfa_comps: &[AddressComponent],
     inc: &[Gf128],
@@ -233,6 +249,7 @@ fn run_reconstruction(
     ell: usize,
     n: usize,
     m0: &[Gf128],
+    m0_public: bool,
     inclusive: bool,
     label: &str,
     t: &mut Transcript,
@@ -243,6 +260,11 @@ fn run_reconstruction(
     let r_v: Vec<Gf128> = r_joint[a..a + ell].to_vec();
     let r_c: Vec<Gf128> = r_joint[a + ell..].to_vec();
     let m0_at = magnetar_field::eval_mle(m0, &[r_k.clone(), r_v.clone()].concat());
+    if !m0_public {
+        // Bind the claimed initial-memory value before any challenge that
+        // depends on it (it enters the reconstruction's round checks).
+        t.absorb_field(&format!("{label}-m0"), &[m0_at]);
+    }
     // LT column at r_c.
     let lt = lt_table(n, inclusive);
     let eq_j = magnetar_field::EqBits::build(&r_c).values;
@@ -317,6 +339,7 @@ fn run_reconstruction(
         wfa_component_claims,
         inc_claim: claims[1],
         r_cycle: r_c,
+        m0_at,
     }
 }
 
@@ -383,6 +406,7 @@ pub fn prove_twist(
             ell,
             n,
             &inst.m0,
+            inst.m0_public,
             false,
             &format!("twist-recon-{s}"),
             t,
@@ -431,6 +455,7 @@ pub fn prove_twist(
         ell,
         n,
         &inst.m0,
+        inst.m0_public,
         true,
         "twist-wrecon",
         t,
@@ -561,6 +586,17 @@ pub fn prove_twist(
             PcsPoint::new(pt, recon.inc_claim)
         })
         .collect();
+    // The transmitted initial-memory claims (only when not public): one
+    // per reconstruction run, at its `(r_k ‖ r_v)` point.
+    let m0: Vec<PcsPoint> = if inst.m0_public {
+        Vec::new()
+    } else {
+        all_recons
+            .iter()
+            .zip(all_runs.iter())
+            .map(|(recon, run)| PcsPoint::new(run.r_joint[..a + ell].to_vec(), recon.m0_at))
+            .collect()
+    };
     let onehot_claims: Vec<Vec<[PcsPoint; 2]>> = onehot
         .iter()
         .zip(onehot_pts.iter())
@@ -597,6 +633,7 @@ pub fn prove_twist(
             write_addr,
             recon_wfa,
             inc,
+            m0,
             st1: st1_pcs,
             onehot: onehot_claims,
         },
@@ -675,6 +712,7 @@ pub fn verify_twist(
         verify_recon(
             &proof.read_recons[s],
             &inst.m0,
+            inst.m0_public,
             &run.r_joint,
             run.val_claim,
             a,
@@ -710,6 +748,7 @@ pub fn verify_twist(
         verify_recon(
             &proof.write_recon,
             &inst.m0,
+            inst.m0_public,
             &proof.write_run.r_joint,
             proof.write_run.val_claim,
             a,
@@ -844,21 +883,43 @@ pub fn verify_twist(
             PcsPoint::new(pt, recon.inc_claim)
         })
         .collect();
+    // The transmitted initial-memory claims — only when not public.
+    let m0: Vec<PcsPoint> = if inst.m0_public {
+        Vec::new()
+    } else {
+        proof
+            .read_recons
+            .iter()
+            .chain(std::iter::once(&proof.write_recon))
+            .zip(
+                proof
+                    .read_runs
+                    .iter()
+                    .chain(std::iter::once(&proof.write_run)),
+            )
+            .map(|(recon, run)| PcsPoint::new(run.r_joint[..a + ell].to_vec(), recon.m0_at))
+            .collect()
+    };
     Ok(TwistPcsClaims {
         read_addr,
         write_addr,
         recon_wfa,
         inc,
+        m0,
         st1: st1_pcs,
         onehot: onehot_claims,
     })
 }
 
 /// Verify one reconstruction sum-check: the claim is
-/// `val_claim + M̂0(point) = Σ_{j'} LT(j', r_c)·ŵfa·Înc`.
+/// `val_claim + M̂0(point) = Σ_{j'} LT(j', r_c)·ŵfa·Înc`. The `M̂0`
+/// value is recomputed when the memory is public, otherwise taken from
+/// the transmitted `recon.m0_at` (absorbed at the same position as the
+/// prover).
 fn verify_recon(
     recon: &ReconRun,
     m0: &[Gf128],
+    m0_public: bool,
     r_joint: &[Gf128],
     val_claim: Gf128,
     a: usize,
@@ -871,7 +932,12 @@ fn verify_recon(
     let r_k: Vec<Gf128> = r_joint[..a].to_vec();
     let r_v: Vec<Gf128> = r_joint[a..a + ell].to_vec();
     let r_c: Vec<Gf128> = r_joint[a + ell..].to_vec();
-    let m0_at = magnetar_field::eval_mle(m0, &[r_k, r_v].concat());
+    let m0_at = if m0_public {
+        magnetar_field::eval_mle(m0, &[r_k, r_v].concat())
+    } else {
+        t.absorb_field(&format!("{label}-m0"), &[recon.m0_at]);
+        recon.m0_at
+    };
     let lt = lt_table(n, inclusive);
     let eq_j = magnetar_field::EqBits::build(&r_c).values;
     let mut lt_col = vec![ZERO; 1usize << n];

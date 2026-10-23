@@ -29,7 +29,7 @@ pub mod interp;
 pub use circuit::{build_circuit, CircuitSpec, WITNESS_LAYOUT};
 pub use decode::{decode, Inst, Opcode};
 pub use expand::{expand_program, RomRow, VirtualInst};
-pub use interp::{execute, ExecState, Trace};
+pub use interp::{execute, execute_chunks, ExecState, Trace};
 
 /// A 64-bit word.
 pub type Word = u64;

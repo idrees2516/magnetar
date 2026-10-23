@@ -100,9 +100,14 @@ claims to committed data:
   paper's production prover avoids by streaming).
 * The cross-step micro-PC constraints are omitted exactly as the
   paper's Remark 4 omits them from the formal protocol; the
-  decode-vs-flag correlation and the register-shift stage-select are
-  documented engineering extensions (the interpreter and expansion
-  implement their semantics; the circuit-level constraints are future
-  work).
+  decode-vs-flag correlation remains a documented engineering extension
+  (the flags are witness-trusted; the fetched bus is authenticated by
+  the Shout). The register-shift **stage-select** extension is now fully
+  implemented: the trash-cell stage chain lives in the public ROM
+  fields, the `sel_stage` one-hot is authenticated through the fetch
+  like every other selector, and the stage-selector sum-check binds the
+  conditional amount bits and composes the selector claims additively
+  in characteristic two — see `docs/architecture/router.md` for the
+  composition argument.
 * Test traces are 2^3–2^5 cycles so CI stays fast; the trace-length
   parameter is a KeyGen input and the architecture scales linearly.

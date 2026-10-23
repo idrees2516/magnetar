@@ -58,9 +58,10 @@ pub mod twist;
 
 pub use claims::{PcsPoint, SelectorPcsClaims, ShoutPcsClaims, TwistPcsClaims};
 pub use discharge::{
-    prove_bus_shout, prove_psi_claim, prove_selector_shout, verify_bus_shout, verify_psi_claim,
-    verify_selector_shout, BusShoutProof, BusShoutSpec, PsiProof, SelectorCheckSpec,
-    SelectorShoutProof, SelectorShoutSpec,
+    prove_bus_shout, prove_psi_claim, prove_selector_shout, prove_stage_select, verify_bus_shout,
+    verify_psi_claim, verify_selector_shout, verify_stage_select, BusShoutProof, BusShoutSpec,
+    PsiProof, SelectorCheckSpec, SelectorShoutProof, SelectorShoutSpec, StageSelectClaims,
+    StageSelectPoints, StageSelectProof, StageSelectSpec,
 };
 pub use shout::{prove_shout, verify_shout, ShoutInstance, ShoutProof};
 pub use twist::{prove_twist, verify_twist, TwistInstance, TwistProof, TwistWitness};

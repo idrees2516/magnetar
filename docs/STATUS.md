@@ -104,3 +104,25 @@ Measured status in `docs/BENCHMARKS.md`; the ranked items:
 * `cargo audit` runs in CI; the `criterion`-style statistical
   benchmarks (versus the current single-shot harness) are not yet
   wired.
+
+## The parallel-branch merge
+
+A parallel development line landed three commits on the pre-overhaul
+base (stage-select, its claim aggregation, `prove_multi`/
+`verify_multi`, the `ivc` module, wire sizes, the architecture doc
+set). This merge keeps the current (post-overhaul) core — the sounder,
+faster lineage that also fixes the branch/jump immediate desync — and
+takes from the parallel line:
+
+* `docs/architecture/*` — the ten-part per-component documentation set
+  (the big-component write-ups).
+* `docs/ivc.md` — the tree-IVC design (the port's specification; the
+  implementation itself lives on the `tree-ivc-legacy` branch until it
+  is ported to the current `protocol` API).
+* The Twist `m0_public` mechanism (committed initial-memory images for
+  IVC chunks) — merged into `magnetar-memory`; inactive (`true`) in the
+  monolithic protocol.
+
+Its overlapping deliverables (the dual-rate profiles, claim aggregation,
+the benchmark, the remaining-work inventory) are superseded by this
+line's implementations on the fixed base.
