@@ -2,6 +2,46 @@
 
 ## 0.2.0 (unreleased)
 
+### This cycle: soundness fix, throughput, and the horizon items
+
+- **Soundness fix (the truncated ROM immediate)**: the ROM's
+  instruction bus carried only the 13-bit immediate field while the
+  witness's fetch segment carries the full sign-extended 36-bit
+  pre-adjusted immediate — every program with a **negative immediate**
+  (backward branches, `ADDI -1`, negative load/store offsets) desynced
+  the bytecode Shout. The ROM now writes the identical 36-bit word;
+  a witness/ROM consistency regression test guards the class.
+- **The SUB carry-in row**: the class-gated T2 binding sets
+  `T2 = rs2 + F_SUB` on the SUB/BRANCH classes (the two's-complement
+  negation absorbed into the operand), and the stale duplicated
+  constraint section was removed.
+- **The sparse-anchor router prover** (`magnetar-sumcheck::sparse` v2):
+  round messages enumerated through the routing tensors' nonzero lists
+  (rebuilt per fold) instead of the full joint cube — the store routing
+  runs 110× faster, the whole 32-cycle proof 8.4×.
+- **PCS rate/query profiles** (Horizon 1): `PcsProfile::{FastChunk,
+  Balanced, CompactWrap, DeepWrap}` with the per-query soundness
+  accounting for the affine-substitution code; the dual-rate projection
+  measured by the cost model and exposed as `magnetar profiles`.
+- **The ZK round-mask primitive** (Horizon 1): `magnetar_sumcheck::zk`
+  — per-round mask polynomials with the running constraint chain,
+  perfect HVZK for the round messages at O(degree) randomness per
+  round; wired into the Mosaic batching discharge behind
+  `KeyGen::enable_zk` (the full site wiring is inventoried in
+  `docs/STATUS.md`).
+- **Segmented proving** (Horizon 2): `execute_chunks` with explicit
+  state handoff; `segments.rs` proves S×T cycles under **one shared
+  commitment** — the chunked witness equals the monolithic trace
+  bit-for-bit (tested), the claims aggregate through the single
+  batching discharge, and `aggregation_report` measures the saving.
+- **The benchmark harness**: `magnetar bench <lo> <hi>` (the
+  cycles/s sweep), `MAGNETAR_TIME=1` phase instrumentation, and
+  `docs/BENCHMARKS.md` with the measured numbers versus the paper's
+  Table 6.
+- **Documentation**: `docs/ROADMAP.md` (the horizons + the GPU target
+  build order), `docs/RECURSION.md` (the wrap/tree-IVC/streaming
+  designs), `docs/STATUS.md` (the implemented/remaining inventory).
+
 ### The complete protocol
 
 - **Construction 3, all seven steps end-to-end** — the virtual-claim

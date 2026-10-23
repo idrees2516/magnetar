@@ -74,6 +74,17 @@ field/utils/proof/arith/cpu split), one crate per component:
   same standard the paper relies on, citing the proven gaps of
   Ben-Sasson et al.) — see `docs/security.md` for the full accounting.
 
+## Documentation
+
+- `docs/BENCHMARKS.md` — the measured cycles/s versus the paper's
+  Table 6, the per-phase breakdown, and the gap analysis.
+- `docs/ROADMAP.md` — the three-horizon schedule and the **GPU target**
+  (150M cycles/s on the least GPUs: the five-phase build order).
+- `docs/RECURSION.md` — the dual-rate wrap, tree-IVC, claim batching,
+  and streaming designs (Horizon 2).
+- `docs/STATUS.md` — the honest implemented-versus-remaining inventory.
+- `docs/security.md` — the soundness accounting.
+
 ## Building and testing
 
 ```sh
