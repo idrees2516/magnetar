@@ -172,8 +172,6 @@ fn shared_round(
     (r, (m1, m2))
 }
 
-fn separate_round_removed() {}
-
 fn outer_spec(
     _a: &SparseMatrix,
     _b: &SparseMatrix,
@@ -293,10 +291,24 @@ pub fn prove_virtual_spartan(
     let bz_fld = apply_bits(&rel.b_fld).0;
     let cz_fld = apply_bits(&rel.c_fld).0;
     let spec_bin = outer_spec(
-        &rel.a_bin, &rel.b_bin, &rel.c_bin, az_bin, bz_bin, cz_bin, &tau_bin, joint_vars_bin,
+        &rel.a_bin,
+        &rel.b_bin,
+        &rel.c_bin,
+        az_bin,
+        bz_bin,
+        cz_bin,
+        &tau_bin,
+        joint_vars_bin,
     );
     let spec_fld = outer_spec(
-        &rel.a_fld, &rel.b_fld, &rel.c_fld, az_fld, bz_fld, cz_fld, &tau_fld, joint_vars_fld,
+        &rel.a_fld,
+        &rel.b_fld,
+        &rel.c_fld,
+        az_fld,
+        bz_fld,
+        cz_fld,
+        &tau_fld,
+        joint_vars_fld,
     );
     drop(_pt_apply);
     // Lockstep: instance rounds share challenges (HighBitsFirst(s) binds the
@@ -822,8 +834,7 @@ mod tests {
         };
         let mut t = Transcript::new("vs", &[b"test"]);
         let (proof, claims) =
-            prove_virtual_spartan(
-                &rel, &layout, &joint, q, &vec![false; rel.m], &mut t);
+            prove_virtual_spartan(&rel, &layout, &joint, q, &vec![false; rel.m], &mut t);
         let mut tv = Transcript::new("vs", &[b"test"]);
         let vclaims = verify_virtual_spartan(&rel, &layout, q, &public, &proof, &mut tv)
             .expect("honest vs proof must verify");

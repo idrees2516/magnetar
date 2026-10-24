@@ -20,7 +20,7 @@
 // multi-input reductions are the domain's normal shape.
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
-#![forbid(clippy::undocumented_unsafe_blocks)]
+#![deny(clippy::undocumented_unsafe_blocks)]
 // The two exceptions: `gf128::clmul` and `avx` contain guarded `unsafe`
 // intrinsics. They are dedicated modules with `#[allow(unsafe_code)]` and
 // audited SAFETY comments; every other module in the workspace stays
@@ -42,8 +42,8 @@ pub use pack::{
     PHIBITS,
 };
 pub use parallel::{
-    par_bind_var, par_bind_var_bit, par_dot_bit_xor, par_dot_xor, par_gather_bit, par_gather_bit_at,
-    PAR_CHUNK, PAR_THRESHOLD,
+    par_bind_var, par_bind_var_bit, par_dot_bit_xor, par_dot_xor, par_gather_bit,
+    par_gather_bit_at, PAR_CHUNK, PAR_THRESHOLD,
 };
 
 /// A small helper trait for field elements used across the stack.

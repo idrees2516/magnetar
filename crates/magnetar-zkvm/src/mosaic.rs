@@ -347,7 +347,7 @@ pub fn prove_mosaic_opt(
             .for_each(|(b, chunk)| {
                 let mask = 1u128 << b;
                 for (u, slot) in chunk.iter_mut().enumerate() {
-                    *slot = Gf128(((cm.packed[u].0 & mask) >> b) as u128);
+                    *slot = Gf128((cm.packed[u].0 & mask) >> b);
                 }
             });
         g

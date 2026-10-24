@@ -72,7 +72,13 @@ fn profile_fused_msg3() {
     let n4 = block / 4;
     let t0 = std::time::Instant::now();
     let ok = magnetar_field::avx::msg3_batch(&mut acc, ONE, &f1, &f2, &f3, 0, block, n4);
-    println!("fused msg3 ({} chunks, {} positions): {:?} ok={}", n4, 4 * n4, t0.elapsed(), ok);
+    println!(
+        "fused msg3 ({} chunks, {} positions): {:?} ok={}",
+        n4,
+        4 * n4,
+        t0.elapsed(),
+        ok
+    );
 }
 
 #[test]
@@ -87,7 +93,11 @@ fn profile_mul4_raw() {
         let r = magnetar_field::avx::mul4(a, b);
         acc[0] = Gf128(acc[0].0 ^ r[(i & 3) as usize].0);
     }
-    println!("mul4 batch (1M calls = 4M muls): {:?} acc={:x}", t0.elapsed(), acc[0].0);
+    println!(
+        "mul4 batch (1M calls = 4M muls): {:?} acc={:x}",
+        t0.elapsed(),
+        acc[0].0
+    );
     // Scalar reference.
     let t1 = std::time::Instant::now();
     let mut acc2 = ZERO;

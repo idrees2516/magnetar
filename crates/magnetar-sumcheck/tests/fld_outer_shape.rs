@@ -79,6 +79,8 @@ fn fld_outer_shape_roundtrips() {
 
 fn r_of(i: usize) -> Gf128 {
     // Deterministic distinct challenges.
-    let x = (i as u128).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0x1234_5678_9ABC_DEF0);
+    let x = (i as u128)
+        .wrapping_mul(0x9E3779B97F4A7C15)
+        .wrapping_add(0x1234_5678_9ABC_DEF0);
     Gf128(x | 1)
 }

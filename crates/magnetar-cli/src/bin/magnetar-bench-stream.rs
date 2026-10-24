@@ -43,6 +43,7 @@ fn alu_program() -> Vec<u32> {
 fn main() {
     let mut args = std::env::args().skip(1);
     let max_log2: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let min_log2: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(8);
     let mode = args.next().unwrap_or_else(|| "both".to_string());
     let run_seq = mode == "seq" || mode == "both";
     let run_stream = mode == "stream" || mode == "both";
@@ -64,15 +65,36 @@ fn main() {
         "table B"
     );
     let prog = alu_program();
-    for log2_t in [8usize, 9, 10, 11, 12].iter().filter(|t| **t <= max_log2) {
+    for log2_t in [8usize, 9, 10, 11, 12, 13, 14, 15, 16]
+        .iter()
+        .filter(|t| **t >= min_log2 && **t <= max_log2)
+    {
         let total = 1usize << log2_t;
         let trace = magnetar_cpu::interp::execute(&prog, &[], total);
         let out = trace.final_state.output;
-        for segments in [1usize, 2, 4] {
+        // Adaptive segment ladder: segments of at least 2^8 cycles, and —
+        // above 2^13 total — at most 2^13 cycles per segment (the
+        // monolithic per-segment envelope of this container).
+        let min_segs = total / (1usize << 10); // 2^10-cycle segments: bounded per-worker envelope at every scale
+        let mut ladder: Vec<usize> = Vec::new();
+        let mut s = 1usize;
+        while s * 256 <= total {
+            if s >= min_segs.max(1) {
+                ladder.push(s);
+            }
+            s *= 2;
+        }
+        for segments in ladder {
             if total / segments < 2 {
                 continue;
             }
-            if run_seq {
+            if segments > 64 {
+                break;
+            }
+            // The monolithic (sequential) prover only fits the container
+            // envelope up to 2^13; above that, streaming-only.
+            let run_seq_here = run_seq && log2_t <= &13;
+            if run_seq_here {
                 let t0 = Instant::now();
                 let seq = magnetar_ivc::prove_ivc(
                     &prog,

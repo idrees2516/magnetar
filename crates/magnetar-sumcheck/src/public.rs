@@ -7,7 +7,6 @@
 //! factor as a dense table to fold during the rounds.
 
 use magnetar_field::{mul, Gf128, ONE, ZERO};
-use rayon::prelude::*;
 
 /// How a public factor participates in the **never-folded eq slab**
 /// discipline (the decomposable-equality optimization of the
@@ -177,8 +176,6 @@ fn scatter(
         mul(val, f1),
     );
 }
-
-
 
 /// A product of `eq` factors over a partition of the joint variables:
 /// `Π_m eq(p_m, x_{S_m})` — the public-factor shape of the

@@ -291,7 +291,10 @@ mod tests {
                 par_bind_var(&mut b, var, r);
                 if a != b {
                     let idx = a.iter().zip(b.iter()).position(|(x, y)| x != y).unwrap();
-                    panic!("MISMATCH vars={vars} var={var} idx={idx} seq={:x} par={:x}", a[idx].0, b[idx].0);
+                    panic!(
+                        "MISMATCH vars={vars} var={var} idx={idx} seq={:x} par={:x}",
+                        a[idx].0, b[idx].0
+                    );
                 }
             }
         }
@@ -357,7 +360,9 @@ mod tests {
         let mut rng = rand::rng();
         let n = 1usize << 13;
         let w: Vec<Gf128> = (0..n).map(|_| Gf128(rng.random::<u128>())).collect();
-        let bits: Vec<Gf128> = (0..n).map(|_| Gf128((rng.random::<u128>() >> 127) as u128)).collect();
+        let bits: Vec<Gf128> = (0..n)
+            .map(|_| Gf128((rng.random::<u128>() >> 127) as u128))
+            .collect();
         let mut seq = Gf128(0);
         for i in 0..n {
             seq += mul(w[i], bits[i]);

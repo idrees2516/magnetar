@@ -74,7 +74,9 @@ fn bit_paths_match_generic_messages() {
         for order in [
             BindOrder::Increasing,
             BindOrder::HighBitsFirst { high: 2 },
-            BindOrder::HighBitsFirst { high: num_vars.min(3) },
+            BindOrder::HighBitsFirst {
+                high: num_vars.min(3),
+            },
         ] {
             let generic = run_collect(&mk_spec(), order, vec![false; 3]);
             let fast = run_collect(&mk_spec(), order, vec![true, true, true]);
@@ -123,8 +125,7 @@ fn slab_matches_generic_for_non_bit_tables() {
                     s += c;
                 }
                 assert_eq!(
-                    s,
-                    running,
+                    s, running,
                     "num_vars={num_vars} round={i} order={order:?}: round-sum check"
                 );
                 // fold running at the same challenge the driver used.
@@ -156,13 +157,7 @@ fn eq_prod_slab_round_sums_hold() {
     // parts: eq(p1, x0..x2) and eq(p2, x3..x4); x5 idle.
     let p1: Vec<Gf128> = (0..3).map(|_| rg(&mut rng)).collect();
     let p2: Vec<Gf128> = (0..2).map(|_| rg(&mut rng)).collect();
-    let f = EqProdFactor::new(
-        vec![
-            (p1, vec![0, 1, 2]),
-            (p2, vec![3, 4]),
-        ],
-        num_vars,
-    );
+    let f = EqProdFactor::new(vec![(p1, vec![0, 1, 2]), (p2, vec![3, 4])], num_vars);
     let table = magnetar_sumcheck::public::PublicFactor::materialize(&f);
     let mut claim = ZERO;
     for i in 0..n {
@@ -265,7 +260,9 @@ fn profile_sumeq_materialize() {
     let f = magnetar_sumcheck::public::SumEqFactor::new(items);
     let t0 = std::time::Instant::now();
     let table = magnetar_sumcheck::public::PublicFactor::materialize(&f);
-    println!("SumEq materialize (22 claims, 2^17 cube): {:?} nonzero={}",
+    println!(
+        "SumEq materialize (22 claims, 2^17 cube): {:?} nonzero={}",
         t0.elapsed(),
-        table.iter().filter(|&&v| v != Gf128(0)).count());
+        table.iter().filter(|&&v| v != Gf128(0)).count()
+    );
 }

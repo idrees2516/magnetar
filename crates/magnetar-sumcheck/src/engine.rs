@@ -82,9 +82,7 @@ impl SumcheckProver {
                 let first = f.eq_slab_info(0);
                 match first {
                     EqSlabInfo::NotSlab => None,
-                    _ => Some(
-                        (0..f.num_vars()).map(|v| f.eq_slab_info(v)).collect(),
-                    ),
+                    _ => Some((0..f.num_vars()).map(|v| f.eq_slab_info(v)).collect()),
                 }
             })
             .collect();
@@ -183,7 +181,13 @@ impl SumcheckProver {
                                     let f1 = self.factor_table(t, 0);
                                     let f2 = self.factor_table(t, 1);
                                     let done = magnetar_field::avx::msg2_batch(
-                                        acc, c0, f1, f2, gbase, block, 4 * n4,
+                                        acc,
+                                        c0,
+                                        f1,
+                                        f2,
+                                        gbase,
+                                        block,
+                                        4 * n4,
                                     );
                                     for o in done..4 * n4 {
                                         self.generic2_one(acc, c0, t, gbase + o, block);
@@ -194,7 +198,14 @@ impl SumcheckProver {
                                     let f2 = self.factor_table(t, 1);
                                     let f3 = self.factor_table(t, 2);
                                     let done = magnetar_field::avx::msg3_batch(
-                                        acc, c0, f1, f2, f3, gbase, block, 4 * n4,
+                                        acc,
+                                        c0,
+                                        f1,
+                                        f2,
+                                        f3,
+                                        gbase,
+                                        block,
+                                        4 * n4,
                                     );
                                     for o in done..4 * n4 {
                                         self.generic3_one(acc, c0, t, gbase + o, block);
@@ -216,8 +227,7 @@ impl SumcheckProver {
                             for o in 4 * n4..block {
                                 let base = gbase + o;
                                 self.position_contribution(
-                                    acc, c0, t, base, block, degree, coeffs_of, ti, nf,
-                                    &paths[ti],
+                                    acc, c0, t, base, block, degree, coeffs_of, ti, nf, &paths[ti],
                                 );
                             }
                         }

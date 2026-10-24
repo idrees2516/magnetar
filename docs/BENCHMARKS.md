@@ -20,19 +20,42 @@ cargo run --release -p magnetar-cli --bin magnetar -- profiles     # dual-rate t
 
 ## End-to-end results (this implementation)
 
+Current numbers (the small-value fast paths + the eq-slab + per-relation
+row padding + the fused VPCLMULQDQ kernels with measured dispatch):
+
 | workload | T | prove (ms) | verify (ms) | cycles/s | proof (KiB) |
 |---|---|---|---|---|---|
-| alu-chain | 2^8 | 659 | 20.2 | 388 | 352.6 |
-| alu-chain | 2^10 | 2,691 | 47.6 | 381 | 443.1 |
-| mem-mix | 2^8 | 639 | 20.9 | 401 | 351.9 |
-| mem-mix | 2^10 | 2,697 | 46.3 | 380 | 442.4 |
-| branchy | 2^8 | 622 | 20.3 | 411 | 351.9 |
-| branchy | 2^10 | 2,749 | 45.8 | 372 | 442.4 |
-| shift-mix | 2^8 | 634 | 20.5 | 404 | 351.9 |
-| shift-mix | 2^10 | 2,688 | 48.5 | 381 | 442.4 |
-| alu-chain | 2^11 | 6,204 | 76.1 | 330 | 492.2 |
-| alu-chain | 2^12 | 12,473 | 141.1 | 328 | 543.7 |
-| (tree-IVC) | 2^10 ×4 | 2,589 | 73.5 | 396 | one shared tail |
+| alu-chain | 2^8 | 238 | 20.4 | 1,074 | 352.2 |
+| alu-chain | 2^10 | 962 | 53.2 | 1,065 | 442.8 |
+| alu-chain | 2^11 | 2,141 | 91.9 | 957 | 491.8 |
+| alu-chain | 2^12 | 4,536 | 164.8 | 903 | 543.3 |
+| alu-chain | 2^13 | 9,982 | 322.6 | 821 | 597.3 |
+| (streaming, 64 segs) | 2^14 | 12,993 | — | **1,261** | one shared tail |
+
+The session-start baseline was 372–411 cycles/s; the cumulative gain is
+**2.8–3.3×**, from four structural optimizations taken from the
+sum-check-proving literature (ePrint 2025/1117, 2026/587, 2025/611, and
+the Dao–Thaler constraint-packing note):
+
+1. **Per-relation row padding** (paper Construction 2 shares only `q` and
+   `m`): the K relation's real row count is 31, not 2048 — its outer
+   sum-check cube shrank 64×.
+2. **Small-value (bit-valued) fast paths**: the binary relation's `az/bz/cz`
+   are bits (a binary matrix applied over the bit witness), so every
+   round-message product against them is a branchless select and their
+   folds are selects — no CLMUL — plus the select-based `A·z` application
+   and instance folds (`Σ eq·z_bit`).
+3. **The never-folded eq slab** (the decomposable-equality discipline):
+   `eq(τ, ·)` public factors gather their bit-`s` slice and move the
+   bound-variable constant into the term coefficients — the eq factor's
+   per-round fold multiplications are gone everywhere.
+4. **Fused VPCLMULQDQ kernels with a *measured* dispatch**: the 2- and
+   3-factor message kernels, the fold runs, and the eq-tensor doubling
+   run through lane-batched pipelines (AVX-512 4-lane and AVX2 2-lane,
+   `#[target_feature]`-specialized), with a one-time timed probe choosing
+   the backend — some virtualized hosts advertise `avx512f` in CPUID but
+   emulate it at ~10× scalar cost, so the probe picks AVX2 there.
+   `MAGNETAR_SIMD=avx512|avx2|scalar` overrides.
 
 The T = 2^11–2^12 rows use `magnetar-bench-big` (previously beyond the
 prover's memory envelope — T = 2^11 OOM'd a 4 GiB container; the dense
@@ -156,9 +179,34 @@ one sequential root (parallel encode + Merkle + the discharge). The
 proofs are **byte-identical** to the sequential prover's (tested on
 1/2/4 segments). With the linear-in-T segment provers, the segment
 workers are no longer memory-bound: the parallel speedup now tracks the
-core count where the phases allow it (the earlier dense-prover
-measurement — ~1.0–1.15× under 2-way concurrency — reflected the dense
-tables' bandwidth saturation, not the schedule).
+core count where the phases allow it.
+
+The 611-paper streaming shape (checkpointed replay, per-segment
+transcripts, bounded peak) is now measured through **2^14 cycles**
+(1,261 cycles/s at 64 segments on this 2-core container); the adaptive
+segment ladder keeps the per-worker envelope inside 4 GiB at every
+scale. Above 2^14 the **root aggregation** becomes the bottleneck: its
+Mosaic batching factor is a sum over all segments' remapped claims
+(`segments × components` items), and the current `SumEqFactor`
+materialization cost is `Σ_i 2^{free_i}` — quadratic growth in the
+combined cube. The 611/587-style fix is the hierarchical k-way
+decomposition (never materialize the sum; keep the shared per-segment
+`eq(r_inst)` factor and the per-segment small local tables — a
+rank-`segments` positional evaluation), which is the next roadmap item
+for the 2^15–2^16 streaming ladder.
+
+## The measured next levers (the per-phase anatomy at T = 2^10)
+
+| phase | share | the paper-prescribed lever |
+|---|---|---|
+| VS outer rounds | 21% | the small-value **round window** (587 §5.1): keep the bit tables un-folded for the first v rounds, compute the window grid with popcount arithmetic, one eq-weighted pack at the window's end — also removes the K-valued materialization that bounds the memory envelope |
+| Mosaic `SumEq` build | 21% | the hierarchical / k-way block build above (2026/587 §6): never materialize the α-combination |
+| the twists | 19% | select-fold the bit-valued one-hot tables in the linear provers (the same `mul_bit` discipline) |
+| everything else | 39% | the circuit-density item: the test-scale witness pads to 2048 bit-columns against the paper's amortized instance batching (several cycles per SIMD instance) |
+
+The verifier stays unchanged by every optimization above (all messages
+are bit-identical to the generic engine's), which is what keeps the
+tamper suite meaningful through the optimization loop.
 
 ## Reproducing
 
