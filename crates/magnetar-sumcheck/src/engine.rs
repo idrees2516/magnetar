@@ -12,8 +12,10 @@
 //! dense evaluations are the prover's claims — these become the output
 //! evaluation claims of the reduction (paper Definition 5).
 
-use crate::{BindOrder, RoundMsg, SumcheckSpec};
-use magnetar_field::{mul, par_bind_var, Gf128, ZERO};
+use crate::{BindOrder, EqSlabInfo, RoundMsg, SumcheckSpec};
+use magnetar_field::{
+    inv, mul, mul_bit, par_bind_var, par_bind_var_bit, par_gather_bit_at, Gf128, ONE, ZERO,
+};
 use magnetar_hash::Transcript;
 use rayon::prelude::*;
 
@@ -22,11 +24,22 @@ use rayon::prelude::*;
 /// (R1), so the parallel message is bit-identical to the sequential one.
 const PAR_MSG_THRESHOLD: usize = 1 << 13;
 
+/// Per-public-factor slab classification for every joint variable,
+/// precomputed at construction (the factors are dropped after
+/// materialization; the classification is all the fold needs).
+type SlabProfile = Vec<EqSlabInfo>;
+
 /// Prover-side state: the folding tables plus the running claim.
 pub struct SumcheckProver {
     spec_terms: Vec<crate::Term>,
     dense: Vec<Vec<Gf128>>,
     public_tables: Vec<Vec<Gf128>>,
+    /// Which dense tables are currently **bit-valued** (`{0, 1}` — the
+    /// small-value setting): their pair products are AND/XOR and their
+    /// folds are selects (no CLMUL). Cleared by the first fold.
+    dense_bits: Vec<bool>,
+    /// The eq-slab profile per public factor (`None` = generic fold).
+    slab_profile: Vec<Option<SlabProfile>>,
     coeffs: Vec<Gf128>,
     running: Gf128,
     order: BindOrder,
@@ -35,14 +48,52 @@ pub struct SumcheckProver {
     challenges: Vec<Gf128>,
 }
 
+/// Per-term, per-round message-path classification (the small-value fast
+/// paths plus the fused generic kernels).
+#[derive(Clone, Copy, PartialEq)]
+enum Path {
+    Generic,
+    Bit1,
+    BitDensePub,
+    Bit2Dense,
+    Bit2DensePub,
+}
+
 impl SumcheckProver {
     pub fn new(spec: &SumcheckSpec, order: BindOrder) -> Self {
+        Self::with_dense_bits(spec, order, vec![false; spec.dense.len()])
+    }
+
+    /// Construct with explicit **bit-valued dense-table flags** (the
+    /// small-value fast paths of the sum-check papers: a bit-valued factor
+    /// makes the round-message products AND/XOR selects and the fold a
+    /// branchless select). The caller guarantees the flagged tables only
+    /// contain `0` or `1` (e.g. a binary-matrix application over a bit
+    /// witness); the engine clears a flag as soon as its table is folded
+    /// with a challenge (the result is field-valued).
+    pub fn with_dense_bits(spec: &SumcheckSpec, order: BindOrder, bits: Vec<bool>) -> Self {
         spec.validate().expect("invalid sumcheck spec");
+        assert_eq!(bits.len(), spec.dense.len(), "dense bit flags arity");
         let public_tables = spec.public.iter().map(|f| f.materialize()).collect();
+        let slab_profile: Vec<Option<SlabProfile>> = spec
+            .public
+            .iter()
+            .map(|f| {
+                let first = f.eq_slab_info(0);
+                match first {
+                    EqSlabInfo::NotSlab => None,
+                    _ => Some(
+                        (0..f.num_vars()).map(|v| f.eq_slab_info(v)).collect(),
+                    ),
+                }
+            })
+            .collect();
         SumcheckProver {
             spec_terms: spec.terms.clone(),
             dense: spec.dense.clone(),
             public_tables,
+            dense_bits: bits,
+            slab_profile,
             coeffs: spec.terms.iter().map(|t| t.coeff).collect(),
             running: spec.claim,
             order,
@@ -65,8 +116,13 @@ impl SumcheckProver {
     /// view materialization, no allocations (the previous kernel built
     /// `degree+1` half-table views per factor per round).
     ///
-    /// The result is bit-identical to the interpolated-by-values message
-    /// (both are the coefficient vector of the same polynomial).
+    /// **Small-value fast paths** (the sum-check-proving papers' bit-valued
+    /// setting): a dense table flagged `dense_bits` has `{0, 1}` entries,
+    /// so its pair products are AND/XOR and every multiply against a
+    /// field-valued operand degenerates to a branchless select — no
+    /// CLMUL at all. The paths are classified per term per round; a fold
+    /// clears the flags (field-valued results), after which the generic
+    /// kernel takes over. Bit-identical messages to the generic engine.
     pub fn message(&self) -> RoundMsg {
         let degree = self
             .spec_terms
@@ -77,9 +133,24 @@ impl SumcheckProver {
         let bit = self.order.current_bit(self.num_vars, self.round);
         let block = 1usize << bit;
         let n = 1usize << (self.num_vars - self.round);
-        let pairs_per_group = block; // pairs within one 2·block group
         let n_groups = n / (2 * block);
         debug_assert!(n_groups >= 1);
+        let paths: Vec<Path> = self
+            .spec_terms
+            .iter()
+            .map(|t| {
+                let d = t.dense.len();
+                let p = t.public.len();
+                let bit_at = |k: usize| self.dense_bits[t.dense[k]];
+                match (d, p) {
+                    (1, 0) if bit_at(0) => Path::Bit1,
+                    (1, 1) if bit_at(0) => Path::BitDensePub,
+                    (2, 0) if bit_at(0) && bit_at(1) => Path::Bit2Dense,
+                    (2, 1) if bit_at(0) && bit_at(1) => Path::Bit2DensePub,
+                    _ => Path::Generic,
+                }
+            })
+            .collect();
         let coeffs = {
             // Per-term accumulators over the coefficient vector (R1: the
             // per-chunk sums combine order-free by `+`).
@@ -98,62 +169,56 @@ impl SumcheckProver {
                         terms.iter().map(|_| vec![ZERO; degree + 1]).collect();
                     for g in groups {
                         let gbase = g * 2 * block;
-                        for j in 0..block {
-                            let base = gbase + j;
-                            for (ti, t) in terms.iter().enumerate() {
-                                // The factors' (a, d) pairs at this position,
-                                // then the coefficient product — specialized
-                                // for the small factor counts that cover the
-                                // stack (1–3 factors: the Spartan outers, the
-                                // PCS eval, the memory sum-checks), with the
-                                // generic array kernel as the fallback.
-                                let nf = t.dense.len() + t.public.len();
-                                let c0 = coeffs_of[ti];
-                                let acc = &mut local[ti];
-                                if nf == 1 {
-                                    let (a, d) = self.pair_of(t, base, block);
-                                    acc[0] += mul(c0, a);
-                                    acc[1] += mul(c0, d);
-                                } else if nf == 2 {
-                                    let (a1, d1) = self.pair_of(t, base, block);
-                                    let (a2, d2) = self.pair_of_idx(t, 1, base, block);
-                                    let ca = mul(c0, a1);
-                                    acc[0] += mul(ca, a2);
-                                    acc[1] += mul(ca, d2) + mul(mul(c0, d1), a2);
-                                    acc[2] += mul(mul(c0, d1), d2);
-                                } else if nf == 3 {
-                                    let (a1, d1) = self.pair_of(t, base, block);
-                                    let (a2, d2) = self.pair_of_idx(t, 1, base, block);
-                                    let (a3, d3) = self.pair_of_idx(t, 2, base, block);
-                                    // (a1 + X·d1)(a2 + X·d2)(a3 + X·d3)
-                                    let a1a2 = mul(a1, a2);
-                                    let a1d2 = mul(a1, d2);
-                                    let d1a2 = mul(d1, a2);
-                                    let d1d2 = mul(d1, d2);
-                                    acc[0] += mul(c0, mul(a1a2, a3));
-                                    acc[1] +=
-                                        mul(c0, mul(a1a2, d3) + mul(a1d2, a3) + mul(d1a2, a3));
-                                    acc[2] +=
-                                        mul(c0, mul(a1d2, d3) + mul(d1a2, d3) + mul(d1d2, a3));
-                                    acc[3] += mul(c0, mul(d1d2, d3));
-                                } else {
-                                    let mut poly = [ZERO; 17];
-                                    poly[0] = coeffs_of[ti];
-                                    let mut deg = 0usize;
-                                    for k in 0..nf {
-                                        let (a, dd) = self.pair_of_idx(t, k, base, block);
-                                        let mut next = [ZERO; 17];
-                                        for e in 0..=deg {
-                                            next[e] += mul(poly[e], a);
-                                            next[e + 1] += mul(poly[e], dd);
-                                        }
-                                        poly = next;
-                                        deg += 1;
-                                    }
-                                    for e in 0..=deg.min(degree) {
-                                        acc[e] += poly[e];
+                        let n4 = block / 4;
+                        // Term-outer: the fused VPCLMULQDQ kernels keep
+                        // their accumulators in SIMD registers across the
+                        // whole group; bit paths are scalar selects; the
+                        // <= 3-position tail runs the per-position forms.
+                        for (ti, t) in terms.iter().enumerate() {
+                            let nf = t.dense.len() + t.public.len();
+                            let c0 = coeffs_of[ti];
+                            let acc = &mut local[ti];
+                            match paths[ti] {
+                                Path::Generic if nf == 2 => {
+                                    let f1 = self.factor_table(t, 0);
+                                    let f2 = self.factor_table(t, 1);
+                                    let done = magnetar_field::avx::msg2_batch(
+                                        acc, c0, f1, f2, gbase, block, 4 * n4,
+                                    );
+                                    for o in done..4 * n4 {
+                                        self.generic2_one(acc, c0, t, gbase + o, block);
                                     }
                                 }
+                                Path::Generic if nf == 3 => {
+                                    let f1 = self.factor_table(t, 0);
+                                    let f2 = self.factor_table(t, 1);
+                                    let f3 = self.factor_table(t, 2);
+                                    let done = magnetar_field::avx::msg3_batch(
+                                        acc, c0, f1, f2, f3, gbase, block, 4 * n4,
+                                    );
+                                    for o in done..4 * n4 {
+                                        self.generic3_one(acc, c0, t, gbase + o, block);
+                                    }
+                                }
+                                _ => {
+                                    // Bit paths (scalar selects, cheap) and
+                                    // the generic fallbacks: per position.
+                                    for o in 0..4 * n4 {
+                                        let base = gbase + o;
+                                        self.position_contribution(
+                                            acc, c0, t, base, block, degree, coeffs_of, ti, nf,
+                                            &paths[ti],
+                                        );
+                                    }
+                                }
+                            }
+                            // Scalar tail (block % 4 positions).
+                            for o in 4 * n4..block {
+                                let base = gbase + o;
+                                self.position_contribution(
+                                    acc, c0, t, base, block, degree, coeffs_of, ti, nf,
+                                    &paths[ti],
+                                );
                             }
                         }
                     }
@@ -178,7 +243,6 @@ impl SumcheckProver {
                 *slot += c[e];
             }
         }
-        let _ = pairs_per_group;
         RoundMsg(msg)
     }
 
@@ -195,9 +259,192 @@ impl SumcheckProver {
         }
     }
 
+    /// The table of term `t`'s factor `k` (dense or public).
     #[inline]
-    fn pair_of(&self, t: &crate::Term, base: usize, block: usize) -> (Gf128, Gf128) {
-        self.pair_of_idx(t, 0, base, block)
+    fn factor_table(&self, t: &crate::Term, k: usize) -> &Vec<Gf128> {
+        if k < t.dense.len() {
+            &self.dense[t.dense[k]]
+        } else {
+            &self.public_tables[t.public[k - t.dense.len()]]
+        }
+    }
+
+    /// One position's message contribution, dispatching on the classified
+    /// path (bit selects or the generic expansions). Bit-identical across
+    /// paths; order-free accumulation.
+    #[allow(clippy::too_many_arguments)]
+    fn position_contribution(
+        &self,
+        acc: &mut [Gf128],
+        c0: Gf128,
+        t: &crate::Term,
+        base: usize,
+        block: usize,
+        degree: usize,
+        coeffs_of: &[Gf128],
+        ti: usize,
+        nf: usize,
+        path: &Path,
+    ) {
+        match path {
+            Path::Bit1 => {
+                let f = &self.dense[t.dense[0]];
+                let a = f[base];
+                let d = Gf128(f[base].0 ^ f[base + block].0);
+                acc[0] += mul_bit(c0, a);
+                acc[1] += mul_bit(c0, d);
+            }
+            Path::BitDensePub => {
+                let f = &self.dense[t.dense[0]];
+                let a = f[base];
+                let d = Gf128(f[base].0 ^ f[base + block].0);
+                let g = &self.public_tables[t.public[0]];
+                let e0 = g[base];
+                let e1 = Gf128(g[base].0 ^ g[base + block].0);
+                let (e0, e1) = if c0 == ONE {
+                    (e0, e1)
+                } else {
+                    (mul(c0, e0), mul(c0, e1))
+                };
+                acc[0] += mul_bit(e0, a);
+                acc[1] += mul_bit(e1, a) + mul_bit(e0, d);
+                acc[2] += mul_bit(e1, d);
+            }
+            Path::Bit2Dense => {
+                let f1 = &self.dense[t.dense[0]];
+                let f2 = &self.dense[t.dense[1]];
+                let a1 = f1[base];
+                let d1 = Gf128(f1[base].0 ^ f1[base + block].0);
+                let a2 = f2[base];
+                let d2 = Gf128(f2[base].0 ^ f2[base + block].0);
+                // Products of bits are bits: AND/XOR.
+                let p0 = Gf128(a1.0 & a2.0);
+                let p1 = Gf128((a1.0 & d2.0) ^ (d1.0 & a2.0));
+                let p3 = Gf128(d1.0 & d2.0);
+                acc[0] += mul_bit(c0, p0);
+                acc[1] += mul_bit(c0, p1);
+                acc[2] += mul_bit(c0, p3);
+            }
+            Path::Bit2DensePub => {
+                let f1 = &self.dense[t.dense[0]];
+                let f2 = &self.dense[t.dense[1]];
+                let a1 = f1[base];
+                let d1 = Gf128(f1[base].0 ^ f1[base + block].0);
+                let a2 = f2[base];
+                let d2 = Gf128(f2[base].0 ^ f2[base + block].0);
+                let p0 = Gf128(a1.0 & a2.0);
+                let p1 = Gf128((a1.0 & d2.0) ^ (d1.0 & a2.0));
+                let p3 = Gf128(d1.0 & d2.0);
+                let g = &self.public_tables[t.public[0]];
+                let e0 = g[base];
+                let e1 = Gf128(g[base].0 ^ g[base + block].0);
+                // (p0 + X·p1 + X²·p3)·(e0 + X·e1), all bit×field selects.
+                let (e0, e1) = if c0 == ONE {
+                    (e0, e1)
+                } else {
+                    (mul(c0, e0), mul(c0, e1))
+                };
+                acc[0] += mul_bit(e0, p0);
+                acc[1] += mul_bit(e1, p0) + mul_bit(e0, p1);
+                acc[2] += mul_bit(e1, p1) + mul_bit(e0, p3);
+                acc[3] += mul_bit(e1, p3);
+            }
+            Path::Generic => {
+                if nf == 1 {
+                    let (a, d) = self.pair_of_idx(t, 0, base, block);
+                    acc[0] += mul(c0, a);
+                    acc[1] += mul(c0, d);
+                } else if nf == 2 {
+                    self.generic2_one(acc, c0, t, base, block);
+                } else if nf == 3 {
+                    self.generic3_one(acc, c0, t, base, block);
+                } else {
+                    self.generic_n(acc, c0, t, base, block, degree, coeffs_of, ti, nf);
+                }
+            }
+        }
+    }
+
+    /// One position's 2-factor generic expansion.
+    fn generic2_one(
+        &self,
+        acc: &mut [Gf128],
+        c0: Gf128,
+        t: &crate::Term,
+        base: usize,
+        block: usize,
+    ) {
+        let (a1, d1) = self.pair_of_idx(t, 0, base, block);
+        let (a2, d2) = self.pair_of_idx(t, 1, base, block);
+        let ca = mul(c0, a1);
+        let cd1 = mul(c0, d1);
+        acc[0] += mul(ca, a2);
+        acc[1] += mul(ca, d2) + mul(cd1, a2);
+        acc[2] += mul(cd1, d2);
+    }
+
+    /// One position's 3-factor generic expansion.
+    fn generic3_one(
+        &self,
+        acc: &mut [Gf128],
+        c0: Gf128,
+        t: &crate::Term,
+        base: usize,
+        block: usize,
+    ) {
+        let (a1, d1) = self.pair_of_idx(t, 0, base, block);
+        let (a2, d2) = self.pair_of_idx(t, 1, base, block);
+        let (a3, d3) = self.pair_of_idx(t, 2, base, block);
+        // (a1 + X·d1)(a2 + X·d2)(a3 + X·d3)
+        let a1a2 = mul(a1, a2);
+        let a1d2 = mul(a1, d2);
+        let d1a2 = mul(d1, a2);
+        let d1d2 = mul(d1, d2);
+        let s1 = a1d2 + d1a2;
+        if c0 == ONE {
+            acc[0] += mul(a1a2, a3);
+            acc[1] += mul(a1a2, d3) + mul(s1, a3);
+            acc[2] += mul(s1, d3) + mul(d1d2, a3);
+            acc[3] += mul(d1d2, d3);
+        } else {
+            acc[0] += mul(c0, mul(a1a2, a3));
+            acc[1] += mul(c0, mul(a1a2, d3) + mul(s1, a3));
+            acc[2] += mul(c0, mul(s1, d3) + mul(d1d2, a3));
+            acc[3] += mul(c0, mul(d1d2, d3));
+        }
+    }
+
+    /// The generic high-degree fallback (one position).
+    #[allow(clippy::too_many_arguments)]
+    fn generic_n(
+        &self,
+        acc: &mut [Gf128],
+        c0: Gf128,
+        t: &crate::Term,
+        base: usize,
+        block: usize,
+        degree: usize,
+        coeffs_of: &[Gf128],
+        ti: usize,
+        nf: usize,
+    ) {
+        let mut poly = [ZERO; 17];
+        poly[0] = coeffs_of[ti];
+        let mut deg = 0usize;
+        for k in 0..nf {
+            let (a, dd) = self.pair_of_idx(t, k, base, block);
+            let mut next = [ZERO; 17];
+            for e in 0..=deg {
+                next[e] += mul(poly[e], a);
+                next[e + 1] += mul(poly[e], dd);
+            }
+            poly = next;
+            deg += 1;
+        }
+        for e in 0..=deg.min(degree) {
+            acc[e] += poly[e];
+        }
+        let _ = c0;
     }
 
     /// Absorb the message into the transcript, check nothing (prover side),
@@ -227,6 +474,16 @@ impl SumcheckProver {
     /// Fold at `r` reusing an already-computed round message (the ZK driver
     /// masks the message it transmits but folds the *unmasked* polynomial —
     /// the mask never enters the prover's tables, only the transcript).
+    ///
+    /// Two prover-internal optimizations fire here (both leave the messages
+    /// bit-identical to the generic engine's):
+    /// * **Bit folds**: a `dense_bits`-flagged table folds with a
+    ///   branchless select (`r·(lo+hi)` with `lo+hi ∈ {0,1}`) — no CLMUL.
+    /// * **Eq slabs**: a slab-able public factor is never folded. Its
+    ///   table is *gathered* (the bit-`s` slice, no multiplications) and
+    ///   the bound variable's constant `eq(τ_b, r)/eq(τ_b, s)` moves into
+    ///   the term coefficients — deleting the eq factor's per-round fold
+    ///   multiplications entirely (the decomposable-equality discipline).
     pub fn fold_msg(&mut self, msg: &RoundMsg, r: Gf128) {
         self.challenges.push(r);
         // running := m(r)
@@ -238,11 +495,56 @@ impl SumcheckProver {
         }
         self.running = mr;
         let bit = self.order.current_bit(self.num_vars, self.round);
-        for d in self.dense.iter_mut() {
-            par_bind_var(d, bit, r);
+        // The slab profile is indexed by ORIGINAL variable; the round binds
+        // `round_var` (the layout bit `bit` corresponds to it).
+        let orig_var = self.order.round_var(self.num_vars, self.round);
+        // Public factors: generic fold, or the slab gather + coefficient
+        // scale. The per-term coefficient deltas accumulate first so each
+        // term scales once per referenced slab factor.
+        let mut coeff_scale: Vec<Gf128> = vec![ONE; self.spec_terms.len()];
+        for (pi, prof) in self.slab_profile.iter().enumerate() {
+            match prof.as_ref().map(|p| p[orig_var].clone()) {
+                None => {
+                    par_bind_var(&mut self.public_tables[pi], bit, r);
+                }
+                Some(crate::EqSlabInfo::NotSlab) => {
+                    par_bind_var(&mut self.public_tables[pi], bit, r);
+                }
+                Some(crate::EqSlabInfo::Covered(tau_v)) => {
+                    // Choose the slice s with eq(τ_v, s) ≠ 0: s = 0 gives
+                    // 1+τ_v, zero only at τ_v = 1; fall back to s = 1
+                    // (scale τ_v = 1 there).
+                    let slice = tau_v != ONE;
+                    par_gather_bit_at(&mut self.public_tables[pi], bit, slice);
+                    // delta = eq(τ_v, r) / eq(τ_v, s).
+                    let eq_r = ONE + tau_v + r; // eq(τ_v, r) in char 2
+                    let eq_s = if slice { tau_v } else { ONE + tau_v };
+                    let delta = mul(eq_r, inv(eq_s));
+                    for (ti, t) in self.spec_terms.iter().enumerate() {
+                        if t.public.contains(&pi) {
+                            coeff_scale[ti] = mul(coeff_scale[ti], delta);
+                        }
+                    }
+                }
+                Some(crate::EqSlabInfo::Uncovered) => {
+                    // Constant in this variable: any slice equals the true
+                    // remaining table; no scale, no coefficient change.
+                    par_gather_bit_at(&mut self.public_tables[pi], bit, false);
+                }
+            }
         }
-        for p in self.public_tables.iter_mut() {
-            par_bind_var(p, bit, r);
+        for (ti, sc) in coeff_scale.into_iter().enumerate() {
+            if sc != ONE {
+                self.coeffs[ti] = mul(self.coeffs[ti], sc);
+            }
+        }
+        for (i, is_bit) in self.dense_bits.iter_mut().enumerate() {
+            if *is_bit {
+                par_bind_var_bit(&mut self.dense[i], bit, r);
+                *is_bit = false; // field-valued from here on
+            } else {
+                par_bind_var(&mut self.dense[i], bit, r);
+            }
         }
         self.round += 1;
     }

@@ -987,14 +987,20 @@ pub fn build_circuit() -> CircuitSpec {
             &[],
         );
     }
-    // Both relations share the same padded row count (paper §5.3).
-    let total_rows = rows.max(rows2).next_power_of_two().max(1);
-    a1.rows = total_rows;
-    b1.rows = total_rows;
-    c1.rows = total_rows;
-    a2.rows = total_rows;
-    b2.rows = total_rows;
-    c2.rows = total_rows;
+    // Both relations pad to their own next power of two: the paper
+    // (Construction 2) requires only the same SIMD dimension q and size
+    // bound m — the row counts are per-relation (each outer sum-check runs
+    // over its own (instance ‖ row) cube with its own row challenges).
+    // The K relation's real row count is tiny (the packed word checks), so
+    // this cuts its outer cube by orders of magnitude vs. shared padding.
+    let total_rows1 = rows.next_power_of_two().max(1);
+    let total_rows2 = rows2.next_power_of_two().max(1);
+    a1.rows = total_rows1;
+    b1.rows = total_rows1;
+    c1.rows = total_rows1;
+    a2.rows = total_rows2;
+    b2.rows = total_rows2;
+    c2.rows = total_rows2;
     CircuitSpec {
         a_bin: a1,
         b_bin: b1,

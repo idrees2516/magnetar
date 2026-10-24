@@ -40,7 +40,7 @@ pub mod sparse;
 pub mod zk;
 
 pub use engine::{SumcheckProver, SumcheckVerifier};
-pub use public::{EqProdFactor, PublicFactor, SumEqFactor, TableFactor};
+pub use public::{EqFactor, EqProdFactor, EqSlabInfo, PublicFactor, SumEqFactor, TableFactor};
 pub use sparse::{SparseFactor, SparseProver, SparseSpec};
 
 use magnetar_field::{Gf128, ZERO};

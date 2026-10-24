@@ -172,26 +172,7 @@ fn shared_round(
     (r, (m1, m2))
 }
 
-/// Absorb a round-message pair and sample two separate challenges.
-fn separate_round(
-    p1: &mut SumcheckProver,
-    p2: &mut SumcheckProver,
-    t: &mut Transcript,
-    label: &str,
-) -> ((Gf128, Gf128), (Vec<Gf128>, Vec<Gf128>)) {
-    let m1 = p1.message().0;
-    let m2 = p2.message().0;
-    let mut buf = Vec::with_capacity((m1.len() + m2.len()) * 16);
-    for c in m1.iter().chain(m2.iter()) {
-        buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
-    }
-    t.absorb_bytes(label, &buf);
-    let r1 = t.challenge_field(&format!("{label}-bin"));
-    let r2 = t.challenge_field(&format!("{label}-fld"));
-    p1.fold_msg(&magnetar_sumcheck::RoundMsg(m1.clone()), r1);
-    p2.fold_msg(&magnetar_sumcheck::RoundMsg(m2.clone()), r2);
-    ((r1, r2), (m1, m2))
-}
+fn separate_round_removed() {}
 
 fn outer_spec(
     _a: &SparseMatrix,
@@ -224,7 +205,11 @@ fn outer_spec(
 }
 
 /// Prove Virtual Spartan. `joint_z` is the joint assignment
-/// `Z(u, y) = z_u[y]` (row-major, `y` low bits); `q` the SIMD count.
+/// `Z(u, y) = z_u[y]` (row-major, `y` low bits); `q` the SIMD count;
+/// `z_bit_cols` marks, per column of `z`, whether the entries are
+/// bit-valued (`{0, 1}` — the w-half and the 1-column; the public x
+/// columns hold packed words). Bit columns enable the select-based
+/// application and the small-value message paths.
 ///
 /// Returns the proof and the per-segment claims.
 #[allow(clippy::too_many_arguments)]
@@ -233,21 +218,26 @@ pub fn prove_virtual_spartan(
     layout: &SegmentLayout,
     joint_z: &[Gf128],
     q: usize,
+    z_bit_cols: &[bool],
     t: &mut Transcript,
 ) -> (VirtualSpartanProof, Vec<SegmentClaim>) {
     let m = rel.m;
     let s = q.trailing_zeros() as usize; // instance vars
-                                         // The outer sum-check runs over (instance ‖ constraint-row): the row
-                                         // space is the (padded, power-of-two) row count of the matrices.
-    let rows = rel.a_bin.rows.max(rel.a_fld.rows).max(1);
-    debug_assert!(rows.is_power_of_two());
-    let row_vars = rows.trailing_zeros() as usize;
-    let joint_vars = s + row_vars;
+                                         // The outer sum-checks run over (instance ‖ constraint-row), each
+                                         // relation over its OWN padded row count (only q and m are shared,
+                                         // paper Construction 2), with separate row challenges.
+    let rows_bin = rel.a_bin.rows.max(1);
+    let rows_fld = rel.a_fld.rows.max(1);
+    debug_assert!(rows_bin.is_power_of_two());
+    debug_assert!(rows_fld.is_power_of_two());
+    let row_vars_bin = rows_bin.trailing_zeros() as usize;
+    let row_vars_fld = rows_fld.trailing_zeros() as usize;
+    let joint_vars_bin = s + row_vars_bin;
+    let joint_vars_fld = s + row_vars_fld;
     debug_assert_eq!(joint_z.len(), q * m);
-    let _ = row_vars;
-    // Sample the two τ points.
-    let tau_bin = t.challenge_field_vec("vs-tau-bin", joint_vars);
-    let tau_fld = t.challenge_field_vec("vs-tau-fld", joint_vars);
+    // Sample the two τ points (per-relation joint spaces).
+    let tau_bin = t.challenge_field_vec("vs-tau-bin", joint_vars_bin);
+    let tau_fld = t.challenge_field_vec("vs-tau-fld", joint_vars_fld);
     // Dense tables: block-diagonal applications.
     struct _Pt(std::time::Instant);
     impl Drop for _Pt {
@@ -285,25 +275,37 @@ pub fn prove_virtual_spartan(
         }
     }
     let _pt_apply = _Pt(std::time::Instant::now());
-    let az_bin = rel.a_bin.apply_simd(joint_z, q);
-    let bz_bin = rel.b_bin.apply_simd(joint_z, q);
-    let cz_bin = rel.c_bin.apply_simd(joint_z, q);
-    let az_fld = rel.a_fld.apply_simd(joint_z, q);
-    let bz_fld = rel.b_fld.apply_simd(joint_z, q);
-    let cz_fld = rel.c_fld.apply_simd(joint_z, q);
+    // Select-based application over the bit columns (small-value setting):
+    // every `entry · z_c` on a bit column is `entry` or `0` — no CLMUL. A
+    // table is bit-valued exactly when ITS matrix is binary and all its
+    // referenced columns are bits (checked per matrix, never assumed).
+    let apply_bits = |mat: &crate::SparseMatrix| -> (Vec<Gf128>, bool) {
+        if z_bit_cols.iter().any(|&b| b) {
+            mat.apply_simd_bits(joint_z, q, z_bit_cols)
+        } else {
+            (mat.apply_simd(joint_z, q), false)
+        }
+    };
+    let (az_bin, az_bits) = apply_bits(&rel.a_bin);
+    let (bz_bin, bz_bits) = apply_bits(&rel.b_bin);
+    let (cz_bin, cz_bits) = apply_bits(&rel.c_bin);
+    let az_fld = apply_bits(&rel.a_fld).0;
+    let bz_fld = apply_bits(&rel.b_fld).0;
+    let cz_fld = apply_bits(&rel.c_fld).0;
     let spec_bin = outer_spec(
-        &rel.a_bin, &rel.b_bin, &rel.c_bin, az_bin, bz_bin, cz_bin, &tau_bin, joint_vars,
+        &rel.a_bin, &rel.b_bin, &rel.c_bin, az_bin, bz_bin, cz_bin, &tau_bin, joint_vars_bin,
     );
     let spec_fld = outer_spec(
-        &rel.a_fld, &rel.b_fld, &rel.c_fld, az_fld, bz_fld, cz_fld, &tau_fld, joint_vars,
+        &rel.a_fld, &rel.b_fld, &rel.c_fld, az_fld, bz_fld, cz_fld, &tau_fld, joint_vars_fld,
     );
     drop(_pt_apply);
     // Lockstep: instance rounds share challenges (HighBitsFirst(s) binds the
     // high s instance variables first), row rounds separate.
     let order = BindOrder::HighBitsFirst { high: s };
     let _pt_r = _PtR::new("vs-outer-rounds");
-    let mut p_bin = SumcheckProver::new(&spec_bin, order);
-    let mut p_fld = SumcheckProver::new(&spec_fld, order);
+    let mut p_bin =
+        SumcheckProver::with_dense_bits(&spec_bin, order, vec![az_bits, bz_bits, cz_bits]);
+    let mut p_fld = SumcheckProver::with_dense_bits(&spec_fld, order, vec![false; 3]);
     let mut outer_shared = Vec::with_capacity(s);
     let mut r_inst_ch = Vec::with_capacity(s);
     for i in 0..s {
@@ -311,19 +313,40 @@ pub fn prove_virtual_spartan(
         r_inst_ch.push(r);
         outer_shared.push(msgs);
     }
-    let row_vars_outer = joint_vars - s;
-    let mut outer_bin = Vec::with_capacity(row_vars_outer);
-    let mut outer_fld = Vec::with_capacity(row_vars_outer);
+    let row_vars_outer = row_vars_bin.max(row_vars_fld);
+    let mut outer_bin = Vec::with_capacity(row_vars_bin);
+    let mut outer_fld = Vec::with_capacity(row_vars_fld);
     let mut row_ch_bin = Vec::new();
     let mut row_ch_fld = Vec::new();
-    for i in 0..row_vars_outer {
-        let ((r1, r2), msgs) =
-            separate_round(&mut p_bin, &mut p_fld, t, &format!("vs-out-row-{i}"));
+    // Row rounds with separate cubes: all of the bin relation's row rounds
+    // first (one message + challenge each), then all of the fld relation's.
+    for i in 0..row_vars_bin {
+        let label = format!("vs-out-rowbin-{i}");
+        let m1 = p_bin.message();
+        let mut buf = Vec::with_capacity(m1.0.len() * 16);
+        for c in &m1.0 {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+        }
+        t.absorb_bytes(&label, &buf);
+        let r1 = t.challenge_field(&label);
+        p_bin.fold_msg(&m1, r1);
         row_ch_bin.push(r1);
-        row_ch_fld.push(r2);
-        outer_bin.push(msgs.0);
-        outer_fld.push(msgs.1);
+        outer_bin.push(m1.0);
     }
+    for i in 0..row_vars_fld {
+        let label = format!("vs-out-rowfld-{i}");
+        let m2 = p_fld.message();
+        let mut buf = Vec::with_capacity(m2.0.len() * 16);
+        for c in &m2.0 {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+        }
+        t.absorb_bytes(&label, &buf);
+        let r2 = t.challenge_field(&label);
+        p_fld.fold_msg(&m2, r2);
+        row_ch_fld.push(r2);
+        outer_fld.push(m2.0);
+    }
+    let _ = row_vars_outer;
     drop(_pt_r);
     let (claims_bin, _) = p_bin.finish();
     let (claims_fld, _) = p_fld.finish();
@@ -361,7 +384,7 @@ pub fn prove_virtual_spartan(
     // Inner sum-check over the COLUMN variables (log m).
     let row_vars = m.trailing_zeros() as usize;
     let m_combo = build_m_combo(rel, &alphas, &r_row_bin, &r_row_fld);
-    let z_fold = fold_joint_at_instances(joint_z, q, m, &r_inst);
+    let z_fold = fold_joint_at_instances(joint_z, q, m, &r_inst, z_bit_cols);
     let inner_spec = SumcheckSpec {
         num_vars: row_vars,
         dense: vec![z_fold.clone()],
@@ -373,7 +396,13 @@ pub fn prove_virtual_spartan(
         }],
         claim: v_star,
     };
-    let mut inner_p = SumcheckProver::new(&inner_spec, BindOrder::Increasing);
+    let mut inner_p = SumcheckProver::with_dense_bits(
+        &inner_spec,
+        BindOrder::Increasing,
+        // `z_fold` is the eq-weighted instance fold — field-valued even
+        // when the witness is bits.
+        vec![false],
+    );
     let mut inner = Vec::with_capacity(row_vars);
     let mut r_col_ch = Vec::with_capacity(row_vars);
     for _ in 0..row_vars {
@@ -404,6 +433,9 @@ pub fn prove_virtual_spartan(
         wf
     };
     // Per-segment values: v_i = Ŵ_f evaluated at (r_local of segment i).
+    // The instance fold of a bit witness is a select-dot per column —
+    // no CLMUL (small-value discipline).
+    let eq_inst = magnetar_field::EqBits::build(&r_inst).values;
     let mut segment_values = Vec::with_capacity(layout.len());
     let mut segment_claims = Vec::with_capacity(layout.len());
     for i in 0..layout.len() {
@@ -412,14 +444,17 @@ pub fn prove_virtual_spartan(
         // r_local: the low `lv` bits of r_low.
         let r_local: Vec<Gf128> = r_low[..lv].to_vec();
         // The segment's folded table: eq(r_inst)-folded, then MLE at r_local.
-        let eq_inst = magnetar_field::EqBits::build(&r_inst).values;
         let mut seg_table = vec![ZERO; 1usize << lv];
         for (j, st) in seg_table.iter_mut().enumerate() {
-            let mut acc = ZERO;
+            let mut vals: Vec<Gf128> = Vec::with_capacity(q);
             for u in 0..q {
-                acc += mul(eq_inst[u], joint_z[u * m + base + j]);
+                vals.push(joint_z[u * m + base + j]);
             }
-            *st = acc;
+            *st = if z_bit_cols[base + j] {
+                magnetar_field::par_dot_bit_xor(&eq_inst, &vals)
+            } else {
+                magnetar_field::par_dot_xor(&eq_inst, &vals)
+            };
         }
         let v = if lv == 0 {
             seg_table[0]
@@ -479,16 +514,28 @@ fn build_m_combo(
     combo
 }
 
-/// Fold the joint table at the instance point (y stays Boolean).
-fn fold_joint_at_instances(joint_z: &[Gf128], q: usize, m: usize, r_inst: &[Gf128]) -> Vec<Gf128> {
+/// Fold the joint table at the instance point (y stays Boolean). Bit
+/// columns fold with select-dots — no CLMUL (small-value discipline);
+/// word columns keep the generic dot.
+fn fold_joint_at_instances(
+    joint_z: &[Gf128],
+    q: usize,
+    m: usize,
+    r_inst: &[Gf128],
+    z_bit_cols: &[bool],
+) -> Vec<Gf128> {
     let eq = magnetar_field::EqBits::build(r_inst).values;
     let mut out = vec![ZERO; m];
     for y in 0..m {
-        let mut acc = ZERO;
+        let mut vals: Vec<Gf128> = Vec::with_capacity(q);
         for u in 0..q {
-            acc += mul(eq[u], joint_z[u * m + y]);
+            vals.push(joint_z[u * m + y]);
         }
-        out[y] = acc;
+        out[y] = if z_bit_cols[y] {
+            magnetar_field::par_dot_bit_xor(&eq, &vals)
+        } else {
+            magnetar_field::par_dot_xor(&eq, &vals)
+        };
     }
     out
 }
@@ -506,12 +553,15 @@ pub fn verify_virtual_spartan(
 ) -> Result<Vec<SegmentClaim>, &'static str> {
     let m = rel.m;
     let s = q.trailing_zeros() as usize;
-    let rows = rel.a_bin.rows.max(rel.a_fld.rows).max(1);
-    let row_vars = m.trailing_zeros() as usize; // the inner's column vars
-    let joint_vars = s + rows.trailing_zeros() as usize;
-    // τ points.
-    let tau_bin = t.challenge_field_vec("vs-tau-bin", joint_vars);
-    let tau_fld = t.challenge_field_vec("vs-tau-fld", joint_vars);
+    let rows_bin = rel.a_bin.rows.max(1);
+    let rows_fld = rel.a_fld.rows.max(1);
+    let row_vars_bin = rows_bin.trailing_zeros() as usize;
+    let row_vars_fld = rows_fld.trailing_zeros() as usize;
+    let joint_vars_bin = s + row_vars_bin;
+    let joint_vars_fld = s + row_vars_fld;
+    // τ points (per-relation joint spaces).
+    let tau_bin = t.challenge_field_vec("vs-tau-bin", joint_vars_bin);
+    let tau_fld = t.challenge_field_vec("vs-tau-fld", joint_vars_fld);
     let order = BindOrder::HighBitsFirst { high: s };
     let mk_terms = || {
         vec![
@@ -531,8 +581,8 @@ pub fn verify_virtual_spartan(
         vec![Box::new(EqFactor::new(tau_bin.clone()))];
     let pf_fld: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
         vec![Box::new(EqFactor::new(tau_fld.clone()))];
-    let mut v_bin = SumcheckVerifier::new(joint_vars, ZERO, &pf_bin, mk_terms(), order);
-    let mut v_fld = SumcheckVerifier::new(joint_vars, ZERO, &pf_fld, mk_terms(), order);
+    let mut v_bin = SumcheckVerifier::new(joint_vars_bin, ZERO, &pf_bin, mk_terms(), order);
+    let mut v_fld = SumcheckVerifier::new(joint_vars_fld, ZERO, &pf_fld, mk_terms(), order);
     // Shared rounds: absorb both messages, one challenge, fold both.
     let mut r_inst_ch = Vec::with_capacity(s);
     for (i, (m1, m2)) in proof.outer_shared.iter().enumerate() {
@@ -551,28 +601,34 @@ pub fn verify_virtual_spartan(
             .map_err(|_| "vs: shared fld round check failed")?;
         r_inst_ch.push(r);
     }
-    // Row rounds: absorb both, two challenges, fold each.
-    let n_row_rounds = joint_vars - s;
-    let mut row_ch_bin = Vec::with_capacity(n_row_rounds);
-    let mut row_ch_fld = Vec::with_capacity(n_row_rounds);
-    for i in 0..n_row_rounds {
-        let label = format!("vs-out-row-{i}");
-        let m1 = &proof.outer_bin[i];
-        let m2 = &proof.outer_fld[i];
-        let mut buf = Vec::with_capacity((m1.len() + m2.len()) * 16);
-        for c in m1.iter().chain(m2.iter()) {
+    // Row rounds: the bin relation's rounds first, then the fld relation's
+    // (separate cubes, one message + challenge each).
+    let mut row_ch_bin = Vec::with_capacity(row_vars_bin);
+    let mut row_ch_fld = Vec::with_capacity(row_vars_fld);
+    for (i, m1) in proof.outer_bin.iter().enumerate() {
+        let label = format!("vs-out-rowbin-{i}");
+        let mut buf = Vec::with_capacity(m1.len() * 16);
+        for c in m1.iter() {
             buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
         }
         t.absorb_bytes(&label, &buf);
-        let r1 = t.challenge_field(&format!("{label}-bin"));
-        let r2 = t.challenge_field(&format!("{label}-fld"));
+        let r1 = t.challenge_field(&label);
         v_bin
             .round_external(&magnetar_sumcheck::RoundMsg(m1.clone()), r1)
             .map_err(|_| "vs: row bin round failed")?;
+        row_ch_bin.push(r1);
+    }
+    for (i, m2) in proof.outer_fld.iter().enumerate() {
+        let label = format!("vs-out-rowfld-{i}");
+        let mut buf = Vec::with_capacity(m2.len() * 16);
+        for c in m2.iter() {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+        }
+        t.absorb_bytes(&label, &buf);
+        let r2 = t.challenge_field(&label);
         v_fld
             .round_external(&magnetar_sumcheck::RoundMsg(m2.clone()), r2)
             .map_err(|_| "vs: row fld round failed")?;
-        row_ch_bin.push(r1);
         row_ch_fld.push(r2);
     }
     // Terminal checks (paper step 3): eq(τ_t, r_x_t)·(vA·vB + vC) = running.
@@ -607,6 +663,8 @@ pub fn verify_virtual_spartan(
         dense: vec![0],
         public: vec![0],
     }];
+    // The inner sum-check runs over the shared column space: log2(m) vars.
+    let row_vars = m.trailing_zeros() as usize;
     let pub_inner: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
         vec![Box::new(TableFactor::new(m_combo))];
     let mut inner_v = SumcheckVerifier::new(
@@ -763,7 +821,9 @@ mod tests {
             c_fld: c.clone(),
         };
         let mut t = Transcript::new("vs", &[b"test"]);
-        let (proof, claims) = prove_virtual_spartan(&rel, &layout, &joint, q, &mut t);
+        let (proof, claims) =
+            prove_virtual_spartan(
+                &rel, &layout, &joint, q, &vec![false; rel.m], &mut t);
         let mut tv = Transcript::new("vs", &[b"test"]);
         let vclaims = verify_virtual_spartan(&rel, &layout, q, &public, &proof, &mut tv)
             .expect("honest vs proof must verify");

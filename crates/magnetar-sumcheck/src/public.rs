@@ -7,6 +7,27 @@
 //! factor as a dense table to fold during the rounds.
 
 use magnetar_field::{mul, Gf128, ONE, ZERO};
+use rayon::prelude::*;
+
+/// How a public factor participates in the **never-folded eq slab**
+/// discipline (the decomposable-equality optimization of the
+/// sum-check-proving papers): a pure `eq(τ, ·)` (or product of eq factors
+/// over disjoint variable sets) is never *folded* through the rounds — the
+/// bound variable contributes a constant `eq(τ_b, r)` that belongs to the
+/// term coefficient, and the table only needs its bit-`s` slice
+/// (`s` chosen so `eq(τ_b, s) ≠ 0`), a mul-free gather. This keeps the
+/// messages identical to the generic engine's while deleting the eq
+/// factor's per-round fold multiplications entirely.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EqSlabInfo {
+    /// Not a slab-able factor (fold as a generic table).
+    NotSlab,
+    /// Slab-able, and the factor covers `var`: the payload is `τ_var`.
+    Covered(Gf128),
+    /// Slab-able but constant in `var` (the product's parts do not cover
+    /// it): the gather is scale-free.
+    Uncovered,
+}
 
 /// A verifier-evaluable multilinear over a fixed number of variables.
 pub trait PublicFactor: std::fmt::Debug {
@@ -18,6 +39,12 @@ pub trait PublicFactor: std::fmt::Debug {
 
     /// Evaluate at an arbitrary point (little-endian variable order).
     fn eval_at(&self, point: &[Gf128]) -> Gf128;
+
+    /// The eq-slab classification of this factor at joint variable `var`
+    /// (see [`EqSlabInfo`]). Default: not slab-able.
+    fn eq_slab_info(&self, _var: usize) -> EqSlabInfo {
+        EqSlabInfo::NotSlab
+    }
 }
 
 /// `eq(r, ·)` — the multilinear equality factor (paper §3.1).
@@ -47,6 +74,13 @@ impl PublicFactor for EqFactor {
         }
         acc
     }
+    fn eq_slab_info(&self, var: usize) -> EqSlabInfo {
+        if var < self.point.len() {
+            EqSlabInfo::Covered(self.point[var])
+        } else {
+            EqSlabInfo::Uncovered
+        }
+    }
 }
 
 /// `Σ_i α_i · eq(p_i, ·)` — the MosaicPCS batching factor (paper §5.2):
@@ -71,50 +105,69 @@ impl PublicFactor for SumEqFactor {
     fn materialize(&self) -> Vec<Gf128> {
         let nv = self.num_vars();
         let n = 1usize << nv;
-        // The **sparse-support build**: a point coordinate fixed at 0 or 1
-        // contributes `eq = 1` and *pins* that bit of the support — only
-        // the random coordinates vary. The Mosaic lift appends Boolean
-        // suffixes (the aligned-subcube offsets), so each claim's table
-        // lives on a `2^{vars_i}` subcube: the build costs
-        // `Σ_i 2^{vars_i}` (a DFS scatter with one multiplication per
-        // support entry), not `S·2^ℓ` — the S-claims batching factor of
-        // the Mosaic discharge. Parallel over item chunks (R1).
-        use rayon::prelude::*;
-        let chunk = (self.items.len() / rayon::current_num_threads().max(1)).max(1);
-        self.items
-            .par_chunks(chunk)
-            .map(|items| {
-                let mut table = vec![Gf128(0); n];
-                for (alpha, point) in items {
-                    let free: Vec<usize> = point
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, &r)| r != ZERO && r != ONE)
-                        .map(|(j, _)| j)
-                        .collect();
-                    let mut base_idx = 0usize;
-                    for (j, &r) in point.iter().enumerate() {
-                        if r == ONE {
-                            base_idx |= 1usize << j;
-                        }
-                    }
-                    // DFS over the free coordinates: each leaf's value is
-                    // the prefix product (one mul per entry).
-                    let fs: Vec<(Gf128, Gf128)> =
-                        free.iter().map(|&j| (ONE + point[j], point[j])).collect();
-                    scatter(&mut table, base_idx, &free, &fs, 0, *alpha);
+        // The **sparse-support build** with a **single shared output table**:
+        // a point coordinate fixed at 0 or 1 contributes `eq = 1` and pins
+        // that bit of the support — only the random coordinates vary. The
+        // Mosaic lift appends Boolean suffixes (the aligned-subcube
+        // offsets), so each claim's support is its free-coordinate subcube:
+        // the build costs `Σ_i 2^{free_i}` (one multiplication per support
+        // entry), scattered into ONE table — the earlier per-chunk
+        // full-table copies + XOR reduce were pure memory traffic.
+        let mut table = vec![Gf128(0); n];
+        // Per item: a **compact iterative tensor build** then one scatter
+        // pass. The build is contiguous (cache-friendly, batchable through
+        // the SIMD pipeline) and costs one multiplication per entry: with
+        // `f0 = 1 + p` and `f1 = p`, `f0 + f1 = 1`, so the doubling is
+        //     t[2k]   = f0·t[k]
+        //     t[2k+1] = t[2k] + t[k]   (= f1·t[k], one mul total)
+        // The scatter folds the free coordinates' bits into their cube
+        // positions around the pinned base index.
+        for (alpha, point) in &self.items {
+            let free: Vec<usize> = point
+                .iter()
+                .enumerate()
+                .filter(|(_, &r)| r != ZERO && r != ONE)
+                .map(|(j, _)| j)
+                .collect();
+            let mut base_idx = 0usize;
+            for (j, &r) in point.iter().enumerate() {
+                if r == ONE {
+                    base_idx |= 1usize << j;
                 }
-                table
-            })
-            .reduce(
-                || vec![Gf128(0); n],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(b.iter()) {
-                        *x += *y;
+            }
+            let m = 1usize << free.len();
+            let mut t = vec![ZERO; m];
+            t[0] = *alpha;
+            let mut size = 1usize;
+            for &j in &free {
+                let f0 = ONE + point[j];
+                // Descending: reads stay in the untouched lower half
+                // while writes fill the upper half.
+                let mut k = size;
+                while k > 0 {
+                    k -= 1;
+                    let base_val = t[k];
+                    let v0 = mul(base_val, f0);
+                    t[2 * k] = v0;
+                    t[2 * k + 1] = Gf128(v0.0 ^ base_val.0);
+                }
+                size *= 2;
+            }
+            for k in 0..m {
+                let mut idx = base_idx;
+                // The doubling assigns the first-processed coordinate to
+                // the HIGH bit of the compact index (each level shifts the
+                // previous bits up), so compact bit `b` corresponds to
+                // free[len − 1 − b].
+                for (b, &j) in free.iter().rev().enumerate() {
+                    if (k >> b) & 1 == 1 {
+                        idx |= 1usize << j;
                     }
-                    a
-                },
-            )
+                }
+                table[idx] += t[k];
+            }
+        }
+        table
     }
     fn eval_at(&self, point: &[Gf128]) -> Gf128 {
         let mut acc = ZERO;
@@ -154,6 +207,8 @@ fn scatter(
         mul(val, f1),
     );
 }
+
+
 
 /// A product of `eq` factors over a partition of the joint variables:
 /// `Π_m eq(p_m, x_{S_m})` — the public-factor shape of the
@@ -212,6 +267,18 @@ impl PublicFactor for EqProdFactor {
             acc = mul(acc, e);
         }
         acc
+    }
+    fn eq_slab_info(&self, var: usize) -> EqSlabInfo {
+        // A product of eq factors over disjoint variable sets: the gather
+        // scales by the covering part's `1 + τ` (or `τ`) and the term
+        // coefficient absorbs `eq(τ, r)` of that part only. Variables no
+        // part covers are idle: the table is constant along them.
+        for (p, pos) in &self.parts {
+            if let Some(t) = pos.iter().position(|&av| av == var) {
+                return EqSlabInfo::Covered(p[t]);
+            }
+        }
+        EqSlabInfo::Uncovered
     }
 }
 

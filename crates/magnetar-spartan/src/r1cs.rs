@@ -99,6 +99,47 @@ impl SparseMatrix {
         }
         out
     }
+
+    /// `true` iff every entry is `0` or `1` (a binary matrix — its
+    /// application over a bit-valued witness is bit-valued: the summands
+    /// are bit-products and the XOR-sum stays in `{0, 1}`).
+    pub fn is_binary(&self) -> bool {
+        self.entries.iter().all(|&(_, _, v)| v.0 <= 1)
+    }
+
+    /// The SIMD application specialized to a **bit-valued witness column
+    /// set** (`z_bit_cols[y]` marks the columns whose entries are all
+    /// `{0, 1}` — the stack's dominant case: the w-half and the 1-column;
+    /// the public x columns hold packed words and stay generic): for a bit
+    /// column, every product `v·z_c` is `v` or `0`, a branchless select —
+    /// no CLMUL. Returns the table plus a flag: the output is bit-valued
+    /// exactly when the matrix is binary and every referenced column is
+    /// bit-valued.
+    pub fn apply_simd_bits(
+        &self,
+        joint_z: &[Gf128],
+        q: usize,
+        z_bit_cols: &[bool],
+    ) -> (Vec<Gf128>, bool) {
+        debug_assert_eq!(joint_z.len(), q * self.cols);
+        debug_assert_eq!(z_bit_cols.len(), self.cols);
+        let mut out = vec![ZERO; q * self.rows];
+        for u in 0..q {
+            let z_u = &joint_z[u * self.cols..(u + 1) * self.cols];
+            let out_u = &mut out[u * self.rows..(u + 1) * self.rows];
+            for &(r, c, v) in &self.entries {
+                if z_bit_cols[c] {
+                    // mask = 0xFFFF… iff z_c = 1: v·z_c = v & mask.
+                    let mask = z_u[c].0.wrapping_neg();
+                    out_u[r].0 ^= v.0 & mask;
+                } else {
+                    out_u[r] += mul(v, z_u[c]);
+                }
+            }
+        }
+        let out_bits = self.is_binary() && self.entries.iter().all(|&(_, c, _)| z_bit_cols[c]);
+        (out, out_bits)
+    }
 }
 
 /// The joint SIMD assignment: `Z(u, y) = z_u[y]`, row-major (`y` low bits),

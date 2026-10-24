@@ -21,10 +21,13 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 #![forbid(clippy::undocumented_unsafe_blocks)]
-// The single exception: `gf128::clmul` contains guarded `unsafe` intrinsics.
-// It is a dedicated module with `#[allow(unsafe_code)]` and audited SAFETY
-// comments; every other module in the workspace stays `forbid`-clean.
+// The two exceptions: `gf128::clmul` and `avx` contain guarded `unsafe`
+// intrinsics. They are dedicated modules with `#[allow(unsafe_code)]` and
+// audited SAFETY comments; every other module in the workspace stays
+// `forbid`-clean.
+#![cfg_attr(target_arch = "x86_64", allow(unsafe_code))]
 
+pub mod avx;
 mod eq;
 mod gf128;
 mod multilinear;
@@ -32,13 +35,16 @@ mod pack;
 pub mod parallel;
 
 pub use eq::{eq_char2, eq_table, EqBits};
-pub use gf128::{inv, mul, pow, square, Gf128, ONE, ZERO};
+pub use gf128::{inv, is_bit, mul, mul_bit, pow, square, Gf128, ONE, ZERO};
 pub use multilinear::{bind_var, eval_mle, fold_pairs, Multilinear};
 pub use pack::{
     c_fold_table, eq_coefficients, pack_bits, pack_bytes_le, pack_table, phi_c, unpack_bits,
     PHIBITS,
 };
-pub use parallel::{par_bind_var, par_dot_xor, PAR_CHUNK, PAR_THRESHOLD};
+pub use parallel::{
+    par_bind_var, par_bind_var_bit, par_dot_bit_xor, par_dot_xor, par_gather_bit, par_gather_bit_at,
+    PAR_CHUNK, PAR_THRESHOLD,
+};
 
 /// A small helper trait for field elements used across the stack.
 pub trait Field: Copy + PartialEq + std::fmt::Debug {

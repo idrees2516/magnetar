@@ -604,7 +604,21 @@ pub fn prove_inner(
         c_fld: pk.circuit.c_fld.clone(),
     };
     let _pt = PhaseTimer::new("3a-virtual-spartan");
-    let (vs_proof, seg_claims) = prove_virtual_spartan(&rel, &pk.layout, &wd.joint_z, q, t);
+    // Column bit-ness of `z = (w, 1, x)`: the w-half and the 1-column are
+    // bits; the public x columns hold packed words (output + inputs) and
+    // stay generic. This is what makes the select-based application and
+    // the small-value message paths sound.
+    let z_bit_cols: Vec<bool> = {
+        let w_cols = magnetar_cpu::WITNESS_LAYOUT::W_COLS;
+        let m = magnetar_cpu::WITNESS_LAYOUT::M;
+        let mut v = vec![false; m];
+        for c in v.iter_mut().take(w_cols + 1) {
+            *c = true;
+        }
+        v
+    };
+    let (vs_proof, seg_claims) =
+        prove_virtual_spartan(&rel, &pk.layout, &wd.joint_z, q, &z_bit_cols, t);
     drop(_pt);
     let seg = |name: &str| -> SegmentClaim {
         let i = pk.layout.index_of(name).expect("segment");

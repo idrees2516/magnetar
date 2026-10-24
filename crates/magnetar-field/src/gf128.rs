@@ -202,6 +202,22 @@ pub fn mul(a: Gf128, b: Gf128) -> Gf128 {
     reduce256(clmul128(a, b))
 }
 
+/// Multiply by a **bit-valued** factor (`b ∈ {0, 1}`, the small-value
+/// setting of the sum-check papers): `r · b` is `r` or `0` — a branchless
+/// select, no CLMUL. Caller guarantees `b.0 ∈ {0, 1}` (the engine detects
+/// bit-valued tables once and uses this path while they last).
+#[inline]
+pub fn mul_bit(r: Gf128, b: Gf128) -> Gf128 {
+    debug_assert!(b.0 <= 1, "mul_bit requires a bit-valued factor");
+    Gf128(r.0 & b.0.wrapping_neg())
+}
+
+/// `true` iff the element is `0` or `1` (bit-valued).
+#[inline]
+pub fn is_bit(a: Gf128) -> bool {
+    a.0 <= 1
+}
+
 /// Frobenius: `a → a²` (the paper's `s_h = r_h²` in BinaryTwist §4.4).
 #[inline]
 pub fn square(a: Gf128) -> Gf128 {
