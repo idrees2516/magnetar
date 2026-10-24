@@ -114,14 +114,12 @@ impl PublicFactor for SumEqFactor {
         // entry), scattered into ONE table — the earlier per-chunk
         // full-table copies + XOR reduce were pure memory traffic.
         let mut table = vec![Gf128(0); n];
-        // Per item: a **compact iterative tensor build** then one scatter
-        // pass. The build is contiguous (cache-friendly, batchable through
-        // the SIMD pipeline) and costs one multiplication per entry: with
-        // `f0 = 1 + p` and `f1 = p`, `f0 + f1 = 1`, so the doubling is
-        //     t[2k]   = f0·t[k]
-        //     t[2k+1] = t[2k] + t[k]   (= f1·t[k], one mul total)
-        // The scatter folds the free coordinates' bits into their cube
-        // positions around the pinned base index.
+        // One shared output table, items scattered sequentially: the cost
+        // is `Σ_i 2^{free_i}` multiplications plus one scattered
+        // read-modify-write per support entry (the earlier per-chunk
+        // full-table copies + XOR reduce were pure memory traffic; the
+        // fully-fused k-way block build — never materializing the sum at
+        // all — is the roadmap follow-up for this factor).
         for (alpha, point) in &self.items {
             let free: Vec<usize> = point
                 .iter()
@@ -135,37 +133,9 @@ impl PublicFactor for SumEqFactor {
                     base_idx |= 1usize << j;
                 }
             }
-            let m = 1usize << free.len();
-            let mut t = vec![ZERO; m];
-            t[0] = *alpha;
-            let mut size = 1usize;
-            for &j in &free {
-                let f0 = ONE + point[j];
-                // Descending: reads stay in the untouched lower half
-                // while writes fill the upper half.
-                let mut k = size;
-                while k > 0 {
-                    k -= 1;
-                    let base_val = t[k];
-                    let v0 = mul(base_val, f0);
-                    t[2 * k] = v0;
-                    t[2 * k + 1] = Gf128(v0.0 ^ base_val.0);
-                }
-                size *= 2;
-            }
-            for k in 0..m {
-                let mut idx = base_idx;
-                // The doubling assigns the first-processed coordinate to
-                // the HIGH bit of the compact index (each level shifts the
-                // previous bits up), so compact bit `b` corresponds to
-                // free[len − 1 − b].
-                for (b, &j) in free.iter().rev().enumerate() {
-                    if (k >> b) & 1 == 1 {
-                        idx |= 1usize << j;
-                    }
-                }
-                table[idx] += t[k];
-            }
+            let fs: Vec<(Gf128, Gf128)> =
+                free.iter().map(|&j| (ONE + point[j], point[j])).collect();
+            scatter(&mut table, base_idx, &free, &fs, 0, *alpha);
         }
         table
     }

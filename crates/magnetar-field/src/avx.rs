@@ -831,6 +831,59 @@ pub fn fold_pairs(out: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> u
     }
 }
 
+/// Broadcast multiply over a run: `dst[k] = src[k] · r` (the fused-lane
+/// form of the eq-tensor doubling). Returns the entries consumed.
+pub fn mul_run(dst: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> usize {
+    match detect() {
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx512 => {
+            let n4 = count / 4;
+            #[allow(unsafe_code)]
+            unsafe {
+                use std::arch::x86_64::{_mm512_loadu_si512, _mm512_storeu_si512};
+                let mut rb = [r; 4];
+                let rv = _mm512_loadu_si512(rb.as_mut_ptr().cast());
+                for i in 0..n4 {
+                    let k = 4 * i;
+                    let v = _mm512_loadu_si512(src.as_ptr().add(k).cast());
+                    let prod = imp512::Avx.mul_mm_public(rv, v);
+                    _mm512_storeu_si512(dst.as_mut_ptr().add(k).cast(), prod);
+                }
+            }
+            4 * n4
+        }
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx2 => {
+            let n2 = count / 2;
+            #[allow(unsafe_code)]
+            unsafe {
+                imp256::Avx2.mul_run2(dst, src, r, n2);
+            }
+            2 * n2
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(unsafe_code)]
+mod imp256_mul_run {
+    use super::*;
+    impl imp256::Avx2 {
+        pub unsafe fn mul_run2(&self, dst: &mut [Gf128], src: &[Gf128], r: Gf128, n2: usize) {
+            use std::arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
+            let mut rb = [r; 2];
+            let rv = _mm256_loadu_si256(rb.as_mut_ptr().cast());
+            for i in 0..n2 {
+                let k = 2 * i;
+                let v = _mm256_loadu_si256(src.as_ptr().add(k).cast());
+                let prod = super::imp256::Avx2.mul_mm_public(rv, v);
+                _mm256_storeu_si256(dst.as_mut_ptr().add(k).cast(), prod);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
