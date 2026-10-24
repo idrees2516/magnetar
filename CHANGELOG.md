@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.6.0] — the linear-in-T release
+
+### Added
+- **The linear-in-T memory provers** (`magnetar-memory::linear`): the
+  Twist read/write port sum-checks, the bytecode Shout Φ, the Ψ
+  address-claim checks, the selector checks, and the cross-step S1
+  transition argument all enumerate the trace cycle-by-cycle — the
+  one-hot kill over the address rounds (the address factors' MLE at a
+  partially bound point is the per-cycle product `Π (1 + c_β + q_β(j))`,
+  and the unbound-bit sum selects the addressed cell) plus the
+  prefix-XOR cumulative sums for the reconstruction identity
+  (`Σ_{j'<j, same address}` running XOR). O(T) prover work, O(K·L + T)
+  state — the joint `(k, o, j)` materializations are gone. Round
+  messages are **byte-identical** to the dense engine's, cross-validated
+  per shape by tests. Measured: prove 6.3× faster at T = 2^10 (58.2 s →
+  2.9 s), the memory envelope extends from OOM-at-2^11 to 2^13 completing.
+- **The dual-rate wrap** (`magnetar-zkvm::wrap`, roadmap H2):
+  `prove_with_wrap` discharges the public evaluation tail at `DeepWrap`
+  (rate 1/16, 14 queries) with transcript-sampled consistency
+  spot-checks (packed-leaf dual openings) binding the deep commitment to
+  the chunk commitment — the bounded-depth spot-check accumulation
+  shape. Measured tails: 62.8 KiB (FastChunk) → 27.3 KiB (DeepWrap);
+  the wrapped artifact 36.5 KiB vs the Balanced chunk's 65.6 KiB.
+- **ZK masking, recovered and wired** (`magnetar-sumcheck::zk`): per-round
+  mask polynomials subject to the running round constraint, a uniform
+  finish offset, and `SumcheckVerifier::finish_offset`. Perfect HVZK of
+  the round messages at O(degree) randomness per round; wired into the
+  Mosaic batching discharge behind `KeyGen::enable_zk` (the finish had
+  been lost in the v2 merge; the docs now match the tree again).
+- **The dual-rate PCS profiles, recovered** (`PcsProfile::{FastChunk,
+  Balanced, CompactWrap, DeepWrap}`) and the `magnetar profiles`
+  command measuring the tail dial on one statement.
+- **The phase instrumentation** (`MAGNETAR_TIME=1`): the per-phase wall
+  clock across the whole prover (the honest-measurement hook the
+  performance rulebook mandates).
+
+### Changed
+- **The sum-check engine's round kernel is fused**: one traversal per
+  round computing the message coefficients directly (specialized
+  1/2/3-factor products, no per-point half-table views, no allocations),
+  and `absorb_and_fold`/the lockstep drivers no longer recompute the
+  message inside `fold`.
+- **The batching factor builds sparsely** (`SumEqFactor`): the Mosaic
+  claims' lifted points carry Boolean suffixes (the aligned-subcube
+  offsets), so each α·eq table scatters over its `2^{vars_i}` support
+  subcube — `Σ 2^{vars_i}` work instead of `S·2^ℓ` (measured 1.19 s →
+  33 ms on the T = 2^8 discharge).
+- **The verifier evaluates its public factors structurally**: the new
+  `EqProdFactor` (products of eq over disjoint variable blocks) replaces
+  the joint-cube materializations in the Twist verification; the
+  reconstruction's LT columns are O(T) suffix sums (no 2^{2n} tables);
+  the reconstruction's address row is the one-hot product (O(T·a), not
+  O(T·K)). Verify: 1,488 ms → 46 ms at T = 2^10.
+- `MosaicProof.ring` is `Option<RingProof>` with the `wrap` alternative;
+  the byte accounting in `proof-stats` covers both.
+
 ## [0.5.0] — the parallel streaming release
 
 ### Added

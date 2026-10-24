@@ -329,7 +329,7 @@ pub fn prove_ivc_streaming(
         stmt,
         ell: combined.ell,
     };
-    let mosaic = prove_mosaic(pcs, &combined, &commitment, &claims, &mut t);
+    let mosaic = prove_mosaic(pcs, &combined, &commitment, &claims, false, &mut t);
     let wall_root = t2.elapsed();
 
     let stats = StreamingStats {

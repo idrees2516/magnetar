@@ -32,28 +32,50 @@ The reference is the Magnetar paper (eprint 2026-2423). Sections marked
 | **The streaming, parallel tree-IVC prover** (checkpointed trace replay, rayon segment parallelism, tables packed directly into the commitment leaves, byte-identical proofs) | §1.3 (the IVC layer) | `magnetar-ivc::streaming` | byte-equality vs. the sequential prover on 1/2/4 segments; record-level replay equality; tamper classes |
 | **The parallelism rulebook + kernels** (R1–R10: rayon Merkle/encode/sum-check/join/segments, thresholds, batching, caching) | engineering | `docs/PERFORMANCE.md`, the crates' kernels | `par_bind_matches_seq`, `pack_tables_matches_assemble_and_pack`, `join_matches_sparse_prover` |
 | Proof-size instrumentation (committed-bit inventory, per-component bytes) | roadmap §7 | `magnetar-zkvm::stats` | CLI smoke |
+| **The linear-in-T memory provers** (Twist read/write ports, the bytecode Shout Φ, the Ψ checks, the selector checks, the cross-step S1 transition): cycle enumeration with the one-hot kill and the prefix-XOR cumulative sums — O(T) prover work, byte-identical round messages | §4.4 | `magnetar-memory::linear` | byte-identity cross-checks vs the dense engine (multiple shapes); the end-to-end tamper suite |
+| **The fused sum-check kernel** (one traversal per round, zero per-point view allocations, specialized 1/2/3-factor products, no double message computation) | roadmap H1 | `magnetar-sumcheck::engine` | the engine roundtrips + the full protocol suite |
+| **The sparse-support batching factor** (the Mosaic α-combination over lifted claims with Boolean suffixes: Σ 2^{vars_i} work, not S·2^ℓ) | roadmap H1 | `magnetar-sumcheck::public::SumEqFactor` | `sum_eq_matches_sum_of_eq` + end-to-end |
+| **The structured verifier factors** (`EqProdFactor`, O(T) suffix-sum LT columns): the verifier's public-factor evaluation is polylogarithmic — no joint-cube materialization | roadmap H1 | `magnetar-sumcheck::public`, `magnetar-memory` | verify-time measurements (21 ms at 2^8); tamper suite |
+| **ZK masking, recovered and wired** (`magnetar_sumcheck::zk`: per-round mask polynomials, perfect HVZK of the round messages, O(degree) randomness/round; `finish_offset` on the verifier) — wired into the Mosaic batching discharge behind `KeyGen::enable_zk` | roadmap H1 | `magnetar-sumcheck::zk`, `magnetar-zkvm::mosaic` | `end_to_end_zk_masked_batching` (+ offset and round tampers) |
+| **The dual-rate PCS profiles** (`PcsProfile::{FastChunk, Balanced, CompactWrap, DeepWrap}`) and the `magnetar profiles` measurement (tails 62.8 → 27.3 KiB) | roadmap H1/H2 | `magnetar-pcs::eval`, `magnetar-cli` | `end_to_end_wrapped_deep`; the CLI harness |
+| **The dual-rate wrap** (roadmap H2): the chunk side keeps its fast profile; the public evaluation tail is discharged at `DeepWrap` with transcript-sampled consistency spot-checks binding the deep commitment to the chunk commitment (the bounded-depth spot-check accumulation shape; ARC's distance-preserving fold documented as the unbounded-depth follow-on) | roadmap H2 / RECURSION §1 | `magnetar-zkvm::wrap`, `prove_with_wrap` | `end_to_end_wrapped_deep` (roundtrip + 3 tamper classes + the size assertion) |
+| **The phase instrumentation** (`MAGNETAR_TIME=1`): the per-phase wall clock of the full prover | engineering | `magnetar-zkvm::protocol::PhaseTimer` | the BENCHMARKS anatomy table |
 
 ## Explicitly not implemented
 
 These are the honest gaps. Each is tracked with its reason and its plan.
 
-### 1. Zero-knowledge (ZK) — roadmap H1
-The paper's construction is a plain (transparent, post-quantum) SNARK;
-ZK masking of witness-dependent sum-check messages is an H1 roadmap item
-(masking polynomials in the sum-check rounds + blinded Merkle openings).
-Not started. **Plan:** mask the router/twist/shout round messages and the
-MosaicPCS query paths; the Spartan outer is already public-coin.
+### 1. Zero-knowledge (ZK) — roadmap H1 (primitive landed; wiring partial)
+The round-message masking primitive is implemented and tested
+(`magnetar_sumcheck::zk`: per-round mask polynomials subject to the
+running constraint, a uniform finish offset, `finish_offset` on the
+verifier — perfect HVZK of the round messages at O(degree) randomness
+per round). It is wired into the **Mosaic batching discharge** (the
+dominant witness-derived sum-check) behind `KeyGen::enable_zk`,
+end-to-end tested. **Remaining sites:** the Twist/Shout/router round
+messages (now linear provers — the mask composes with them the same way)
+and the commitment-side revelations (blinded packed leaves before the
+commit; the tail reveal padding). The revealed evaluation *claims*
+remain public by design, as in the paper.
 
-### 2. Dual-rate PCS wrap and cross-proof claim aggregation — roadmap H2
-`PcsParams` already carries the rate `k` (the codeword extension), so a
-low-rate *wrap* instance is parameterizable, but the wrap circuit (the
-verifier-as-guest that compresses a proof into a recursively verifiable
-one) does not exist. Cross-*proof* aggregation (batching independent
-proofs' evaluation claims by random linear combination) exists **within**
-one execution (the tree-IVC root batches all segments' claims into one
-PCS evaluation argument) but not across independently-stated proofs.
-**Plan:** the H2 wrap instance reuses `magnetar-ivc`'s shared-commitment
-aggregation over the wrap circuit's trace.
+### 2. The dual-rate wrap — landed (spot-check shape); the verifier-guest circuit remains
+The **dual-rate wrap** is implemented and measured
+(`magnetar-zkvm::wrap`): the chunk side keeps its fast profile, the
+public evaluation tail is re-committed and discharged at `DeepWrap`
+(rate 1/16, 14 queries), and transcript-sampled consistency spot-checks
+open packed-leaf positions in both trees, binding the deep commitment to
+the chunk commitment the transcript already absorbed (the bounded-depth
+spot-check accumulation shape of [BMNW24]; measured 44% tail reduction).
+**Not implemented:** (a) the ARC-style distance-preserving fold — the
+attached ARC paper (eprint 2024/1731) achieves unbounded accumulation
+depth via Reed–Solomon quotients and out-of-domain sampling; our
+affine-substitution code is multilinear-over-Boolean-cubes, so the
+quotient machinery does not transfer directly — the engineering path is
+documented in `docs/RECURSION.md`; (b) the hash-circuit verifier-guest
+(SHA3/BLAKE3 in-circuit) — the alternative wrap that removes the
+spot-check loss entirely; (c) cross-*proof* aggregation of independently
+stated proofs (batching exists **within** one execution via the tree-IVC
+root).
 
 ### 3. Recursion / verifier-as-guest — roadmap H2
 No recursive composition. The verifying key's verifier work is measured

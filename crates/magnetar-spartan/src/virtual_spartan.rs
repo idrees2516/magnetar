@@ -167,8 +167,8 @@ fn shared_round(
     }
     t.absorb_bytes(label, &buf);
     let r = t.challenge_field(label);
-    p1.fold(r);
-    p2.fold(r);
+    p1.fold_msg(&magnetar_sumcheck::RoundMsg(m1.clone()), r);
+    p2.fold_msg(&magnetar_sumcheck::RoundMsg(m2.clone()), r);
     (r, (m1, m2))
 }
 
@@ -188,8 +188,8 @@ fn separate_round(
     t.absorb_bytes(label, &buf);
     let r1 = t.challenge_field(&format!("{label}-bin"));
     let r2 = t.challenge_field(&format!("{label}-fld"));
-    p1.fold(r1);
-    p2.fold(r2);
+    p1.fold_msg(&magnetar_sumcheck::RoundMsg(m1.clone()), r1);
+    p2.fold_msg(&magnetar_sumcheck::RoundMsg(m2.clone()), r2);
     ((r1, r2), (m1, m2))
 }
 
@@ -249,6 +249,42 @@ pub fn prove_virtual_spartan(
     let tau_bin = t.challenge_field_vec("vs-tau-bin", joint_vars);
     let tau_fld = t.challenge_field_vec("vs-tau-fld", joint_vars);
     // Dense tables: block-diagonal applications.
+    struct _Pt(std::time::Instant);
+    impl Drop for _Pt {
+        fn drop(&mut self) {
+            if std::env::var("MAGNETAR_TIME").is_ok() {
+                eprintln!(
+                    "[time] {:<24} {:>9.1} ms",
+                    "vs-apply",
+                    self.0.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+    }
+    struct _PtR {
+        label: &'static str,
+        start: std::time::Instant,
+    }
+    impl _PtR {
+        fn new(label: &'static str) -> Self {
+            _PtR {
+                label,
+                start: std::time::Instant::now(),
+            }
+        }
+    }
+    impl Drop for _PtR {
+        fn drop(&mut self) {
+            if std::env::var("MAGNETAR_TIME").is_ok() {
+                eprintln!(
+                    "[time] {:<24} {:>9.1} ms",
+                    self.label,
+                    self.start.elapsed().as_secs_f64() * 1e3
+                );
+            }
+        }
+    }
+    let _pt_apply = _Pt(std::time::Instant::now());
     let az_bin = rel.a_bin.apply_simd(joint_z, q);
     let bz_bin = rel.b_bin.apply_simd(joint_z, q);
     let cz_bin = rel.c_bin.apply_simd(joint_z, q);
@@ -261,9 +297,11 @@ pub fn prove_virtual_spartan(
     let spec_fld = outer_spec(
         &rel.a_fld, &rel.b_fld, &rel.c_fld, az_fld, bz_fld, cz_fld, &tau_fld, joint_vars,
     );
+    drop(_pt_apply);
     // Lockstep: instance rounds share challenges (HighBitsFirst(s) binds the
     // high s instance variables first), row rounds separate.
     let order = BindOrder::HighBitsFirst { high: s };
+    let _pt_r = _PtR::new("vs-outer-rounds");
     let mut p_bin = SumcheckProver::new(&spec_bin, order);
     let mut p_fld = SumcheckProver::new(&spec_fld, order);
     let mut outer_shared = Vec::with_capacity(s);
@@ -286,6 +324,7 @@ pub fn prove_virtual_spartan(
         outer_bin.push(msgs.0);
         outer_fld.push(msgs.1);
     }
+    drop(_pt_r);
     let (claims_bin, _) = p_bin.finish();
     let (claims_fld, _) = p_fld.finish();
     // The engine's terminal check is the paper's step-3 identity; the

@@ -12,7 +12,7 @@
 //! dense evaluations are the prover's claims — these become the output
 //! evaluation claims of the reduction (paper Definition 5).
 
-use crate::{interpolate, BindOrder, RoundMsg, SumcheckSpec};
+use crate::{BindOrder, RoundMsg, SumcheckSpec};
 use magnetar_field::{mul, par_bind_var, Gf128, ZERO};
 use magnetar_hash::Transcript;
 use rayon::prelude::*;
@@ -58,8 +58,15 @@ impl SumcheckProver {
     }
 
     /// Current round's message: coefficients of the round polynomial,
-    /// computed by evaluating the summand at `X = 0, 1, …, d` on the
-    /// remaining cube and interpolating.
+    /// computed by the **fused single-pass** kernel (the Horizon-1
+    /// sum-check-arithmetic item): every factor's pair structure
+    /// `(a, a+t1)` at the bind bit multiplies directly into per-term
+    /// polynomial accumulators — one traversal per round, no per-point
+    /// view materialization, no allocations (the previous kernel built
+    /// `degree+1` half-table views per factor per round).
+    ///
+    /// The result is bit-identical to the interpolated-by-values message
+    /// (both are the coefficient vector of the same polynomial).
     pub fn message(&self) -> RoundMsg {
         let degree = self
             .spec_terms
@@ -67,127 +74,130 @@ impl SumcheckProver {
             .map(|t| t.dense.len() + t.public.len())
             .max()
             .unwrap_or(0);
-        let npts = degree + 1;
-        let mut values = Vec::with_capacity(npts);
-        for i in 0..npts {
-            let x = Gf128(i as u128);
-            values.push(self.summand_sum_at(x));
-        }
-        RoundMsg(interpolate(&values))
-    }
-
-    /// `Σ_{rest} g(X, rest)` over the remaining Boolean cube, with the round
-    /// variable fixed to the field value `X`.
-    ///
-    /// Parallel strategy (docs/PERFORMANCE.md R1/R3/R8): every factor's
-    /// view is a disjoint chunk-wise map; each term's elementwise product
-    /// is reduced per chunk and the chunk sums are XOR-combined — every
-    /// reduction is over `+`/`×` (commutative, associative), so the result
-    /// is bit-identical to the sequential computation regardless of thread
-    /// scheduling.
-    fn summand_sum_at(&self, x: Gf128) -> Gf128 {
         let bit = self.order.current_bit(self.num_vars, self.round);
-        // Value of the MLE at (X, rest) = A + X·(A + T1) per entry.
-        let view = |table: &Vec<Gf128>| -> Vec<Gf128> {
-            let block = 1usize << bit;
-            let out_len = table.len() / 2;
-            if table.len() >= PAR_MSG_THRESHOLD {
-                // One task per aligned span of pair-groups (R2/R8): the
-                // chunk length is a multiple of `block`, so no group is
-                // ever split across tasks.
-                let threads = rayon::current_num_threads().max(1);
-                let target = (out_len / (threads * 4)).clamp(block, out_len);
-                let task = target.next_multiple_of(block).clamp(block, out_len);
-                let mut buf = vec![ZERO; out_len];
-                buf.par_chunks_mut(task)
-                    .enumerate()
-                    .for_each(|(ci, ochunk)| {
-                        let groups = ochunk.len() / block;
-                        let gi0 = (ci * task) / block;
-                        for g in 0..groups {
-                            let base = (gi0 + g) * 2 * block;
-                            for j in 0..block {
-                                let a = table[base + j];
-                                let t1 = table[(base + j) | block];
-                                ochunk[g * block + j] = a + mul(x, a + t1);
+        let block = 1usize << bit;
+        let n = 1usize << (self.num_vars - self.round);
+        let pairs_per_group = block; // pairs within one 2·block group
+        let n_groups = n / (2 * block);
+        debug_assert!(n_groups >= 1);
+        let coeffs = {
+            // Per-term accumulators over the coefficient vector (R1: the
+            // per-chunk sums combine order-free by `+`).
+            let terms = &self.spec_terms;
+            let coeffs_of = &self.coeffs;
+            let chunk_groups = if n_groups >= 2 && n >= PAR_MSG_THRESHOLD {
+                (n_groups / (rayon::current_num_threads().max(1) * 4)).max(1)
+            } else {
+                n_groups.max(1)
+            };
+            (0..n_groups)
+                .into_par_iter()
+                .chunks(chunk_groups)
+                .map(|groups| {
+                    let mut local: Vec<Vec<Gf128>> =
+                        terms.iter().map(|_| vec![ZERO; degree + 1]).collect();
+                    for g in groups {
+                        let gbase = g * 2 * block;
+                        for j in 0..block {
+                            let base = gbase + j;
+                            for (ti, t) in terms.iter().enumerate() {
+                                // The factors' (a, d) pairs at this position,
+                                // then the coefficient product — specialized
+                                // for the small factor counts that cover the
+                                // stack (1–3 factors: the Spartan outers, the
+                                // PCS eval, the memory sum-checks), with the
+                                // generic array kernel as the fallback.
+                                let nf = t.dense.len() + t.public.len();
+                                let c0 = coeffs_of[ti];
+                                let acc = &mut local[ti];
+                                if nf == 1 {
+                                    let (a, d) = self.pair_of(t, base, block);
+                                    acc[0] += mul(c0, a);
+                                    acc[1] += mul(c0, d);
+                                } else if nf == 2 {
+                                    let (a1, d1) = self.pair_of(t, base, block);
+                                    let (a2, d2) = self.pair_of_idx(t, 1, base, block);
+                                    let ca = mul(c0, a1);
+                                    acc[0] += mul(ca, a2);
+                                    acc[1] += mul(ca, d2) + mul(mul(c0, d1), a2);
+                                    acc[2] += mul(mul(c0, d1), d2);
+                                } else if nf == 3 {
+                                    let (a1, d1) = self.pair_of(t, base, block);
+                                    let (a2, d2) = self.pair_of_idx(t, 1, base, block);
+                                    let (a3, d3) = self.pair_of_idx(t, 2, base, block);
+                                    // (a1 + X·d1)(a2 + X·d2)(a3 + X·d3)
+                                    let a1a2 = mul(a1, a2);
+                                    let a1d2 = mul(a1, d2);
+                                    let d1a2 = mul(d1, a2);
+                                    let d1d2 = mul(d1, d2);
+                                    acc[0] += mul(c0, mul(a1a2, a3));
+                                    acc[1] +=
+                                        mul(c0, mul(a1a2, d3) + mul(a1d2, a3) + mul(d1a2, a3));
+                                    acc[2] +=
+                                        mul(c0, mul(a1d2, d3) + mul(d1a2, d3) + mul(d1d2, a3));
+                                    acc[3] += mul(c0, mul(d1d2, d3));
+                                } else {
+                                    let mut poly = [ZERO; 17];
+                                    poly[0] = coeffs_of[ti];
+                                    let mut deg = 0usize;
+                                    for k in 0..nf {
+                                        let (a, dd) = self.pair_of_idx(t, k, base, block);
+                                        let mut next = [ZERO; 17];
+                                        for e in 0..=deg {
+                                            next[e] += mul(poly[e], a);
+                                            next[e + 1] += mul(poly[e], dd);
+                                        }
+                                        poly = next;
+                                        deg += 1;
+                                    }
+                                    for e in 0..=deg.min(degree) {
+                                        acc[e] += poly[e];
+                                    }
+                                }
                             }
                         }
-                    });
-                buf
-            } else {
-                let mut out = Vec::with_capacity(out_len);
-                let mut i = 0;
-                while i < table.len() {
-                    for j in 0..block {
-                        let a = table[i + j];
-                        let t1 = table[(i + j) | block];
-                        out.push(a + mul(x, a + t1));
                     }
-                    i += 2 * block;
-                }
-                out
-            }
-        };
-        let dense_views: Vec<Vec<Gf128>> = self.dense.iter().map(view).collect();
-        let public_views: Vec<Vec<Gf128>> = self.public_tables.iter().map(view).collect();
-        // Sum terms elementwise on the product of the views — chunked
-        // with per-chunk XOR accumulators (R8: no shared mutable state).
-        // The iteration count is the shortest view (the round variable is
-        // already folded out of every view; zip-truncation semantics are
-        // preserved for degenerate factors).
-        let mut total = ZERO;
-        for (ti, t) in self.spec_terms.iter().enumerate() {
-            let coeff = self.coeffs[ti];
-            let factor_views: Vec<&Vec<Gf128>> = t
-                .dense
-                .iter()
-                .map(|&d| &dense_views[d])
-                .chain(t.public.iter().map(|&p| &public_views[p]))
-                .collect();
-            if factor_views.is_empty() {
-                if self.remaining_vars() == 1 {
-                    total += coeff;
-                }
-                continue;
-            }
-            let n_rem = factor_views.iter().map(|f| f.len()).min().unwrap_or(0);
-            if n_rem == 0 {
-                continue;
-            }
-            if n_rem < PAR_MSG_THRESHOLD {
-                // Sequential kernel (R2).
-                let mut s = ZERO;
-                for i in 0..n_rem {
-                    let mut v = coeff;
-                    for f in &factor_views {
-                        v = mul(v, f[i]);
-                    }
-                    s += v;
-                }
-                total += s;
-                continue;
-            }
-            // Per chunk: fold the elementwise product of all factor views
-            // into one field element, then XOR-combine (R1: order-free).
-            let chunk = (1usize << 15).min(n_rem);
-            let terms_sum: Gf128 = (0..n_rem)
-                .into_par_iter()
-                .chunks(chunk)
-                .map(|idxs| {
-                    let mut s = ZERO;
-                    for i in idxs {
-                        let mut v = coeff;
-                        for f in &factor_views {
-                            v = mul(v, f[i]);
-                        }
-                        s += v;
-                    }
-                    s
+                    local
                 })
-                .sum::<Gf128>();
-            total += terms_sum;
+                .reduce(
+                    || terms.iter().map(|_| vec![ZERO; degree + 1]).collect(),
+                    |mut a, b| {
+                        for (ta, tb) in a.iter_mut().zip(b.iter()) {
+                            for (x, y) in ta.iter_mut().zip(tb.iter()) {
+                                *x += *y;
+                            }
+                        }
+                        a
+                    },
+                )
+        };
+        // Sum the per-term coefficient vectors into one message.
+        let mut msg = vec![ZERO; degree + 1];
+        for (e, slot) in msg.iter_mut().enumerate() {
+            for c in &coeffs {
+                *slot += c[e];
+            }
         }
-        total
+        let _ = pairs_per_group;
+        RoundMsg(msg)
+    }
+
+    /// The `(a, d)` pair of term `t`'s factor `k` at position `base`
+    /// (the MLE's value at bit 0 and its X coefficient).
+    #[inline]
+    fn pair_of_idx(&self, t: &crate::Term, k: usize, base: usize, block: usize) -> (Gf128, Gf128) {
+        if k < t.dense.len() {
+            let f = &self.dense[t.dense[k]];
+            (f[base], f[base] + f[base + block])
+        } else {
+            let f = &self.public_tables[t.public[k - t.dense.len()]];
+            (f[base], f[base] + f[base + block])
+        }
+    }
+
+    #[inline]
+    fn pair_of(&self, t: &crate::Term, base: usize, block: usize) -> (Gf128, Gf128) {
+        self.pair_of_idx(t, 0, base, block)
     }
 
     /// Absorb the message into the transcript, check nothing (prover side),
@@ -200,7 +210,9 @@ impl SumcheckProver {
         }
         t.absorb_bytes(label, &buf);
         let r = t.challenge_field(label);
-        self.fold(r);
+        // Reuse the already-computed message (fold_msg) — the old path
+        // recomputed the message inside fold().
+        self.fold_msg(&msg, r);
         r
     }
 
@@ -208,8 +220,15 @@ impl SumcheckProver {
     /// claim to `m(r)`. Used by the lockstep driver with *external*
     /// challenges (Virtual Spartan, paper §5.3 step 1).
     pub fn fold(&mut self, r: Gf128) {
-        self.challenges.push(r);
         let msg = self.message();
+        self.fold_msg(&msg, r);
+    }
+
+    /// Fold at `r` reusing an already-computed round message (the ZK driver
+    /// masks the message it transmits but folds the *unmasked* polynomial —
+    /// the mask never enters the prover's tables, only the transcript).
+    pub fn fold_msg(&mut self, msg: &RoundMsg, r: Gf128) {
+        self.challenges.push(r);
         // running := m(r)
         let mut mr = ZERO;
         let mut xp = Gf128(1);
@@ -380,6 +399,25 @@ impl<'a> SumcheckVerifier<'a> {
     /// dense-evaluation claims, returning the point (original coordinates)
     /// and the accepted claims.
     pub fn finish(&self, dense_claims: &[Gf128]) -> Result<(Vec<Gf128>, Vec<Gf128>), &'static str> {
+        self.finish_inner(dense_claims, ZERO)
+    }
+
+    /// The ZK terminal check: `Σ terms·claims + offset = running`, where
+    /// `offset` is the prover-revealed residual of the per-round mask
+    /// polynomials (uniform on its own, hiding the honest terminal).
+    pub fn finish_offset(
+        &self,
+        dense_claims: &[Gf128],
+        offset: Gf128,
+    ) -> Result<(Vec<Gf128>, Vec<Gf128>), &'static str> {
+        self.finish_inner(dense_claims, offset)
+    }
+
+    fn finish_inner(
+        &self,
+        dense_claims: &[Gf128],
+        offset: Gf128,
+    ) -> Result<(Vec<Gf128>, Vec<Gf128>), &'static str> {
         if self.challenges.len() != self.num_vars {
             return Err("rounds incomplete");
         }
@@ -411,6 +449,7 @@ impl<'a> SumcheckVerifier<'a> {
             }
             total += prod;
         }
+        total += offset;
         if total != self.running {
             return Err("terminal identity check failed");
         }

@@ -55,6 +55,7 @@ pub mod claims;
 pub mod cross_step;
 pub mod discharge;
 pub mod final_state;
+pub mod linear;
 pub mod shout;
 pub mod twist;
 

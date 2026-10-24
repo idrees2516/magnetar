@@ -139,7 +139,34 @@ them bit-for-bit (`par_bind_matches_seq`).
 Benchmarks measure wall-clock prove/verify on fixed programs
 (`benches/`, `docs/BENCHMARKS.md`), report cycles/s against the paper's
 numbers, and include memory. Optimizations land with numbers, never with
-"should be faster".
+"should be faster". The phase instrumentation (`MAGNETAR_TIME=1`) is the
+standard anatomy tool: every optimization PR includes the before/after
+per-phase table.
+
+## R11 — Linear-in-T provers over joint cubes (the memory-checking rule)
+
+Any sum-check whose factors live over a joint `(address, value-bit,
+cycle)` cube is proved by **cycle enumeration**, never by materializing
+the joint cube:
+
+- **The one-hot kill**: the committed address components are one-hot per
+  cycle, so the address MLE at a partially bound point is the per-cycle
+  product `Π_β (1 + c_β + q_β(j))` and the sum over the unbound address
+  bits *selects the addressed cell* — `O(1)` per cycle per round (two
+  cell lookups), never `O(2^a)`.
+- **The prefix-XOR cumulative sum**: the reconstruction identity
+  `Val = M0 + Σ_{j'<j} LT(j',j)·wfa·Inc` couples cycles only through
+  the same-address running XOR — one `O(T)` scan with a
+  per-address-suffix accumulator, never the `O(T²)` pair enumeration and
+  never the `K·L·T` history table.
+- **Suffix sums instead of less-than tables**: `Σ_j LT(j',j)·v[j]` is a
+  suffix scan; `Σ_k eq(r,k)·wfa(k,j')` is the one-hot product.
+
+Every such prover emits **byte-identical** round messages to the dense
+engine (the cross-validation tests are the merge gate — see
+`twist::tests::linear_port_prover_matches_dense` and the router's
+`join_matches_sparse_prover`). The dense reference paths stay in-tree
+under `#[cfg(test)]` for exactly this purpose.
 
 ---
 

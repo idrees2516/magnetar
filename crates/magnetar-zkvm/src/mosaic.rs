@@ -281,12 +281,21 @@ pub fn commit_mosaic(
 /// The Mosaic discharge proof: the batching sum-check + the ring switch.
 #[derive(Clone, Debug)]
 pub struct MosaicProof {
-    /// Batching sum-check rounds (degree 2).
+    /// Batching sum-check rounds (degree 2) — masked when ZK is enabled.
     pub batch_rounds: Vec<Vec<Gf128>>,
     /// The terminal claim `Ĝ(r*) = v''`.
     pub terminal: Gf128,
-    /// The ring-switch discharge.
-    pub ring: RingProof,
+    /// The ZK finish offset (ZERO for plain proofs): the residual of the
+    /// per-round mask polynomials, revealed so the verifier's terminal
+    /// identity closes. Uniform on its own — it hides the honest
+    /// terminal's correlation with the witness.
+    pub zk_offset: Gf128,
+    /// The ring-switch discharge at the chunk rate (plain proofs).
+    pub ring: Option<RingProof>,
+    /// The dual-rate wrap (roadmap H2): when present, the deep-rate
+    /// discharge REPLACES the chunk-rate ring switch — the public
+    /// artifact's evaluation tail carries the deep rate's 14 queries.
+    pub wrap: Option<crate::wrap::WrapProof>,
 }
 
 /// Prove the Mosaic discharge for a set of component claims.
@@ -295,6 +304,23 @@ pub fn prove_mosaic(
     layout: &MosaicLayout,
     cm: &MosaicCommitment,
     claims: &[MosaicClaim],
+    zk: bool,
+    t: &mut Transcript,
+) -> MosaicProof {
+    prove_mosaic_opt(params, layout, cm, claims, zk, None, t)
+}
+
+/// Prove the Mosaic discharge, optionally **wrapped** at a deep rate
+/// (roadmap H2's dual-rate wrap): the chunk side keeps its fast profile;
+/// the public evaluation tail is discharged at the low rate.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_mosaic_opt(
+    params: &PcsParams,
+    layout: &MosaicLayout,
+    cm: &MosaicCommitment,
+    claims: &[MosaicClaim],
+    zk: bool,
+    deep: Option<&PcsParams>,
     t: &mut Transcript,
 ) -> MosaicProof {
     let ell = cm.ell;
@@ -330,17 +356,53 @@ pub fn prove_mosaic(
         claim: lhs,
     };
     let order = BindOrder::HighBitsFirst { high: 7 };
+    let _pt_g = crate::protocol::PhaseTimer::new("7a-mosaic-gtable");
     let mut prover = SumcheckProver::new(&spec, order);
+    drop(_pt_g);
+    let _pt_batch = crate::protocol::PhaseTimer::new("7b-mosaic-batch");
     let mut batch_rounds = Vec::with_capacity(ell);
+    // The ZK masking of the batching sum-check (roadmap H1): per-round
+    // mask polynomials hide the (witness-derived) round messages; the
+    // finish offset below closes the verifier's terminal identity. The
+    // masks never touch the prover's tables, so the terminal claim is
+    // the honest evaluation.
+    let mut masker = magnetar_sumcheck::zk::ZkMasker::new();
+    let mut zk_offset = magnetar_field::ZERO;
     for _ in 0..ell {
-        let msg = prover.message();
-        batch_rounds.push(msg.0.clone());
-        prover.absorb_and_fold(t, "mosaic-batch");
+        if zk {
+            let msg = prover.message();
+            let mut masked = magnetar_sumcheck::RoundMsg(msg.0.clone());
+            masker.mask(&mut masked);
+            batch_rounds.push(masked.0.clone());
+            let mut buf = Vec::with_capacity(masked.0.len() * 16);
+            for c in &masked.0 {
+                buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+            }
+            t.absorb_bytes("mosaic-batch", &buf);
+            let r = t.challenge_field("mosaic-batch");
+            masker.commit(r);
+            prover.fold_msg(&msg, r);
+        } else {
+            let msg = prover.message();
+            batch_rounds.push(msg.0.clone());
+            let mut buf = Vec::with_capacity(msg.0.len() * 16);
+            for c in &msg.0 {
+                buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+            }
+            t.absorb_bytes("mosaic-batch", &buf);
+            let r = t.challenge_field("mosaic-batch");
+            prover.fold_msg(&msg, r);
+        }
+    }
+    drop(_pt_batch);
+    if zk {
+        zk_offset = masker.offset();
     }
     let challenges = prover.challenges();
     let (dense_claims, _) = prover.finish();
     let terminal = dense_claims[0];
     t.absorb_field("mosaic-terminal", &[terminal]);
+    t.absorb_field("mosaic-zk-offset", &[zk_offset]);
     let r_star = order.point(ell, &challenges);
     // Split: r_block (low ℓ−7), r_bit (top 7, in variable order 7..ℓ).
     let r_block: Vec<Gf128> = r_star[..ell - 7].to_vec();
@@ -353,20 +415,42 @@ pub fn prove_mosaic(
     };
     // Ring switch: the claim Ĝ(r*) = terminal with the packing over the
     // top 7 bits.
-    let ring = prove_ring_switch(
-        params,
-        &cm.codeword,
-        &cm.tree,
-        &cm.packed,
-        &r_block,
-        &r_bit_arr,
-        terminal,
-        t,
-    );
+    let _pt_ring = crate::protocol::PhaseTimer::new("7c-ring-switch");
+    let (ring, wrap) = match deep {
+        Some(deep_params) => {
+            let w = crate::wrap::prove_wrap(
+                deep_params,
+                &cm.tree,
+                &cm.stmt.domain,
+                &cm.packed,
+                &r_block,
+                &r_bit_arr,
+                terminal,
+                t,
+            );
+            (None, Some(w))
+        }
+        None => (
+            Some(prove_ring_switch(
+                params,
+                &cm.codeword,
+                &cm.tree,
+                &cm.packed,
+                &r_block,
+                &r_bit_arr,
+                terminal,
+                t,
+            )),
+            None,
+        ),
+    };
+    drop(_pt_ring);
     MosaicProof {
         batch_rounds,
         terminal,
+        zk_offset,
         ring,
+        wrap,
     }
 }
 
@@ -407,9 +491,10 @@ pub fn verify_mosaic(
             "mosaic-batch",
         )?);
     }
-    v.finish(&[proof.terminal])
+    v.finish_offset(&[proof.terminal], proof.zk_offset)
         .map_err(|_| "mosaic: batching terminal failed")?;
     t.absorb_field("mosaic-terminal", &[proof.terminal]);
+    t.absorb_field("mosaic-zk-offset", &[proof.zk_offset]);
     let r_star = order.point(ell, &challenges);
     let r_block: Vec<Gf128> = r_star[..ell - 7].to_vec();
     let r_bit_arr: [Gf128; 7] = {
@@ -419,15 +504,21 @@ pub fn verify_mosaic(
         }
         a
     };
-    verify_ring_switch(
-        cm_stmt,
-        params,
-        &r_block,
-        &r_bit_arr,
-        proof.terminal,
-        &proof.ring,
-        t,
-    )
+    match (&proof.ring, &proof.wrap) {
+        (Some(ring), None) => verify_ring_switch(
+            cm_stmt,
+            params,
+            &r_block,
+            &r_bit_arr,
+            proof.terminal,
+            ring,
+            t,
+        ),
+        (None, Some(wrap)) => {
+            crate::wrap::verify_wrap(cm_stmt, &r_block, &r_bit_arr, proof.terminal, wrap, t)
+        }
+        _ => Err("mosaic: exactly one of ring/wrap must be present"),
+    }
 }
 
 #[cfg(test)]

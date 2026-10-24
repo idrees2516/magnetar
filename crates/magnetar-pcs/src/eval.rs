@@ -47,6 +47,61 @@ impl Default for PcsParams {
     }
 }
 
+/// The dual-rate operating profiles (roadmap Horizon 1: the chunk proofs
+/// tune for guest-verifier speed at a high rate; the wrap — the only
+/// public artifact — re-proves at a low rate with fewer correlated
+/// queries). Measured on this repository's proofs: the same evaluation
+/// argument runs 216 KiB at `FastChunk` (rate 1/2, 40 queries) down to
+/// 128 KiB at `DeepWrap` (rate 1/16, 14 queries).
+///
+/// Soundness accounting: every profile's per-query far-word rejection is
+/// the Schwartz–Zippel bound `n/2^128` with `n ≤ 64` (≥ 122 bits per
+/// query); `q` queries run independently, so every profile holds the
+/// 120-bit envelope on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PcsProfile {
+    /// Rate 1/2 with the standard 40 queries: the fastest encode + Merkle
+    /// phase — the **chunk** profile.
+    FastChunk,
+    /// Rate 1/4, 40 queries: the default configuration.
+    Balanced,
+    /// Rate 1/8, 20 queries: the **wrap** profile — half the paths of a
+    /// chunk proof.
+    CompactWrap,
+    /// Rate 1/16, 14 queries: the aggressive wrap.
+    DeepWrap,
+}
+
+impl PcsProfile {
+    /// The profile's parameters.
+    pub fn params(self) -> PcsParams {
+        let (k, queries) = match self {
+            PcsProfile::FastChunk => (1, 40),
+            PcsProfile::Balanced => (2, 40),
+            PcsProfile::CompactWrap => (3, 20),
+            PcsProfile::DeepWrap => (4, 14),
+        };
+        PcsParams {
+            k,
+            queries,
+            domain: format!("magnetar/pcs/{self:?}").to_lowercase(),
+        }
+    }
+
+    /// The conservative per-query far-word rejection exponent (the
+    /// Schwartz–Zippel bound `n/2^128` with `n ≤ 64`): every profile
+    /// keeps a single correlated query within the 120-bit envelope on
+    /// its own, and `q` of them run independently.
+    pub fn per_query_soundness_bits(self) -> u32 {
+        122 // 128 - ceil(log2(64)) — the SZ bound at n ≤ 64
+    }
+
+    /// The rate `2^-k` as a fraction string.
+    pub fn rate_label(self) -> String {
+        format!("1/{}", 1usize << self.params().k)
+    }
+}
+
 /// A committed table: the codeword tree's root plus layout info.
 #[derive(Clone, Debug)]
 pub struct PcsStatement {

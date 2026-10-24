@@ -14,12 +14,13 @@
 //! they do not depend on (padding leaves the MLE unchanged).
 
 use crate::claims::{PcsPoint, TwistPcsClaims};
+use crate::linear::{addr_bits, prove_port_linear, suffix_sums, TwistShared};
 use crate::{AddressComponent, OneHotProof};
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
 use magnetar_sumcheck::{
     engine::{SumcheckProver, SumcheckVerifier},
-    public::TableFactor,
+    public::{EqProdFactor, TableFactor},
     BindOrder, SumcheckSpec, Term,
 };
 
@@ -105,6 +106,9 @@ pub struct TwistProof {
 }
 
 /// `LT_strict(j', j) = [j' < j]`, `LT_le(j', j) = [j' ≤ j]`.
+/// (Kept for the dense cross-check tests; the protocol paths use the
+/// O(T) suffix sums.)
+#[cfg(test)]
 fn lt_table(n: usize, inclusive: bool) -> Vec<Gf128> {
     let s = 1usize << n;
     let mut t = vec![ZERO; s * s];
@@ -117,6 +121,9 @@ fn lt_table(n: usize, inclusive: bool) -> Vec<Gf128> {
 }
 
 /// Materialize `Val` (strict) or `Val+Inc` (inclusive) incrementally.
+/// (Kept for the dense cross-check tests; the protocol prover is the
+/// linear-in-T `prove_port_linear`.)
+#[cfg(test)]
 fn materialize_val(
     a: usize,
     ell: usize,
@@ -163,6 +170,7 @@ fn materialize_val(
 }
 
 /// The joint-space padded table of the full address (product of components).
+#[cfg(test)]
 fn full_addr_joint(comps: &[AddressComponent], a: usize, ell: usize, n: usize) -> Vec<Gf128> {
     let d = comps.len();
     let ad = a / d;
@@ -181,7 +189,10 @@ fn full_addr_joint(comps: &[AddressComponent], a: usize, ell: usize, n: usize) -
     out
 }
 
-/// Run one value sum-check (read or write shape) capturing the point.
+/// Run one value sum-check (read or write shape) capturing the point —
+/// the **dense** reference prover (kept for the byte-identity
+/// cross-check against the linear prover).
+#[cfg(test)]
 fn run_port_sumcheck(
     comps: &[AddressComponent],
     val_table: &[Gf128],
@@ -243,41 +254,31 @@ fn run_reconstruction(
     let r_v: Vec<Gf128> = r_joint[a..a + ell].to_vec();
     let r_c: Vec<Gf128> = r_joint[a + ell..].to_vec();
     let m0_at = magnetar_field::eval_mle(m0, &[r_k.clone(), r_v.clone()].concat());
-    // LT column at r_c.
-    let lt = lt_table(n, inclusive);
+    // LT column at r_c: the suffix sums of eq(r_c, ·) — O(T), not the
+    // O(T²) less-than table.
     let eq_j = magnetar_field::EqBits::build(&r_c).values;
-    let mut lt_col = vec![ZERO; 1usize << n];
-    for jp in 0..(1usize << n) {
-        let mut acc = ZERO;
-        for j in 0..(1usize << n) {
-            acc += mul(eq_j[j], lt[jp + j * (1usize << n)]);
-        }
-        lt_col[jp] = acc;
-    }
-    // wfa row at r_k; inc row at r_v.
-    let eq_k = magnetar_field::EqBits::build(&r_k).values;
-    let mut wfa_row = vec![ZERO; 1usize << n];
-    for jp in 0..(1usize << n) {
-        let mut acc = ZERO;
-        for k in 0..(1usize << a) {
-            let mut prod = eq_k[k];
-            for (i, comp) in wfa_comps.iter().enumerate() {
-                let slice = (k >> (i * ad)) & ((1usize << ad) - 1);
-                prod = mul(prod, comp.table[comp.index_with(slice, jp)]);
+    let lt_col = suffix_sums(&eq_j, inclusive);
+    // wfa row at r_k: the one-hot address product — O(T·a), not O(T·K).
+    let w_addr = addr_bits(wfa_comps);
+    let wfa_row: Vec<Gf128> = (0..(1usize << n))
+        .map(|jp| {
+            let mut acc = ONE;
+            for (bit_idx, &rk) in r_k.iter().enumerate() {
+                acc = mul(acc, ONE + rk + Gf128(((w_addr[jp] >> bit_idx) & 1) as u128));
             }
-            acc += prod;
-        }
-        wfa_row[jp] = acc;
+            acc
+        })
+        .collect();
+    // inc row at r_v: fold the ell low (bit) variables.
+    let mut inc_row = inc.to_vec();
+    for b in 0..ell {
+        inc_row = {
+            let mut v = inc_row;
+            magnetar_field::par_bind_var(&mut v, 0, r_v[b]);
+            v
+        };
     }
-    let eq_v = magnetar_field::EqBits::build(&r_v).values;
-    let mut inc_row = vec![ZERO; 1usize << n];
-    for jp in 0..(1usize << n) {
-        let mut acc = ZERO;
-        for o in 0..(1usize << ell) {
-            acc += mul(eq_v[o], inc[o | (jp << ell)]);
-        }
-        inc_row[jp] = acc;
-    }
+    debug_assert_eq!(inc_row.len(), 1usize << n);
     let spec = SumcheckSpec {
         num_vars: n,
         dense: vec![wfa_row, inc_row],
@@ -328,34 +329,24 @@ pub fn prove_twist(
     t: &mut Transcript,
 ) -> (TwistProof, TwistPcsClaims) {
     let (a, ell, n, p) = (inst.a, inst.ell, inst.n, inst.p);
-    let joint_vars = a + ell + n;
     let d = wit.d();
-    // The public factor over the joint space: eq(r_val, o)·eq(r_cycle, j).
-    let eq_val = magnetar_field::EqBits::build(&inst.r_val).values;
-    let eq_cyc = magnetar_field::EqBits::build(&inst.r_cycle).values;
-    let mut pub_table = vec![ZERO; 1usize << joint_vars];
-    for idx in 0..pub_table.len() {
-        let o = (idx >> a) & ((1usize << ell) - 1);
-        let j = idx >> (a + ell);
-        pub_table[idx] = mul(eq_val[o], eq_cyc[j]);
-    }
-    // Val (strict) for reads; Val+Inc (inclusive) for the write.
-    let val_strict = materialize_val(a, ell, n, &inst.m0, &wit.ports[p], &wit.inc, false);
-    let val_inc = materialize_val(a, ell, n, &inst.m0, &wit.ports[p], &wit.inc, true);
-    // Read sum-checks.
+    // The shared linear-prover precomputation (the value-pre-folded
+    // increments and initial memory, the write-address trace).
+    let w_addr = addr_bits(&wit.ports[p]);
+    let shared = TwistShared::new(inst, w_addr, &wit.inc);
+    // Read sum-checks (the linear-in-T prover: cycle enumeration with
+    // the one-hot kill, never the joint materialization).
     let mut read_runs = Vec::with_capacity(p);
     let mut read_recons = Vec::with_capacity(p);
     let mut read_component_claims = Vec::with_capacity(p);
     for s in 0..p {
-        let run = run_port_sumcheck(
+        let run = prove_port_linear(
+            inst,
+            &shared,
+            &wit.inc,
             &wit.ports[s],
-            &val_strict,
             inst.rv_claims[s],
-            joint_vars,
-            &pub_table,
-            a,
-            ell,
-            n,
+            false,
             &format!("twist-read-{s}"),
             t,
         );
@@ -396,15 +387,13 @@ pub fn prove_twist(
         read_runs.push(run);
     }
     // Write sum-check (Val + Inc).
-    let write_run = run_port_sumcheck(
+    let write_run = prove_port_linear(
+        inst,
+        &shared,
+        &wit.inc,
         &wit.ports[p],
-        &val_inc,
         inst.wv_claim,
-        joint_vars,
-        &pub_table,
-        a,
-        ell,
-        n,
+        true,
         "twist-write",
         t,
     );
@@ -615,24 +604,22 @@ pub fn verify_twist(
     let (a, ell, n, p) = (inst.a, inst.ell, inst.n, inst.p);
     let joint_vars = a + ell + n;
     let ad = a / d;
-    let eq_val = magnetar_field::EqBits::build(&inst.r_val).values;
-    let eq_cyc = magnetar_field::EqBits::build(&inst.r_cycle).values;
-    let pub_table: Vec<Gf128> = {
-        let mut pt = vec![ZERO; 1usize << joint_vars];
-        for idx in 0..pt.len() {
-            let o = (idx >> a) & ((1usize << ell) - 1);
-            let j = idx >> (a + ell);
-            pt[idx] = mul(eq_val[o], eq_cyc[j]);
-        }
-        pt
-    };
+    // The public factor `eq(r_val, o)·eq(r_cycle, j)` in structured form:
+    // the verifier evaluates it at the terminal point in O(ell + n) —
+    // no joint-cube materialization.
+    let pubf: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
+        vec![Box::new(EqProdFactor::new(
+            vec![
+                (inst.r_val.clone(), (a..a + ell).collect()),
+                (inst.r_cycle.clone(), (a + ell..a + ell + n).collect()),
+            ],
+            joint_vars,
+        ))];
     let terms = vec![Term {
         coeff: ONE,
         dense: vec![0, 1],
         public: vec![0],
     }];
-    let pubf: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
-        vec![Box::new(TableFactor::new(pub_table.clone()))];
     // Read runs.
     for (s, run) in proof.read_runs.iter().enumerate() {
         // The dense claims: the address claim = the product of the
@@ -730,15 +717,12 @@ pub fn verify_twist(
         let mut pcs_per = Vec::new();
         for (i, rounds) in rounds_per.iter().enumerate() {
             let rho = t.challenge_field_vec(&format!("twist-st1-{port}-{i}-rho"), n);
-            let eq_rho = magnetar_field::EqBits::build(&rho).values;
             let kj_vars = ad + n;
-            let mut pubf2 = vec![ZERO; 1usize << kj_vars];
-            for idx in 0..pubf2.len() {
-                let j = idx >> ad;
-                pubf2[idx] = eq_rho[j];
-            }
             let pubf2: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
-                vec![Box::new(TableFactor::new(pubf2))];
+                vec![Box::new(EqProdFactor::new(
+                    vec![(rho.clone(), (ad..ad + n).collect())],
+                    kj_vars,
+                ))];
             let terms2 = vec![Term {
                 coeff: ONE,
                 dense: vec![0],
@@ -872,16 +856,10 @@ fn verify_recon(
     let r_v: Vec<Gf128> = r_joint[a..a + ell].to_vec();
     let r_c: Vec<Gf128> = r_joint[a + ell..].to_vec();
     let m0_at = magnetar_field::eval_mle(m0, &[r_k, r_v].concat());
-    let lt = lt_table(n, inclusive);
+    // The LT column at r_c via the O(T) suffix sums (the verifier's
+    // structured evaluation — no 2^{2n} less-than table).
     let eq_j = magnetar_field::EqBits::build(&r_c).values;
-    let mut lt_col = vec![ZERO; 1usize << n];
-    for jp in 0..(1usize << n) {
-        let mut acc = ZERO;
-        for j in 0..(1usize << n) {
-            acc += mul(eq_j[j], lt[jp + j * (1usize << n)]);
-        }
-        lt_col[jp] = acc;
-    }
+    let lt_col = suffix_sums(&eq_j, inclusive);
     let claim = val_claim + m0_at;
     let pubf: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
         vec![Box::new(TableFactor::new(lt_col))];
@@ -921,6 +899,111 @@ mod tests {
             for jp in 0..(1usize << n) {
                 assert_eq!(strict[jp + j * 8], if jp < j { ONE } else { ZERO });
                 assert_eq!(incl[jp + j * 8], if jp <= j { ONE } else { ZERO });
+            }
+        }
+    }
+
+    /// The linear-in-T port prover emits **byte-identical** round
+    /// messages, challenges, and terminal claims to the dense engine's
+    /// for the same statement — the cross-validation that gates the
+    /// linear prover's use in the protocol.
+    #[test]
+    fn linear_port_prover_matches_dense() {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        for &(a, d, ell, n, p) in &[
+            (4usize, 2usize, 3usize, 3usize, 2usize),
+            (6, 2, 4, 4, 1),
+            (6, 3, 2, 3, 2),
+        ] {
+            let ad = a / d;
+            let cycles = 1usize << n;
+            let cells = 1usize << a;
+            let bits = 1usize << ell;
+            // The write port's components and increments.
+            let mut wcomps = Vec::new();
+            for _ in 0..d {
+                let mut b = vec![false; (1usize << ad) * cycles];
+                for j in 0..cycles {
+                    b[rng.random_range(0..(1usize << ad)) + j * (1usize << ad)] = true;
+                }
+                wcomps.push(AddressComponent::from_bits(ad, n, &b));
+            }
+            let inc: Vec<Gf128> = (0..bits * cycles)
+                .map(|_| Gf128(rng.random::<bool>() as u128))
+                .collect();
+            let m0: Vec<Gf128> = (0..cells * bits)
+                .map(|_| Gf128(rng.random::<bool>() as u128))
+                .collect();
+            let r_val: Vec<Gf128> = (0..ell).map(|_| Gf128(rng.random::<u128>())).collect();
+            let r_cycle: Vec<Gf128> = (0..n).map(|_| Gf128(rng.random::<u128>())).collect();
+            let shared = crate::linear::TwistShared::new(
+                &TwistInstance {
+                    a,
+                    ell,
+                    n,
+                    p,
+                    m0: m0.clone(),
+                    rv_claims: vec![],
+                    wv_claim: ZERO,
+                    r_val: r_val.clone(),
+                    r_cycle: r_cycle.clone(),
+                },
+                crate::linear::addr_bits(&wcomps),
+                &inc,
+            );
+            let eq_val = magnetar_field::EqBits::build(&r_val).values;
+            let eq_cyc = magnetar_field::EqBits::build(&r_cycle).values;
+            let joint_vars = a + ell + n;
+            let mut pub_table = vec![ZERO; 1usize << joint_vars];
+            for idx in 0..pub_table.len() {
+                let o = (idx >> a) & ((1usize << ell) - 1);
+                let j = idx >> (a + ell);
+                pub_table[idx] = mul(eq_val[o], eq_cyc[j]);
+            }
+            let ra_joint = full_addr_joint(&wcomps, a, ell, n);
+            let val_strict = materialize_val(a, ell, n, &m0, &wcomps, &inc, false);
+            let val_inc = materialize_val(a, ell, n, &m0, &wcomps, &inc, true);
+            for &(inclusive, val_table) in &[(false, &val_strict), (true, &val_inc)] {
+                // The honest claim.
+                let mut claim = ZERO;
+                for idx in 0..(1usize << joint_vars) {
+                    claim += mul(pub_table[idx], mul(ra_joint[idx], val_table[idx]));
+                }
+                // Dense.
+                let mut t1 = Transcript::new("lin-x", &[b"dense"]);
+                let dense = run_port_sumcheck(
+                    &wcomps, val_table, claim, joint_vars, &pub_table, a, ell, n, "port", &mut t1,
+                );
+                // Linear.
+                let mut t2 = Transcript::new("lin-x", &[b"dense"]);
+                let lin = crate::linear::prove_port_linear(
+                    &TwistInstance {
+                        a,
+                        ell,
+                        n,
+                        p,
+                        m0: m0.clone(),
+                        rv_claims: vec![],
+                        wv_claim: ZERO,
+                        r_val: r_val.clone(),
+                        r_cycle: r_cycle.clone(),
+                    },
+                    &shared,
+                    &inc,
+                    &wcomps,
+                    claim,
+                    inclusive,
+                    "port",
+                    &mut t2,
+                );
+                assert_eq!(
+                    dense.rounds, lin.rounds,
+                    "rounds a={a} d={d} inc={inclusive}"
+                );
+                assert_eq!(dense.r_joint, lin.r_joint, "point");
+                assert_eq!(dense.ra_claim, lin.ra_claim, "ra claim");
+                assert_eq!(dense.val_claim, lin.val_claim, "val claim");
             }
         }
     }

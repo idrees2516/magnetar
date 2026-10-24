@@ -61,7 +61,8 @@ pub mod ring;
 
 pub use code::{CodeParams, Codeword};
 pub use eval::{
-    commit_table, prove_eval, verify_eval, LevelOpen, PathQuery, PcsParams, PcsProof, PcsStatement,
+    commit_table, prove_eval, verify_eval, LevelOpen, PathQuery, PcsParams, PcsProfile, PcsProof,
+    PcsStatement,
 };
 pub use ring::{prove_ring_switch, verify_ring_switch, RingProof};
 

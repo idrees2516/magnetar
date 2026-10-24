@@ -236,7 +236,7 @@ fn count_fields_proof(proof: &Proof) -> (usize, Vec<(String, usize)>) {
         .map(|m| m.len())
         .sum::<usize>()
         + 1
-        + ring_fields(&proof.mosaic.ring);
+        + proof.mosaic.ring.as_ref().map(ring_fields).unwrap_or(0);
     add("mosaic+pcs-eval", mosaic_n);
     (total, br)
 }

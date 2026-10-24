@@ -9,8 +9,25 @@ every cost grounded in this repository's measured cost model
 (`stats.rs`, `docs/BENCHMARKS.md`).
 
 **Status: the chunk-side machinery (segments, aggregation, the
-dual-rate profiles) is implemented; the wrap circuit is designed here
-and not yet implemented** — tracked in `docs/STATUS.md`.
+dual-rate profiles) and the dual-rate wrap's spot-check layer are
+implemented** (`magnetar-zkvm::wrap`: the deep-rate discharge + the
+consistency spot-checks, measured 44% tail reduction); the hash-circuit
+verifier-guest below is designed here and not yet implemented — tracked
+in `docs/STATUS.md`.
+
+**The accumulation-layer note (the attached ARC paper, eprint
+2024/1731):** ARC achieves *unbounded-depth* hash-based accumulation for
+Reed–Solomon proximity claims via the quotient construction
+(`Quotient(f, (x_1,y_1), …)` at sampled points, degree-corrected back)
+plus out-of-domain sampling — distance-preserving, so the depth bound
+never binds. Our commitment code is the multilinear affine-substitution
+codeword over Boolean cubes (`C(x, ε) = T̂(x + L(ε))`), for which no
+quotient structure is known: the wrap therefore uses the bounded-depth
+spot-check consistency (the [BMNW24] shape) with an ε-loss per fold
+step, sound for the wrap tree depths this system targets (log-many
+folds at the paper's chunking). Porting ARC's unbounded shape needs
+either an RS-compatible commitment or a proximity-gap argument for the
+affine-substitution code — the research follow-on.
 
 ## 1. The strategy
 

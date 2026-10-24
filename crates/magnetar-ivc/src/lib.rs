@@ -298,7 +298,7 @@ pub fn prove_ivc(
         t.absorb_digest(&format!("seg-digest-{s}"), d);
     }
     t.absorb_digest("cm-g", &commitment.stmt.root);
-    let mosaic = prove_mosaic(pcs, &combined, &commitment, &claims, &mut t);
+    let mosaic = prove_mosaic(pcs, &combined, &commitment, &claims, false, &mut t);
     IvcProof {
         statements,
         inners,

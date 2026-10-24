@@ -25,27 +25,8 @@ use crate::{AddressComponent, OneHotProof};
 use magnetar_field::{eval_mle, mul, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
 use magnetar_sumcheck::{
-    engine::{SumcheckProver, SumcheckVerifier},
-    public::PublicFactor,
-    BindOrder, RoundMsg, SumcheckSpec, Term,
+    engine::SumcheckVerifier, public::PublicFactor, BindOrder, RoundMsg, Term,
 };
-
-/// Pad one address component's table into the joint `(k, mid, j)` space
-/// (address part low, `mid_vars` middle variables, cycle part high).
-fn pad_component(comp: &AddressComponent, i: usize, d: usize, mid_vars: usize) -> Vec<Gf128> {
-    let ad = comp.addr_vars; // a/d
-    let n = comp.cycle_vars;
-    let a = ad * d;
-    let joint_vars = a + mid_vars + n;
-    let mut out = vec![ZERO; 1usize << joint_vars];
-    for idx in 0..out.len() {
-        let k = idx & ((1usize << a) - 1);
-        let j = idx >> (a + mid_vars);
-        let slice = (k >> (i * ad)) & ((1usize << ad) - 1);
-        out[idx] = comp.table[comp.index_with(slice, j)];
-    }
-    out
-}
 
 /// Split a joint `(k, mid, j)` point into the component's local coords:
 /// `(k-slice_i, r_j)`.
@@ -133,7 +114,9 @@ fn psi_table(weights: &[Gf128], a: usize) -> Vec<Gf128> {
 
 /// Prove the Ψ-claim for a set of address components; returns the honest
 /// claim value `c` (the caller forwards it to the consuming argument) and
-/// the proof.
+/// the proof. Runs the **linear-in-T prover** (the one-hot kill over the
+/// address rounds, `O(T·(a+n))` — never the joint materialization); the
+/// round messages are byte-identical to the dense engine's.
 pub fn prove_psi_claim(
     components: &[AddressComponent],
     r_cycle: &[Gf128],
@@ -141,79 +124,7 @@ pub fn prove_psi_claim(
     label: &str,
     t: &mut Transcript,
 ) -> (Gf128, PsiProof) {
-    let d = components.len();
-    let a = components[0].addr_vars * d;
-    let n = components[0].cycle_vars;
-    debug_assert_eq!(r_cycle.len(), n);
-    debug_assert_eq!(weights.len(), a);
-    // The honest claim value.
-    let eq_j = magnetar_field::EqBits::build(r_cycle).values;
-    let psi = psi_table(weights, a);
-    let mut claim = ZERO;
-    for idx in 0..(1usize << (a + n)) {
-        let k = idx & ((1usize << a) - 1);
-        let j = idx >> a;
-        let mut prod = mul(eq_j[j], psi[k]);
-        for (i, comp) in components.iter().enumerate() {
-            let ad = comp.addr_vars;
-            let slice = (k >> (i * ad)) & ((1usize << ad) - 1);
-            prod = mul(prod, comp.table[comp.index_with(slice, j)]);
-        }
-        claim += prod;
-    }
-    t.absorb_field(&format!("{label}-claim"), &[claim]);
-    // Sum-check over the joint (k, j) space: Ψ(k)·eq(r_cycle, j)·Π comps.
-    let dense: Vec<Vec<Gf128>> = (0..d)
-        .map(|i| pad_component(&components[i], i, d, 0))
-        .collect();
-    let public: Vec<Box<dyn PublicFactor + Send + Sync>> = vec![
-        Box::new(JointTableFactor::new(
-            psi_table(weights, a),
-            (0..a).collect(),
-            a + n,
-        )),
-        Box::new(JointTableFactor::new(
-            magnetar_field::EqBits::build(r_cycle).values,
-            (a..a + n).collect(),
-            a + n,
-        )),
-    ];
-    let spec = SumcheckSpec {
-        num_vars: a + n,
-        dense,
-        public,
-        terms: vec![Term {
-            coeff: ONE,
-            dense: (0..d).collect(),
-            public: vec![0, 1],
-        }],
-        claim,
-    };
-    let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
-    let mut rounds = Vec::with_capacity(a + n);
-    for _ in 0..(a + n) {
-        let msg = prover.message();
-        rounds.push(msg.0.clone());
-        prover.absorb_and_fold(t, label);
-    }
-    let r_joint = prover.challenges();
-    let (terminals, _) = prover.finish();
-    let component_claims: Vec<PcsPoint> = (0..d)
-        .map(|i| {
-            let pt = component_point(&r_joint, i, d, 0, n);
-            PcsPoint::new(pt, terminals[i])
-        })
-        .collect();
-    for c in &component_claims {
-        t.absorb_field(&format!("{label}-comp"), &[c.value]);
-    }
-    (
-        claim,
-        PsiProof {
-            rounds,
-            component_claims,
-        },
-    )
+    crate::linear::prove_psi_linear(components, r_cycle, weights, label, t)
 }
 
 /// Verify a Ψ-sum-check; returns the accepted per-component claims.
@@ -425,7 +336,7 @@ pub fn prove_bus_shout(
     t: &mut Transcript,
 ) -> (BusShoutProof, ShoutPcsClaims) {
     let d = components.len();
-    let (a, ell, n) = (spec.a, spec.ell, spec.n);
+    let (a, _ell, _n) = (spec.a, spec.ell, spec.n);
     // Absorb the input claims (they precede the Φ coefficients).
     t.absorb_field("bus-in-bus", &[spec.bus_claim]);
     t.absorb_field("bus-in-pc", &[spec.pc_claim]);
@@ -438,37 +349,18 @@ pub fn prove_bus_shout(
     for ((_, _, c), &g) in spec.index_claims.iter().zip(gammas.iter()) {
         claim += mul(g, *c);
     }
-    // The honest sum check (defensive): compute directly.
-    let dense: Vec<Vec<Gf128>> = (0..d)
-        .map(|i| pad_component(&components[i], i, d, ell))
-        .collect();
-    let (public, mut terms) = bus_phi_factors(spec, alpha0, gamma_bus, &gammas);
-    let dense_idx: Vec<usize> = (0..d).collect();
-    for tm in terms.iter_mut() {
-        tm.dense = dense_idx.clone();
-    }
-    let spec_sc = SumcheckSpec {
-        num_vars: a + ell + n,
-        dense,
-        public,
-        terms,
+    // The Φ sum-check via the linear-in-T prover (byte-identical rounds).
+    let (phi_rounds, _r_joint, phi_comp_pt) = crate::linear::prove_bus_phi_linear(
+        spec,
+        &components[0],
+        alpha0,
+        gamma_bus,
+        &gammas,
         claim,
-    };
-    let mut prover = SumcheckProver::new(&spec_sc, BindOrder::Increasing);
-    let mut phi_rounds = Vec::with_capacity(a + ell + n);
-    for _ in 0..(a + ell + n) {
-        let msg = prover.message();
-        phi_rounds.push(msg.0.clone());
-        prover.absorb_and_fold(t, "bus-phi");
-    }
-    let r_joint = prover.challenges();
-    let (terminals, _) = prover.finish();
-    let phi_component_claims: Vec<PcsPoint> = (0..d)
-        .map(|i| {
-            let pt = component_point(&r_joint, i, d, ell, n);
-            PcsPoint::new(pt, terminals[i])
-        })
-        .collect();
+        "bus-phi",
+        t,
+    );
+    let phi_component_claims: Vec<PcsPoint> = std::iter::once(phi_comp_pt).collect();
     for c in &phi_component_claims {
         t.absorb_field("bus-phi-comp", &[c.value]);
     }
@@ -642,7 +534,11 @@ pub fn prove_selector_shout(
     t: &mut Transcript,
 ) -> (SelectorShoutProof, SelectorPcsClaims) {
     let d = components.len();
-    let (a, n) = (spec.a, spec.n);
+    let a = spec.a;
+    debug_assert_eq!(
+        d, 1,
+        "the selector checks run on the single fetch component"
+    );
     let mut per_factor = Vec::with_capacity(spec.factors.len());
     let mut all_claims = Vec::new();
     for (fi, f) in spec.factors.iter().enumerate() {
@@ -650,60 +546,22 @@ pub fn prove_selector_shout(
         debug_assert_eq!(f.r_h.len(), hv);
         debug_assert_eq!(f.rom_sel.len(), 1usize << (hv + a));
         t.absorb_field(&format!("{label}-in-{fi}"), &[f.claim]);
-        let jv = a + hv + n;
-        // Dense: the fetch components padded over (k, h_f, j).
-        let dense: Vec<Vec<Gf128>> = (0..d)
-            .map(|i| pad_component(&components[i], i, d, hv))
-            .collect();
-        // Public: eq(r_j, j) over the j block; eq(r_h, h_f) over the h
-        // block; sel_f(h_f, k) over (h_f, k).
-        let sel_active: Vec<usize> = (a..a + hv).chain(0..a).collect();
-        let public: Vec<Box<dyn PublicFactor + Send + Sync>> = vec![
-            Box::new(JointTableFactor::new(
-                magnetar_field::EqBits::build(&spec.r_j).values,
-                (a + hv..a + hv + n).collect(),
-                jv,
-            )),
-            Box::new(JointTableFactor::new(
-                magnetar_field::EqBits::build(&f.r_h).values,
-                (a..a + hv).collect(),
-                jv,
-            )),
-            Box::new(JointTableFactor::new(f.rom_sel.clone(), sel_active, jv)),
-        ];
-        let terms = vec![Term {
-            coeff: ONE,
-            dense: (0..d).collect(),
-            public: vec![0, 1, 2],
-        }];
-        let sc_spec = SumcheckSpec {
-            num_vars: jv,
-            dense,
-            public,
-            terms,
-            claim: f.claim,
-        };
-        let mut prover = SumcheckProver::new(&sc_spec, BindOrder::Increasing);
-        let mut rounds = Vec::with_capacity(jv);
-        for _ in 0..jv {
-            let msg = prover.message();
-            rounds.push(msg.0.clone());
-            prover.absorb_and_fold(t, &format!("{label}-{fi}"));
-        }
-        let r_joint = prover.challenges();
-        let (terminals, _) = prover.finish();
-        let component_claims: Vec<PcsPoint> = (0..d)
-            .map(|i| {
-                let pt = component_point(&r_joint, i, d, hv, n);
-                PcsPoint::new(pt, terminals[i])
-            })
-            .collect();
+        // The linear-in-T prover (byte-identical rounds to the dense
+        // engine's — never the joint materialization).
+        let run = crate::linear::prove_selector_linear(
+            spec,
+            f,
+            &components[0],
+            &format!("{label}-{fi}"),
+            t,
+        );
+        let component_claims = run.component_claims;
         for c in &component_claims {
             t.absorb_field(&format!("{label}-{fi}-comp"), &[c.value]);
             all_claims.push(c.clone());
         }
         per_factor.push(SelectorFactorRun {
-            rounds,
+            rounds: run.rounds,
             component_claims,
         });
     }

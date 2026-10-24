@@ -37,12 +37,13 @@
 pub mod engine;
 pub mod public;
 pub mod sparse;
+pub mod zk;
 
 pub use engine::{SumcheckProver, SumcheckVerifier};
-pub use public::{PublicFactor, SumEqFactor, TableFactor};
+pub use public::{EqProdFactor, PublicFactor, SumEqFactor, TableFactor};
 pub use sparse::{SparseFactor, SparseProver, SparseSpec};
 
-use magnetar_field::{mul, Gf128, ONE, ZERO};
+use magnetar_field::{Gf128, ZERO};
 
 /// One additive term of the summand: `coeff · Π(dense) · Π(public)`.
 #[derive(Clone, Debug)]
@@ -167,7 +168,9 @@ pub struct RoundMsg(pub Vec<Gf128>);
 /// Lagrange interpolation on the fixed node set `{0, 1, 2, …, d}` (distinct
 /// constants of `K`). Given values at these points, returns the polynomial
 /// coefficients, degree `d`.
+#[cfg(test)]
 fn interpolate(values: &[Gf128]) -> Vec<Gf128> {
+    use magnetar_field::{mul, ONE};
     let d = values.len() - 1;
     // The engine counts the total factor count per term (conservative upper
     // bound on the per-variable degree). The largest term in the stack is
@@ -207,6 +210,7 @@ fn interpolate(values: &[Gf128]) -> Vec<Gf128> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use magnetar_field::{mul, ONE};
 
     #[test]
     fn interpolation_is_exact() {
@@ -232,9 +236,11 @@ mod tests {
 }
 #[cfg(test)]
 mod extra_tests {
+    use super::*;
+    use magnetar_field::{mul, ONE};
+
     #[test]
     fn interpolation_high_degree() {
-        use super::*;
         use rand::RngExt;
         let mut rng = rand::rng();
         for d in 4..=6usize {

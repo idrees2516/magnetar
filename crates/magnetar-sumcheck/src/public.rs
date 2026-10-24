@@ -70,14 +70,51 @@ impl PublicFactor for SumEqFactor {
     }
     fn materialize(&self) -> Vec<Gf128> {
         let nv = self.num_vars();
-        let mut table = vec![ZERO; 1 << nv];
-        for (alpha, point) in &self.items {
-            let eq = magnetar_field::EqBits::build(point).values;
-            for (t, e) in table.iter_mut().zip(eq.iter()) {
-                *t += mul(*alpha, *e);
-            }
-        }
-        table
+        let n = 1usize << nv;
+        // The **sparse-support build**: a point coordinate fixed at 0 or 1
+        // contributes `eq = 1` and *pins* that bit of the support — only
+        // the random coordinates vary. The Mosaic lift appends Boolean
+        // suffixes (the aligned-subcube offsets), so each claim's table
+        // lives on a `2^{vars_i}` subcube: the build costs
+        // `Σ_i 2^{vars_i}` (a DFS scatter with one multiplication per
+        // support entry), not `S·2^ℓ` — the S-claims batching factor of
+        // the Mosaic discharge. Parallel over item chunks (R1).
+        use rayon::prelude::*;
+        let chunk = (self.items.len() / rayon::current_num_threads().max(1)).max(1);
+        self.items
+            .par_chunks(chunk)
+            .map(|items| {
+                let mut table = vec![Gf128(0); n];
+                for (alpha, point) in items {
+                    let free: Vec<usize> = point
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, &r)| r != ZERO && r != ONE)
+                        .map(|(j, _)| j)
+                        .collect();
+                    let mut base_idx = 0usize;
+                    for (j, &r) in point.iter().enumerate() {
+                        if r == ONE {
+                            base_idx |= 1usize << j;
+                        }
+                    }
+                    // DFS over the free coordinates: each leaf's value is
+                    // the prefix product (one mul per entry).
+                    let fs: Vec<(Gf128, Gf128)> =
+                        free.iter().map(|&j| (ONE + point[j], point[j])).collect();
+                    scatter(&mut table, base_idx, &free, &fs, 0, *alpha);
+                }
+                table
+            })
+            .reduce(
+                || vec![Gf128(0); n],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(b.iter()) {
+                        *x += *y;
+                    }
+                    a
+                },
+            )
     }
     fn eval_at(&self, point: &[Gf128]) -> Gf128 {
         let mut acc = ZERO;
@@ -87,6 +124,92 @@ impl PublicFactor for SumEqFactor {
                 e = mul(e, ONE + r + x);
             }
             acc += mul(*alpha, e);
+        }
+        acc
+    }
+}
+
+/// The DFS scatter of `α·eq(point, ·)` into `table` over the free
+/// coordinates' subcube (the fixed coordinates pin the base index).
+fn scatter(
+    table: &mut [Gf128],
+    base_idx: usize,
+    free: &[usize],
+    fs: &[(Gf128, Gf128)],
+    level: usize,
+    val: Gf128,
+) {
+    if level == free.len() {
+        table[base_idx] += val;
+        return;
+    }
+    let (f0, f1) = fs[level];
+    scatter(table, base_idx, free, fs, level + 1, mul(val, f0));
+    scatter(
+        table,
+        base_idx | (1usize << free[level]),
+        free,
+        fs,
+        level + 1,
+        mul(val, f1),
+    );
+}
+
+/// A product of `eq` factors over a partition of the joint variables:
+/// `Π_m eq(p_m, x_{S_m})` — the public-factor shape of the
+/// memory-checking sum-checks (e.g. `eq(r_val, o)·eq(r_cycle, j)` over
+/// the `(k | o | j)` layout). The verifier evaluates it in
+/// `O(total variables)` at the terminal point — the structured
+/// evaluation that keeps the verifier polylogarithmic (no joint-cube
+/// materialization, unlike a `TableFactor` over the padded table).
+#[derive(Clone, Debug)]
+pub struct EqProdFactor {
+    /// `(point, joint_positions)` per part; the position sets are
+    /// disjoint and together may cover a subset of the joint variables
+    /// (uncovered variables are idle — the product is constant in them).
+    pub parts: Vec<(Vec<Gf128>, Vec<usize>)>,
+    pub joint_vars: usize,
+}
+
+impl EqProdFactor {
+    pub fn new(parts: Vec<(Vec<Gf128>, Vec<usize>)>, joint_vars: usize) -> Self {
+        for (p, pos) in &parts {
+            assert_eq!(p.len(), pos.len(), "eq part arity mismatch");
+        }
+        EqProdFactor { parts, joint_vars }
+    }
+}
+
+impl PublicFactor for EqProdFactor {
+    fn num_vars(&self) -> usize {
+        self.joint_vars
+    }
+    fn materialize(&self) -> Vec<Gf128> {
+        let n = 1usize << self.joint_vars;
+        let mut out = vec![ONE; n];
+        for (p, pos) in &self.parts {
+            let eq = magnetar_field::EqBits::build(p).values;
+            for idx in 0..n {
+                // The part's sub-index: the joint bits at `pos`.
+                let mut sub = 0usize;
+                for (t, &av) in pos.iter().enumerate() {
+                    if (idx >> av) & 1 == 1 {
+                        sub |= 1usize << t;
+                    }
+                }
+                out[idx] = mul(out[idx], eq[sub]);
+            }
+        }
+        out
+    }
+    fn eval_at(&self, point: &[Gf128]) -> Gf128 {
+        let mut acc = ONE;
+        for (p, pos) in &self.parts {
+            let mut e = ONE;
+            for (&r, &av) in p.iter().zip(pos.iter()) {
+                e = mul(e, ONE + r + point[av]);
+            }
+            acc = mul(acc, e);
         }
         acc
     }

@@ -113,7 +113,8 @@ pub fn prove_cross_step(
     debug_assert_eq!(halt.len(), n_cols);
     // The shifted fetch table ASH(k', j) = A(k', j+1) with the last cycle
     // frozen (or the public boundary one-hot).
-    let ash: Vec<Gf128> = {
+    let _ash: Vec<Gf128> = {
+        // (the linear S1 prover derives nq inline)
         let mut v = vec![ZERO; (1 << a) * n_cols];
         for j in 0..n_cols - 1 {
             for k in 0..(1usize << a) {
@@ -136,14 +137,14 @@ pub fn prove_cross_step(
         v
     };
     // The eq-links L_t(t, j) = 1 + t + t̂(j), L_h(h, j) = 1 + h + ĥ(j).
-    let l_t: Vec<Gf128> = (0..2 * n_cols)
+    let _l_t: Vec<Gf128> = (0..2 * n_cols)
         .map(|i| {
             let bit = i & 1;
             let j = i >> 1;
             ONE + Gf128(bit as u128) + taken[j]
         })
         .collect();
-    let l_h: Vec<Gf128> = (0..2 * n_cols)
+    let _l_h: Vec<Gf128> = (0..2 * n_cols)
         .map(|i| {
             let bit = i & 1;
             let j = i >> 1;
@@ -158,59 +159,15 @@ pub fn prove_cross_step(
         }
     };
     let gamma = t.challenge_field("cs-gamma");
-    let claim = alpha0 + gamma;
-    // The sparse spec: dense [A, ASH, L_t, L_h], public [eq(r_j), α₀, TT]
-    // — the k/k' spaces are SUMMED (the one-hot selects), so they carry
-    // no eq factors; only the cycle space is eq-weighted.
+    let _claim = alpha0 + gamma;
     let r_j = t.challenge_field_vec("cs-rj", n);
-    let dense = vec![
-        SparseFactor::new(fetch.table.clone(), (0..a).chain(j0..j0 + n).collect()),
-        SparseFactor::new(ash.clone(), (k1..k1 + a).chain(j0..j0 + n).collect()),
-        SparseFactor::new(l_t, std::iter::once(t0).chain(j0..j0 + n).collect()),
-        SparseFactor::new(l_h, std::iter::once(h0).chain(j0..j0 + n).collect()),
-    ];
-    let public = vec![
-        SparseFactor::new(
-            magnetar_field::EqBits::build(&r_j).values,
-            (j0..j0 + n).collect(),
-        ),
-        SparseFactor::new(vec![alpha0], vec![]),
-        SparseFactor::new(
-            spec.tt.clone(),
-            (k0..k0 + a)
-                .chain(k1..k1 + a)
-                .chain(std::iter::once(t0))
-                .chain(std::iter::once(h0))
-                .collect(),
-        ),
-    ];
-    let spec_sc = SparseSpec {
-        num_vars: jv,
-        dense,
-        public,
-        terms: vec![
-            Term {
-                coeff: ONE,
-                dense: vec![0, 1, 2, 3],
-                public: vec![0, 1],
-            },
-            Term {
-                coeff: gamma,
-                dense: vec![0, 1, 2, 3],
-                public: vec![0, 2],
-            },
-        ],
-        claim,
-    };
-    let mut prover = SparseProver::new(spec_sc, BindOrder::Increasing);
-    let mut s1_rounds = Vec::with_capacity(jv);
-    for _ in 0..jv {
-        let msg = prover.message();
-        s1_rounds.push(msg.0.clone());
-        prover.absorb_and_fold(t, "cs-s1");
-    }
-    let challenges = prover.challenges();
-    let (terminals, _) = prover.finish();
+    // S1 via the linear-in-T prover (the one-hot kills over k and k',
+    // O(T) per round — never the 2^{2a+2+n} sparse enumeration). The
+    // round messages are byte-identical to the sparse prover's.
+    let (s1_rounds, challenges, terminals) = crate::linear::prove_cross_step_s1_linear(
+        spec, fetch, taken, halt, alpha0, gamma, &r_j, "cs-s1", t,
+    );
+    debug_assert_eq!(s1_rounds.len(), jv);
     let r_joint = BindOrder::Increasing.point(jv, &challenges);
     let a_claim = terminals[0];
     let ash_claim = terminals[1];

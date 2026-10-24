@@ -20,7 +20,7 @@
 //!    argument.
 
 use crate::mosaic::{
-    commit_mosaic, prove_mosaic, verify_mosaic, MosaicClaim, MosaicCommitment, MosaicLayout,
+    commit_mosaic, prove_mosaic_opt, verify_mosaic, MosaicClaim, MosaicCommitment, MosaicLayout,
     MosaicProof,
 };
 use crate::RomTables;
@@ -71,6 +71,17 @@ pub struct KeyGen {
     pub trace_len: usize,
     /// PCS parameters.
     pub pcs: PcsParams,
+    /// Zero-knowledge masking of the Mosaic batching discharge (roadmap
+    /// H1): per-round mask polynomials hide the witness-derived round
+    /// messages (see `magnetar_sumcheck::zk`).
+    pub zk: bool,
+}
+
+impl KeyGen {
+    /// Enable ZK masking of the Mosaic batching discharge.
+    pub fn enable_zk(&mut self) {
+        self.zk = true;
+    }
 }
 
 /// The verifying key.
@@ -320,6 +331,7 @@ pub fn keygen_with(
         amount_bits,
         trace_len,
         pcs: pcs.clone(),
+        zk: false,
     };
     let vk = VerifyingKey {
         program,
@@ -591,7 +603,9 @@ pub fn prove_inner(
         b_fld: pk.circuit.b_fld.clone(),
         c_fld: pk.circuit.c_fld.clone(),
     };
+    let _pt = PhaseTimer::new("3a-virtual-spartan");
     let (vs_proof, seg_claims) = prove_virtual_spartan(&rel, &pk.layout, &wd.joint_z, q, t);
+    drop(_pt);
     let seg = |name: &str| -> SegmentClaim {
         let i = pk.layout.index_of(name).expect("segment");
         seg_claims[i].clone()
@@ -616,7 +630,9 @@ pub fn prove_inner(
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
+    let _pt = PhaseTimer::new("3b-reg-twist");
     let (reg_proof, reg_twist_claims) = prove_twist(&reg_inst, &wd.reg_wit, t);
+    drop(_pt);
     // The register-index Ψ-sum-checks (read 1, read 2, write).
     let port_comps = [
         &wd.reg_wit.ports[0],
@@ -697,7 +713,9 @@ pub fn prove_inner(
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
+    let _pt = PhaseTimer::new("3c-ram-twist");
     let (ram_proof, ram_twist_claims) = prove_twist(&ram_inst, &wd.ram_wit, t);
+    drop(_pt);
     // The RAM address Ψ-sum-checks (read, write) — checked against the
     // ram-addr segment's VS claim.
     let v_ramaddr = seg("ram-addr").value;
@@ -757,6 +775,7 @@ pub fn prove_inner(
         offset_bits: Vec::new(),
     };
     let shift_claim = seg("shift-out").value;
+    let _pt = PhaseTimer::new("4a-shift-router");
     let shift_router = prove_routing_join(
         &shift_layout,
         shift_claim,
@@ -772,6 +791,7 @@ pub fn prove_inner(
         &shift_wit,
         t,
     );
+    drop(_pt);
     // ---- 5b. BinaryRouter for sub-word stores.
     let (o_vs, u_vs, h_vs, a_vs) = (
         pk.store_tensor.1,
@@ -824,6 +844,7 @@ pub fn prove_inner(
     };
     // The output claim: the Inc claim at the verifier-sampled point.
     let (r_inc_o, r_inc_j) = inc_point.split_at(6);
+    let _pt = PhaseTimer::new("4b-store-router");
     let store_router = prove_routing_join(
         &store_layout,
         inc_claim,
@@ -839,6 +860,7 @@ pub fn prove_inner(
         &store_wit,
         t,
     );
+    drop(_pt);
     // The store X split claims (the two segment MLEs at the router's
     // terminal point).
     let store_x_claims: [Gf128; 2] = {
@@ -884,8 +906,10 @@ pub fn prove_inner(
         pc_r_local: r_local3.clone(),
         pc_claim: seg("pc").value,
     };
+    let _pt = PhaseTimer::new("5-bus-shout");
     let (bus_shout, bus_shout_claims) =
         prove_bus_shout(&bus_spec, std::slice::from_ref(&wd.fetch_comp), t);
+    drop(_pt);
     // The selector checks.
     let shift_terminal = shift_router.terminal.clone();
     let sel_shift = {
@@ -1157,7 +1181,47 @@ pub fn build_segment(
 
 /// The single-segment protocol (paper §5.5, Construction 3): execute,
 /// run steps 2–6, then commit and discharge once.
+/// Phase timing (MAGNETAR_TIME=1 prints the per-phase wall clock to
+/// stderr — the honest-measurement rule of docs/PERFORMANCE.md).
+pub struct PhaseTimer {
+    enabled: bool,
+    label: &'static str,
+    start: std::time::Instant,
+}
+impl PhaseTimer {
+    pub fn new(label: &'static str) -> Self {
+        PhaseTimer {
+            enabled: std::env::var("MAGNETAR_TIME").is_ok(),
+            label,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        if self.enabled {
+            eprintln!(
+                "[time] {:<24} {:>9.1} ms",
+                self.label,
+                self.start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+}
+
 pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
+    prove_with_wrap(pk, pub_in, None)
+}
+
+/// Prove, optionally **wrapping** the public evaluation tail at a deep
+/// rate (roadmap H2's dual-rate wrap): the chunk side keeps its fast
+/// profile; the discharge runs at `deep`'s low rate with the consistency
+/// spot-checks binding it to the chunk commitment.
+pub fn prove_with_wrap(
+    pk: &KeyGen,
+    pub_in: &PublicInput,
+    deep: Option<magnetar_pcs::PcsParams>,
+) -> Proof {
     // ---- 1. Execute (padded to exactly `trace_len` cycles).
     let mut trace = execute(&pk.program, &pub_in.input, pk.trace_len);
     assert_eq!(
@@ -1172,10 +1236,14 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         pk.trace_len,
     );
     assert_eq!(trace.records.len(), pk.trace_len);
+    let _pt_exec = PhaseTimer::new("1-execute+witness");
     let (wd, tables) = build_segment(pk, pub_in, &trace);
+    drop(_pt_exec);
     // ---- 2. Commit (the protocol's only commitment), then bind it into
     // the transcript before any challenge is drawn.
+    let _pt_commit = PhaseTimer::new("2-commit");
     let commitment: MosaicCommitment = commit_mosaic(&pk.pcs, &pk.mosaic, &tables);
+    drop(_pt_commit);
     let mut t = Transcript::new(
         "magnetar",
         &[
@@ -1197,9 +1265,21 @@ pub fn prove(pk: &KeyGen, pub_in: &PublicInput) -> Proof {
         trace.final_state.halted,
         "the execution must halt within the trace bound"
     );
+    let _pt_inner = PhaseTimer::new("3-prove_inner");
     let (inner, mosaic_claims) = prove_inner(pk, pub_in, None, &trace, &wd, None, &mut t);
+    drop(_pt_inner);
     // ---- 7. Discharge.
-    let mosaic_proof = prove_mosaic(&pk.pcs, &pk.mosaic, &commitment, &mosaic_claims, &mut t);
+    let _pt_mosaic = PhaseTimer::new("7-mosaic-discharge");
+    let mosaic_proof = prove_mosaic_opt(
+        &pk.pcs,
+        &pk.mosaic,
+        &commitment,
+        &mosaic_claims,
+        pk.zk,
+        deep.as_ref(),
+        &mut t,
+    );
+    drop(_pt_mosaic);
     Proof {
         commitment_root: commitment.stmt.root,
         pcs_n: commitment.stmt.n,
@@ -1976,6 +2056,127 @@ mod tests {
         );
     }
 
+    /// The ZK-masked Mosaic batching discharge (roadmap H1): the round
+    /// messages are blinded by per-round mask polynomials; the uniform
+    /// finish offset closes the terminal identity. The masked proof must
+    /// verify, carry a nonzero offset, differ from the plain proof's
+    /// transcript, and reject a tampered offset.
+    #[test]
+    fn end_to_end_zk_masked_batching() {
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            (2u32 << 20) | (1 << 15) | (3 << 7) | 0x33,
+            (3u32 << 20) | (2 << 15) | (4 << 7) | 0x33,
+            0x0000_0073,
+        ];
+        let (mut pk, vk) = keygen(program, 8);
+        pk.enable_zk();
+        let pub_in = PublicInput {
+            input: vec![],
+            output: 0,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert_ne!(
+            proof.mosaic.zk_offset,
+            magnetar_field::ZERO,
+            "the finish offset must be random-looking"
+        );
+        assert!(verify(&vk, &pub_in, &proof).is_ok(), "ZK proof verifies");
+        // A tampered offset breaks the terminal identity.
+        let mut p = proof.clone();
+        p.mosaic.zk_offset += magnetar_field::ONE;
+        assert!(verify(&vk, &pub_in, &p).is_err());
+        // A tampered masked round breaks the round check.
+        let mut p = proof.clone();
+        p.mosaic.batch_rounds[0][1] += magnetar_field::ONE;
+        assert!(verify(&vk, &pub_in, &p).is_err());
+    }
+
+    /// The dual-rate wrap (roadmap H2): the chunk profile stays fast; the
+    /// public evaluation tail is discharged at `DeepWrap` with the
+    /// consistency spot-checks. The wrapped proof verifies, is SMALLER
+    /// than the plain proof's tail, and rejects tampered consistency
+    /// values, tampered deep roots, and a tampered ring round.
+    #[test]
+    fn end_to_end_wrapped_deep() {
+        use magnetar_pcs::PcsProfile;
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            (2u32 << 20) | (1 << 15) | (3 << 7) | 0x33,
+            (3u32 << 20) | (2 << 15) | (4 << 7) | 0x33,
+            0x0000_0073,
+        ];
+        let (pk, vk) = keygen(program, 8);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: 0,
+        };
+        let plain = prove(&pk, &pub_in);
+        assert!(verify(&vk, &pub_in, &plain).is_ok());
+        let deep = PcsProfile::DeepWrap.params();
+        let wrapped = prove_with_wrap(&pk, &pub_in, Some(deep.clone()));
+        assert!(
+            verify(&vk, &pub_in, &wrapped).is_ok(),
+            "wrapped proof verifies"
+        );
+        // The size win: the deep ring (14 queries) + consistency replaces
+        // the chunk ring (40 queries).
+        let tail_bytes = |p: &Proof| -> usize {
+            // The full byte inventory of the evaluation-argument tail:
+            // round messages + level roots + queries + tail + anchors
+            // (+ the wrap's consistency openings).
+            let ring = |r: &magnetar_pcs::RingProof| -> usize {
+                let mut n = r.rounds.iter().map(|m| m.len() * 16).sum::<usize>();
+                n += r.level_roots.len() * 32;
+                for q in &r.queries {
+                    n += q.levels.len() * 3 * (16 + 32);
+                }
+                for (_v, path) in &r.tail {
+                    n += 16 + path.len() * 32;
+                }
+                for a in &r.anchors {
+                    n += 16 + a.main_path.len() * 32 + 16 + a.c_path.len() * 32;
+                }
+                n
+            };
+            let mut n = p.mosaic.ring.as_ref().map(ring).unwrap_or(0);
+            if let Some(w) = &p.mosaic.wrap {
+                n += ring(&w.ring);
+                n += w.consistency.len()
+                    * (16
+                        + (w.consistency[0].chunk_path.len() + w.consistency[0].deep_path.len())
+                            * 32);
+            }
+            n
+        };
+        let plain_tail = tail_bytes(&plain);
+        let wrapped_tail = tail_bytes(&wrapped);
+        assert!(
+            wrapped_tail < plain_tail,
+            "the deep tail ({wrapped_tail} B) must beat the chunk tail ({plain_tail} B)"
+        );
+        // A tampered consistency value breaks the dual opening.
+        let mut p = wrapped.clone();
+        if let Some(w) = p.mosaic.wrap.as_mut() {
+            w.consistency[0].value += magnetar_field::ONE;
+        }
+        assert!(verify(&vk, &pub_in, &p).is_err());
+        // A tampered deep root breaks the ring switch.
+        let mut p = wrapped.clone();
+        if let Some(w) = p.mosaic.wrap.as_mut() {
+            w.deep.root[0] ^= 0xff;
+        }
+        assert!(verify(&vk, &pub_in, &p).is_err());
+        // A tampered deep ring round breaks the round check.
+        let mut p = wrapped.clone();
+        if let Some(w) = p.mosaic.wrap.as_mut() {
+            w.ring.rounds[0][1] += magnetar_field::ONE;
+        }
+        assert!(verify(&vk, &pub_in, &p).is_err());
+    }
+
     #[test]
     fn end_to_end_load_store() {
         // addi x1, x0, 16; addi x5, x0, 0xAB; sb x5, 0(x1);
@@ -2201,7 +2402,17 @@ mod cross_step_tests {
         let commitment = commit_mosaic(&pk.pcs, &pk.mosaic, &tables);
         t.absorb_digest("cm-g", &commitment.stmt.root);
         let (inner, mosaic_claims) = prove_inner(&pk, &pub_in, None, &trace, &wd, None, &mut t);
-        let mosaic_proof = prove_mosaic(&pk.pcs, &pk.mosaic, &commitment, &mosaic_claims, &mut t);
+        let _pt_mosaic = PhaseTimer::new("7-mosaic-discharge");
+        let mosaic_proof = prove_mosaic_opt(
+            &pk.pcs,
+            &pk.mosaic,
+            &commitment,
+            &mosaic_claims,
+            pk.zk,
+            None,
+            &mut t,
+        );
+        drop(_pt_mosaic);
         let proof = Proof {
             commitment_root: commitment.stmt.root,
             pcs_n: commitment.stmt.n,
