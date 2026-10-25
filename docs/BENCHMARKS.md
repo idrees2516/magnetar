@@ -1,11 +1,11 @@
 # Benchmarks — the reference implementation vs. the paper
 
 Measured on this repository's reference implementation (Rust `--release`,
-rayon parallel kernels, test-scale parameters: RAM = 2^8 words, shift
-amount width 2, witness width W = 2048, GF(2^128) with PCLMULQDQ) and
-compared with the paper's reported figures (eprint 2026-2423, §6,
-Table 6). The development container: 2 Xeon cores, 4 GiB. The paper's
-hardware: 12 performance cores of an M4 Max, 128 GiB.
+rayon parallel kernels, the packed-bit witness, the mask-major outer,
+GF(2^128) with VPCLMULQDQ) and compared with the paper's reported
+figures (eprint 2026-2423, §6, Table 6). The production load-test
+host: a 4-vCPU EPYC instance with real AVX-512 + VPCLMULQDQ (InstaBox).
+The paper's hardware: 12 performance cores of an M4 Max, 128 GiB.
 
 Run with:
 
@@ -22,25 +22,22 @@ cargo run --release -p magnetar-cli --bin magnetar -- profiles     # dual-rate t
 
 ## End-to-end results (this implementation)
 
-Current numbers (the circuit-density pass + the small-value round window
-+ the hierarchical discharge root):
+Current numbers (the production-throughput release: the packed witness,
+the mask-major bin outer, the group-fold discharge, the linear st1,
+the FastChunk rate, the parallel hierarchical root):
 
 | workload | T | prove (ms) | verify (ms) | cycles/s | proof (KiB) |
 |---|---|---|---|---|---|
-| mem-mix | 2^8 | 146 | 19.0 | 1,755 | 351.4 |
-| mem-mix | 2^10 | 569 | 43.5 | 1,801 | 442.0 |
-| alu-chain | 2^10 | 590 | 42.6 | 1,737 | 442.7 |
-| alu-chain | 2^13 (monolithic) | 5,259 | 314.4 | 1,558 | 597.2 |
-| (streaming, 64 segs) | 2^14 | 8,531 | — | **1,920** | one shared tail |
-| (streaming, 64 segs) | 2^15 | 17,874 | — | **1,833** | one shared tail |
-| (streaming, 64 segs) | 2^16 | 38,386 | — | **1,707** | one shared tail |
+| alu-chain | 2^10 | 203 | 43.6 | 5,044 | 404.9 |
+| alu-chain | 2^11 | 373 | 62.1 | 5,495 | 451.5 |
+| alu-chain | 2^12 | 614 | 114.3 | 6,668 | 500.5 |
+| (streaming, 8 segs) | 2^13 | 672 | — | 12,186 | one shared tail |
+| (streaming, 16 segs) | 2^14 | 1,321 | — | 12,398 | one shared tail |
+| (streaming, 32 segs) | 2^15 | 2,799 | — | 11,707 | one shared tail |
+| (streaming, 64 segs) | 2^16 | 6,300 | — | **10,402** | one shared tail |
 
-The session-start baseline was 1,074 cycles/s at 2^8 / 821 at 2^13
-monolithic / 1,261 at 2^14 streaming — and **2^15 and above were not
-provable at all** (the root's combined-cube tables exhausted the 4 GiB
-envelope). The cumulative gain this pass is 1.6–2.2× on every scale, and
-the streaming ladder now runs through 2^16 at bounded memory (2.6 GiB
-peak for 65,536 cycles).
+Peak RSS at 2^12 monolithic: **165 MiB** (was 619 MiB two releases ago);
+at 2^16 streaming: 1.4 GiB.
 
 ## The ERC-20 mixed-block load test (the paper's Table-6 workload shape)
 
@@ -51,10 +48,33 @@ transfer at the 64-bit balance width of this RV64I reference CPU:
 
 | T | segments | tx | prove (ms) | cycles/s | tx/s | peak RSS |
 |---|---|---|---|---|---|---|
-| 2^12 (monolithic) | — | 341 | 2,818 | 1,453 | 121 | 619 MiB |
-| 2^13 | 8 | 682 | 5,039 | 1,626 | 135 | 619 MiB |
-| 2^15 | 32 | 2,730 | 21,173 | 1,548 | 129 | 1.36 GiB |
-| 2^16 | 64 | 5,461 | 45,299 | 1,447 | 121 | 2.60 GiB |
+| 2^12 (monolithic) | — | 341 | 614 | 6,668 | 555 | 165 MiB |
+| 2^13 | 8 | 682 | 672 | 12,186 | 1,014 | 259 MiB |
+| 2^14 | 16 | 1,365 | 1,321 | 12,398 | 1,033 | 344 MiB |
+| 2^15 | 32 | 2,730 | 2,799 | 11,707 | 975 | 590 MiB |
+| 2^16 | 64 | 5,461 | 6,300 | 10,402 | 867 | 1.37 GiB |
+
+**The pooled proving-pool run** (5 × 4-vCPU instances proving
+independent 2^16 batches concurrently): ≈3,880 tx/s aggregate (the
+per-machine rate drops ~12% under cross-VM contention). The production
+50k-tx/s target therefore needs ~13× more per-core efficiency; the
+measured remaining levers, in order of impact:
+
+1. **The ring switch's FRI chain** (~35% of the streaming root): the
+   per-level Merkle trees are Ligerito-inherent, but the c-chain still
+   materializes the derived c-table + a second encode; the paper's
+   commitment-free ring switch reduces to the packed-PCS claim and
+   reuses the main codeword's argument (est. −0.3–0.5 s/root).
+2. **The per-segment transcript/claims glue** (~20–30% of each
+   segment): hundreds of small Fiat–Shamir absorbs per proof; batching
+   the absorbs and the claim serializations (est. −15–20% per segment).
+3. **The twists' o-rounds** (the inc-table folds + the eq-sum passes):
+   the packed-inc refactor (u64 words per cycle instead of the
+   `2^{6+n}` bit table) mirrors the witness packing (est. −5–8%).
+4. **The paper's per-instance amortization**: the circuit still pads
+   the rows to 512/cycle against the paper's several-cycles-per-
+   instance operating point — the single largest structural constant
+   left (4–8× at the paper's density).
 
 Every row proves **and verifies** end-to-end (the assert is in the
 harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,

@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.8.0] — the production-throughput release
+
+### Added
+- **The InstaBox load-test pool**: the ERC-20 mixed-block ladder measured
+  on real AVX-512 hardware (4-vCPU EPYC instances), including the pooled
+  5-machine (20-vCPU) concurrent run — the production proving-pool
+  throughput shape.
+- **The packed witness** (`WitnessData::w_packed`): the bit-packed w-half
+  (128 witness columns per `u128`) + the shared public-x vector. The
+  `q × m × 16 B` joint table — every bit a full field element — is gone;
+  the eq(r_inst)-fold is one tzcnt select-XOR pass (`fold_packed_w`),
+  the x-fold is the identity (`Σ eq = 1`, the shared-x observation),
+  and the matrices apply over packed bits with the shared x-part
+  hoisted out of the per-instance loop (`apply_simd_packed`).
+- **The linear sum-to-one prover** (`prove_st1_linear`): the twist st1
+  sum-checks over the one-hot components via the one-hot kill — O(T) per
+  round over the per-cycle address traces, never the `2^{ad+n}` cube
+  (the RAM twist's st1 was 291 ms of a 541 ms twist). Byte-identical to
+  the dense engine (cross-validated).
+- **The sparse component evaluations**:
+  `row_at_sparse`/`column_at_sparse`/`eval_at_sparse` from the address
+  traces (the dense `O(2^a · T)` table dots were the onehot/claims
+  cost), with the address traces computed once and threaded through the
+  claims, st1, onehot, and reconstruction paths.
+- **The group-fold Mosaic discharge**: the eq(r)-weighted fold of the
+  packed words per **distinct free-word point** — the claims' word
+  coordinates coincide within families (the witness segments share
+  `r_low ‖ r_inst`; the memory claims share `r_k ‖ r_cycle`), so ~53
+  groups cover 61 claims — then the per-claim plane folds (the
+  bind-shrink-adjusted pattern positions) + the window monomial
+  butterfly, and `bound_se` as the group outer product. The per-suffix
+  64-plane extraction and the `2^{ell-v}`-per-item suffix tables are
+  gone; a brute-force cross-validation test gates the fold.
+- **The mask-major bin outer** (`apply_simd_bit_masks` +
+  `SumcheckProver::with_mask_window`): the three bit tables arrive as
+  packed window truth-table words (one `u64` per suffix — the
+  constant-1 column as a fixed row flip), the window pass reads one
+  word per (table, suffix) instead of `2^v` strided 16-byte gathers,
+  and the fast-forward contracts the masks. vs-apply 3.4×, vs-outer
+  2.1×, and the az/bz/cz materialization (q·rows·48 B) is gone.
+- **The fused `axpy_run` kernel**: the broadcast multiply-accumulate
+  (AVX-512 4-lane / AVX-2 2-lane + the scalar reference), unit-tested —
+  the bound_se inner op's kernel.
+- The twist + port-linear + discharge phase instrumentation
+  (`MAGNETAR_TIME=1`) used to pin every optimization this release.
+
+### Changed
+- **The FastChunk default** (`k = 1`, rate 1/2): every codeword and
+  Merkle tree halves. Each profile's per-query far-word rejection is
+  the Schwartz–Zippel bound `n/2^128` with `n ≤ 64` (≥ 122 bits per
+  query), so every profile holds the 120-bit envelope on its own; the
+  wrap re-proves the public tail at a deep rate for size.
+- **The hierarchical discharge parallelized**: the per-segment local
+  stages (construction, per-round messages, binds) run rayon-parallel
+  — they were sequential; the streaming root halved.
+- The window size stays `min(6, high)`: the SWAR monomial machinery is
+  `u64`-bound at v ≤ 6, and the pack cost grows as `(3/2)^v` — the
+  masks are the real window lever (measured).
+
+### Measured (4-vCPU EPYC, AVX-512)
+- Monolithic: 5,044–6,668 cycles/s at 2^10–2^12 (release start 3,541).
+- Streaming: 12,186 at 2^13 / 12,398 at 2^14 / 11,707 at 2^15 /
+  **10,276 at 2^16** (10.4–12.4k cycles/s; the release start measured
+  3,943 on the same host).
+- **The ERC-20 mixed-block load test** (12 cycles/tx): 856–1,033 tx/s
+  per machine across the ladder; the pooled 5-machine concurrent run
+  measured **≈3,880 tx/s** (20 vCPUs, with cross-VM contention).
+- Memory: the 2^12 monolithic prove's peak RSS fell 619 → 165 MiB (the
+  packed witness + the mask-major outer + the group-fold discharge).
+
+
 ## [0.7.0] — the streaming-scale release
 
 ### Added
