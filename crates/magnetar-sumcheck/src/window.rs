@@ -168,6 +168,52 @@ impl WindowState {
         eq_table: &[Gf128],
         tau: &[Gf128],
     ) {
+        let stride = self.stride;
+        let v = self.v;
+        self.run_pass_inner(
+            |x| mobius_mask(d0, x, stride, v),
+            |x| mobius_mask(d1, x, stride, v),
+            |x| mobius_mask(d2, x, stride, v),
+            eq_table,
+            tau,
+        );
+    }
+
+    /// The **mask-major** window pass: the three bit tables arrive
+    /// packed — one `u64` window truth-table word per suffix (the
+    /// `apply_simd_bit_masks` layout) — so the pass reads ONE word per
+    /// (table, suffix) instead of `2^v` strided 16-byte entries. The
+    /// resulting state (and therefore every message) is bit-identical to
+    /// [`Self::run_pass`]'s.
+    pub(crate) fn run_pass_masks(
+        &mut self,
+        m0: &[u64],
+        m1: &[u64],
+        m2: &[u64],
+        eq_table: &[Gf128],
+        tau: &[Gf128],
+    ) {
+        let v = self.v;
+        self.run_pass_inner(
+            |x| mobius_from_packed(m0[x], v),
+            |x| mobius_from_packed(m1[x], v),
+            |x| mobius_from_packed(m2[x], v),
+            eq_table,
+            tau,
+        );
+    }
+
+    /// The generic pass core: `f_i(x)` returns table `i`'s Möbius mask
+    /// at suffix `x`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pass_inner(
+        &mut self,
+        f0: impl Fn(usize) -> u64 + Send + Sync,
+        f1: impl Fn(usize) -> u64 + Send + Sync,
+        f2: impl Fn(usize) -> u64 + Send + Sync,
+        eq_table: &[Gf128],
+        tau: &[Gf128],
+    ) {
         let v = self.v;
         let stride = self.stride;
         let n_c = 1usize << v;
@@ -201,13 +247,14 @@ impl WindowState {
             .into_par_iter()
             .chunks(chunk)
             .map(|suffixes| {
+                let (f0, f1, f2) = (&f0, &f1, &f2);
                 let mut q_ab = vec![ZERO; n_ab];
                 let mut q_c = vec![ZERO; n_ab];
                 for x in suffixes {
                     // The three window sub-cubes' Möbius masks.
-                    let m0 = mobius_mask(d0, x, stride, v);
-                    let m1 = mobius_mask(d1, x, stride, v);
-                    let m2 = mobius_mask(d2, x, stride, v);
+                    let m0 = f0(x);
+                    let m1 = f1(x);
+                    let m2 = f2(x);
                     // The eq-weighted pack: eq(τ_s, x') = the stripe entry
                     // scaled by 1/eq(τ_w, m*) (applied once at the end).
                     let w = eq_table[eq_base + x];
@@ -401,9 +448,53 @@ fn mobius_mask(table: &[Gf128], x: usize, stride: usize, v: usize) -> u64 {
     m
 }
 
+/// The Möbius butterfly over an already-packed window truth table (the
+/// mask-major form `apply_simd_bit_masks` produces): identical to
+/// [`mobius_mask`] without the strided extraction.
+#[inline]
+fn mobius_from_packed(mut m: u64, v: usize) -> u64 {
+    for j in 0..v {
+        m ^= (m << (1 << j)) & swirl_mask(j);
+    }
+    m
+}
+
 /// Contract a still-bit-valued table at the window challenges: the sub-cube
 /// MLE at `r_{<v}`, computed with selects (`eq_r[m]·bit`). Parallel over
 /// the suffix range; used by the engine's fast-forward.
+/// The mask-major contraction: identical to [`contract_bit_table`] but
+/// the bit table arrives packed (one `u64` window truth-table word per
+/// suffix) — a select-dot over each word's set bits instead of `2^v`
+/// strided 16-byte reads.
+pub(crate) fn contract_bit_masks(
+    masks: &[u64],
+    eq_r: &[Gf128],
+    stride: usize,
+    v: usize,
+) -> Vec<Gf128> {
+    assert_eq!(masks.len(), stride);
+    assert_eq!(eq_r.len(), 1usize << v);
+    let mut out = vec![ZERO; stride];
+    let chunk = if stride >= 2 * magnetar_field::PAR_THRESHOLD {
+        (stride / (rayon::current_num_threads().max(1) * 4))
+            .clamp(magnetar_field::PAR_THRESHOLD, stride)
+    } else {
+        stride
+    };
+    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, o)| {
+        let base = ci * chunk;
+        for (rel, dst) in o.iter_mut().enumerate() {
+            let mut s = masks[base + rel];
+            while s != 0 {
+                let m = s.trailing_zeros() as usize;
+                s &= s - 1;
+                *dst += eq_r[m];
+            }
+        }
+    });
+    out
+}
+
 pub(crate) fn contract_bit_table(
     table: &[Gf128],
     eq_r: &[Gf128],
@@ -435,9 +526,12 @@ pub(crate) fn contract_bit_table(
     out
 }
 
-/// The default window size: `min(6, high)` (the model's optimum for the
-/// degree-2 product term at this host's select-to-CLMUL ratio; the
-/// `MAGNETAR_WINDOW` environment variable overrides, 0 disables).
+/// The default window size: `min(6, high)` — the papers' single early
+/// window. The window's per-suffix pack costs `Θ(3^v)` select-adds
+/// against the replaced rounds' `Θ(2^v)` CLMUL passes per position, so
+/// the crossover sits in the high single digits; `v = 6` is also the
+/// SWAR limit (the monomial butterflies live in one `u64` truth table).
+/// The `MAGNETAR_WINDOW` environment variable overrides, 0 disables.
 pub(crate) fn window_size(high: usize) -> usize {
     if let Ok(w) = std::env::var("MAGNETAR_WINDOW") {
         if let Ok(w) = w.parse::<usize>() {

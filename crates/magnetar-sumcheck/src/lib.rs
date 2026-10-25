@@ -40,6 +40,12 @@ pub mod sparse;
 pub mod window;
 pub mod zk;
 
+/// The window size the engine would choose for `high` high-bits-first
+/// variables (the callers use it to build the matching mask layout).
+pub fn window_probe(high: usize) -> usize {
+    window::window_size(high)
+}
+
 pub use engine::{SumcheckProver, SumcheckVerifier};
 pub use public::{EqFactor, EqProdFactor, EqSlabInfo, PublicFactor, SumEqFactor, TableFactor};
 pub use sparse::{SparseFactor, SparseProver, SparseSpec};

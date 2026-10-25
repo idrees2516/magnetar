@@ -285,22 +285,55 @@ pub fn prove_virtual_spartan(
         |mat: &crate::SparseMatrix| -> (Vec<Gf128>, bool) {
             mat.apply_simd_packed(w_packed, x_cols, q, w_cols)
         };
-    let (az_bin, az_bits) = apply_bits(&rel.a_bin);
-    let (bz_bin, bz_bits) = apply_bits(&rel.b_bin);
-    let (cz_bin, cz_bits) = apply_bits(&rel.c_bin);
     let az_fld = apply_bits(&rel.a_fld).0;
     let bz_fld = apply_bits(&rel.b_fld).0;
     let cz_fld = apply_bits(&rel.c_fld).0;
-    let spec_bin = outer_spec(
-        &rel.a_bin,
-        &rel.b_bin,
-        &rel.c_bin,
-        az_bin,
-        bz_bin,
-        cz_bin,
-        &tau_bin,
-        joint_vars_bin,
+    // The binary relation's tables in **packed mask form** (the
+    // mask-major window): one u64 window truth-table word per suffix —
+    // the application writes bit-words instead of a `q × rows × 16 B`
+    // field table, and the window pass reads one word per (table,
+    // suffix). Falls back to the field-table path when any matrix
+    // references the (word-valued) x columns.
+    let v_win = magnetar_sumcheck::window_probe(s);
+    let bin_masks = (
+        rel.a_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
+        rel.b_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
+        rel.c_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
     );
+    let mask_mode = matches!(bin_masks, (Some(_), Some(_), Some(_)));
+    let spec_bin = if mask_mode {
+        // The mask-mode spec: empty dense (the masks carry the tables),
+        // the same terms and public factor.
+        SumcheckSpec {
+            num_vars: joint_vars_bin,
+            dense: vec![Vec::new(), Vec::new(), Vec::new()],
+            public: vec![Box::new(EqFactor::new(tau_bin.to_vec()))],
+            terms: vec![
+                Term {
+                    coeff: ONE,
+                    dense: vec![0, 1],
+                    public: vec![0],
+                },
+                Term {
+                    coeff: ONE,
+                    dense: vec![2],
+                    public: vec![0],
+                },
+            ],
+            claim: ZERO,
+        }
+    } else {
+        outer_spec(
+            &rel.a_bin,
+            &rel.b_bin,
+            &rel.c_bin,
+            apply_bits(&rel.a_bin).0,
+            apply_bits(&rel.b_bin).0,
+            apply_bits(&rel.c_bin).0,
+            &tau_bin,
+            joint_vars_bin,
+        )
+    };
     let spec_fld = outer_spec(
         &rel.a_fld,
         &rel.b_fld,
@@ -322,11 +355,25 @@ pub fn prove_virtual_spartan(
     // rounds come from ONE pass over the un-folded tables (selects, not
     // CLMUL) — messages bit-identical to the generic engine's. The fld
     // prover's tables are field-valued: generic engine.
-    let mut p_bin = SumcheckProver::with_dense_bits_auto_window(
-        &spec_bin,
-        order,
-        vec![az_bits, bz_bits, cz_bits],
-    );
+    let mut p_bin = if mask_mode {
+        let (m0, m1, m2) = bin_masks;
+        SumcheckProver::with_mask_window(
+            &spec_bin,
+            order,
+            vec![m0.expect("mask mode"), m1.expect("mask mode"), m2.expect("mask mode")],
+        )
+    } else {
+        let (az_bits, bz_bits, cz_bits) = (
+            apply_bits(&rel.a_bin).1,
+            apply_bits(&rel.b_bin).1,
+            apply_bits(&rel.c_bin).1,
+        );
+        SumcheckProver::with_dense_bits_auto_window(
+            &spec_bin,
+            order,
+            vec![az_bits, bz_bits, cz_bits],
+        )
+    };
     let mut p_fld = SumcheckProver::with_dense_bits(&spec_fld, order, vec![false; 3]);
     let mut outer_shared = Vec::with_capacity(s);
     let mut r_inst_ch = Vec::with_capacity(s);

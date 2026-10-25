@@ -44,6 +44,11 @@ pub struct SumcheckProver {
     /// batching): while active (rounds `0..v`), the messages come from the
     /// monomial state and the tables stay un-folded. See `window.rs`.
     window: Option<crate::window::WindowState>,
+    /// The **packed window masks** (the mask-major window mode): when
+    /// present, the three bit tables live as one `u64` window
+    /// truth-table word per suffix, and the window's fast-forward
+    /// contracts these instead of `dense`.
+    dense_masks: Option<Vec<Vec<u64>>>,
     coeffs: Vec<Gf128>,
     running: Gf128,
     order: BindOrder,
@@ -94,6 +99,92 @@ impl SumcheckProver {
         Self::with_dense_bits_opt_window(spec, order, bits, true)
     }
 
+    /// Construct in the **mask-major window mode**: the three bit tables
+    /// arrive packed (one `u64` window truth-table word per suffix, the
+    /// `apply_simd_bit_masks` layout) instead of as `2^ell` field-entry
+    /// dense tables. The spec's `dense` vectors may be empty; the window
+    /// state builds from the masks, and the fast-forward contracts the
+    /// masks into the post-window dense tables. Requires the windowable
+    /// shape (`eq·(D0·D1 + D2)`, high-bits-first) — panics otherwise.
+    pub fn with_mask_window(
+        spec: &SumcheckSpec,
+        order: BindOrder,
+        masks: Vec<Vec<u64>>,
+    ) -> Self {
+        spec.validate().expect("invalid sumcheck spec");
+        assert_eq!(masks.len(), 3, "the mask window needs exactly 3 tables");
+        assert!(
+            matches!(order, BindOrder::HighBitsFirst { .. }),
+            "the mask window binds high-bits-first"
+        );
+        let bits = vec![true; 3];
+        let public_tables: Vec<Vec<Gf128>> = spec.public.iter().map(|f| f.materialize()).collect();
+        let slab_profile: Vec<Option<SlabProfile>> = spec
+            .public
+            .iter()
+            .map(|f| {
+                let first = f.eq_slab_info(0);
+                match first {
+                    EqSlabInfo::NotSlab => None,
+                    _ => Some((0..f.num_vars()).map(|v| f.eq_slab_info(v)).collect()),
+                }
+            })
+            .collect();
+        let window = Some(
+            Self::try_window_masks(spec, order, &masks, &public_tables)
+                .expect("the mask window requires the windowable shape"),
+        );
+        SumcheckProver {
+            spec_terms: spec.terms.clone(),
+            dense: vec![Vec::new(); 3],
+            dense_masks: Some(masks),
+            public_tables,
+            dense_bits: bits,
+            slab_profile,
+            window,
+            coeffs: spec.terms.iter().map(|t| t.coeff).collect(),
+            running: spec.claim,
+            order,
+            num_vars: spec.num_vars,
+            round: 0,
+            challenges: Vec::new(),
+        }
+    }
+
+    /// The mask-mode window build: identical shape checks to
+    /// [`Self::try_window`], then the packed pass.
+    fn try_window_masks(
+        spec: &SumcheckSpec,
+        order: BindOrder,
+        masks: &[Vec<u64>],
+        public_tables: &[Vec<Gf128>],
+    ) -> Option<crate::window::WindowState> {
+        let high = match order {
+            BindOrder::HighBitsFirst { high } => high,
+            _ => return None,
+        };
+        let v = crate::window::window_size(high);
+        if v == 0 || spec.num_vars < 2 {
+            return None;
+        }
+        let shape = spec.dense.is_empty()
+            && spec.terms.len() == 2
+            && spec.terms[0].dense == vec![0, 1]
+            && spec.terms[0].public == vec![0]
+            && spec.terms[1].dense == vec![2]
+            && spec.terms[1].public == vec![0]
+            && spec.public.len() == 1
+            && spec.public[0].num_vars() == spec.num_vars;
+        if !shape {
+            return None;
+        }
+        let tau = spec.public[0].eq_point()?;
+        debug_assert_eq!(tau.len(), spec.num_vars);
+        let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
+        w.run_pass_masks(&masks[0], &masks[1], &masks[2], &public_tables[0], &tau);
+        Some(w)
+    }
+
     fn with_dense_bits_opt_window(
         spec: &SumcheckSpec,
         order: BindOrder,
@@ -123,6 +214,7 @@ impl SumcheckProver {
         SumcheckProver {
             spec_terms: spec.terms.clone(),
             dense: spec.dense.clone(),
+            dense_masks: None,
             public_tables,
             dense_bits: bits,
             slab_profile,
@@ -668,12 +760,22 @@ impl SumcheckProver {
     fn finish_window(&mut self) {
         let w = self.window.take().expect("window active");
         let eq_r: Vec<Gf128> = w.eq_r().to_vec();
-        // 1. The dense tables: bound[x'] = Σ_m eq(r_<v, m)·f[m·stride + x']
-        //    — a select per (m, x') since the entries are bits.
-        for k in 0..self.dense.len() {
-            let old = std::mem::take(&mut self.dense[k]);
-            self.dense[k] = crate::window::contract_bit_table(&old, &eq_r, w.stride, w.v);
-            self.dense_bits[k] = false;
+        // 1. The dense tables: bound[x'] = the eq(r_<v)-weighted window
+        //    contraction — a select per (m, x') since the entries are
+        //    bits. In the mask-major mode the packed masks contract
+        //    instead (one word per suffix).
+        if let Some(masks) = self.dense_masks.take() {
+            debug_assert_eq!(self.dense.len(), 3);
+            for k in 0..3 {
+                self.dense[k] = crate::window::contract_bit_masks(&masks[k], &eq_r, w.stride, w.v);
+                self.dense_bits[k] = false;
+            }
+        } else {
+            for k in 0..self.dense.len() {
+                let old = std::mem::take(&mut self.dense[k]);
+                self.dense[k] = crate::window::contract_bit_table(&old, &eq_r, w.stride, w.v);
+                self.dense_bits[k] = false;
+            }
         }
         // 2. The eq factor: v slab gathers + the combined delta
         //    (exactly what v rounds of fold_msg's slab path do).
