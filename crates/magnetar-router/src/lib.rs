@@ -880,6 +880,154 @@ mod tests {
         assert_eq!(sparse.terminal, join.terminal);
     }
 
+    /// The **generic (non-binary) tensor** path of the join prover must
+    /// also emit byte-identical round messages to the sparse prover —
+    /// the binary fast path's regression suite does not reach it, so
+    /// this test randomizes the tensor's nonzero coefficients.
+    #[test]
+    fn join_matches_sparse_prover_generic_coefs() {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let w = 8usize;
+        let (values0, o_vars, u_vars, h_vars, a_vars) = build_store_tensor(w);
+        // Scale every nonzero by a random field element.
+        let values: Vec<Gf128> = values0
+            .iter()
+            .map(|&v| if v == ZERO { v } else { mul(v, rg(&mut rng)) })
+            .collect();
+        let j_vars = 3usize;
+        let layout = RoutingLayout {
+            o_vars,
+            j_vars,
+            u_vars,
+            h_vars,
+            a_vars,
+        };
+        let jv = layout.joint_vars();
+        let [o_off, j_off, u_off, h_off, a_off] = layout.offsets();
+        let cycles = 1usize << j_vars;
+        let x_table: Vec<Gf128> = (0..(1usize << u_vars) * cycles)
+            .map(|_| Gf128(rng.random::<u64>() as u128 & 1))
+            .collect();
+        let mut q_st = vec![ZERO; 4 * cycles];
+        let mut off_bits = vec![ZERO; 3 * cycles];
+        for j in 0..cycles {
+            let hsel = rng.random_range(0..5usize);
+            if hsel < 4 {
+                q_st[hsel + j * 4] = ONE;
+            }
+            let a = rng.random_range(0..8usize);
+            off_bits[j * 3] = Gf128((a & 1) as u128);
+            off_bits[1 + j * 3] = Gf128(((a >> 1) & 1) as u128);
+            off_bits[2 + j * 3] = Gf128(((a >> 2) & 1) as u128);
+        }
+        let r_o: Vec<Gf128> = (0..o_vars).map(|_| rg(&mut rng)).collect();
+        let r_j: Vec<Gf128> = (0..j_vars).map(|_| rg(&mut rng)).collect();
+        let claim = {
+            let mut acc = ZERO;
+            for j in 0..cycles {
+                for o in 0..(1usize << o_vars) {
+                    for u in 0..(1usize << u_vars) {
+                        for h in 0..(1usize << h_vars) {
+                            for a in 0..(1usize << a_vars) {
+                                let rv = values[o
+                                    | (u << o_vars)
+                                    | (h << (o_vars + u_vars))
+                                    | (a << (o_vars + u_vars + h_vars))];
+                                if rv == ZERO {
+                                    continue;
+                                }
+                                let mut s = mul(mul(eq_mle(&r_o, o), eq_mle(&r_j, j)), rv);
+                                s = mul(s, x_table[u + j * (1usize << u_vars)]);
+                                s = mul(s, q_st[h + j * 4]);
+                                for k in 0..3 {
+                                    let ak = (a >> k) & 1;
+                                    let ahat = off_bits[k + j * 3];
+                                    s = mul(s, ONE + Gf128(ak as u128) + ahat);
+                                }
+                                acc += s;
+                            }
+                        }
+                    }
+                }
+            }
+            acc
+        };
+        let x_fac = PaddedDense::new(
+            x_table.clone(),
+            {
+                let mut a: Vec<usize> = (u_off..u_off + u_vars).collect();
+                a.extend(j_off..j_off + j_vars);
+                a
+            },
+            jv,
+        );
+        let q_fac = PaddedDense::new(
+            q_st.clone(),
+            {
+                let mut a: Vec<usize> = (h_off..h_off + h_vars).collect();
+                a.extend(j_off..j_off + j_vars);
+                a
+            },
+            jv,
+        );
+        let link_facs: Vec<PaddedDense> = (0..3)
+            .map(|k| {
+                let mut t = vec![ZERO; 2 * cycles];
+                for j in 0..cycles {
+                    let ahat = off_bits[k + j * 3];
+                    t[2 * j] = ONE + ahat;
+                    t[2 * j + 1] = ahat;
+                }
+                let mut a = vec![a_off + k];
+                a.extend(j_off..j_off + j_vars);
+                PaddedDense::new(t, a, jv)
+            })
+            .collect();
+        let r_pub = PaddedTableFactor::new(
+            values.clone(),
+            {
+                let mut act: Vec<usize> = (0..o_vars).map(|i| o_off + i).collect();
+                act.extend(u_off..u_off + u_vars);
+                act.extend(h_off..h_off + h_vars);
+                act.extend(a_off..a_off + a_vars);
+                act
+            },
+            jv,
+        );
+        let dense = {
+            let mut d = vec![x_fac, q_fac];
+            d.extend(link_facs);
+            d
+        };
+        let mut t1 = Transcript::new("xcheckg", &[b"t"]);
+        let sparse = prove_routing(&layout, claim, &r_o, &r_j, &r_pub, &dense, 1, &mut t1);
+        let off_bools: Vec<Vec<bool>> = (0..3)
+            .map(|k| (0..cycles).map(|j| off_bits[k + j * 3] == ONE).collect())
+            .collect();
+        let tensor = RoutingTensor::from_parts(values, o_vars, u_vars, h_vars, a_vars);
+        let sels = vec![SelCol {
+            table: q_st.clone(),
+            h_off: 0,
+            h_vars,
+        }];
+        let wit = JoinWitness {
+            x: x_table.clone(),
+            selectors: sels,
+            offset_bits: off_bools,
+        };
+        let mut t2 = Transcript::new("xcheckg", &[b"t"]);
+        let join = prove_routing_join(&layout, claim, &r_o, &r_j, &tensor, &wit, &mut t2);
+        assert_eq!(sparse.rounds.len(), join.rounds.len());
+        for (i, (a, b)) in sparse.rounds.iter().zip(join.rounds.iter()).enumerate() {
+            assert_eq!(a, b, "round {i} differs (generic coefs)");
+        }
+        assert_eq!(sparse.x_value, join.x_value);
+        assert_eq!(sparse.q_values, join.q_values);
+        assert_eq!(sparse.offset_values, join.offset_values);
+        assert_eq!(sparse.terminal, join.terminal);
+    }
+
     /// eq(r, x) for a Boolean x, as a field element.
     fn eq_mle(r: &[Gf128], x: usize) -> Gf128 {
         let mut v = ONE;

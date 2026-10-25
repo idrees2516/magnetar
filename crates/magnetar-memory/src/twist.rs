@@ -266,7 +266,7 @@ fn run_port_sumcheck(
 fn run_reconstruction(
     wfa_comps: &[AddressComponent],
     wfa_comp_addrs: &[Vec<usize>],
-    inc: &[Gf128],
+    inc_packed: &[u128],
     val_claim: Gf128,
     r_joint: &[Gf128],
     a: usize,
@@ -307,15 +307,23 @@ fn run_reconstruction(
             acc
         })
         .collect();
-    // inc row at r_v: fold the ell low (bit) variables.
-    let mut inc_row = inc.to_vec();
-    for b in 0..ell {
-        inc_row = {
-            let mut v = inc_row;
-            magnetar_field::par_bind_var(&mut v, 0, r_v[b]);
-            v
-        };
-    }
+    // inc row at r_v: the eq(r_v, ·)-weighted select over the packed
+    // increment words — one select per set bit per cycle (the old path
+    // cloned and folded the whole `T·2^ell` table, a CLMUL pass per
+    // value variable).
+    let eq_rv = magnetar_field::EqBits::build(&r_v).values;
+    let inc_row: Vec<Gf128> = inc_packed
+        .iter()
+        .map(|&word| {
+            let mut acc = magnetar_field::ZERO;
+            let mut w = word;
+            while w != 0 {
+                acc += eq_rv[w.trailing_zeros() as usize];
+                w &= w - 1;
+            }
+            acc
+        })
+        .collect();
     debug_assert_eq!(inc_row.len(), 1usize << n);
     let spec = SumcheckSpec {
         num_vars: n,
@@ -394,7 +402,6 @@ pub fn prove_twist(
         let run = prove_port_linear(
             inst,
             &shared,
-            &wit.inc,
             &wit.ports[s],
             inst.rv_claims[s],
             false,
@@ -421,7 +428,7 @@ pub fn prove_twist(
         let recon = run_reconstruction(
             &wit.ports[p],
             &port_addrs[p],
-            &wit.inc,
+            &shared.inc_packed,
             run.val_claim,
             &run.r_joint,
             a,
@@ -446,7 +453,6 @@ pub fn prove_twist(
     let write_run = prove_port_linear(
         inst,
         &shared,
-        &wit.inc,
         &wit.ports[p],
         inst.wv_claim,
         true,
@@ -471,7 +477,7 @@ pub fn prove_twist(
     let write_recon = run_reconstruction(
         wcomps,
         &port_addrs[p],
-        &wit.inc,
+        &shared.inc_packed,
         write_run.val_claim,
         &write_run.r_joint,
         a,
@@ -1041,7 +1047,6 @@ mod tests {
                         r_cycle: r_cycle.clone(),
                     },
                     &shared,
-                    &inc,
                     &wcomps,
                     claim,
                     inclusive,

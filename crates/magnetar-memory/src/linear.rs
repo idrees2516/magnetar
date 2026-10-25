@@ -107,8 +107,11 @@ pub fn addr_bits(comps: &[AddressComponent]) -> Vec<usize> {
 
 /// The shared per-instance precomputation of one BinaryTwist instance:
 /// the value-pre-folded increments and initial memory, the write address
-/// trace (every port's `Val` references the same write address), and the
-/// cycle-point eq table.
+/// trace (every port's `Val` references the same write address), the
+/// cycle-point eq table, and the **packed increment words** — one per
+/// cycle, bit `o` = `Inc(u, o)` — the select-fold representation the
+/// o-rounds read (the increments are bits, so every eq-weighted fold is
+/// a select over the packed word, never a `T·2^ell`-table CLMUL pass).
 pub struct TwistShared {
     /// `INCv(j) = Înc(r_val, j)` — the increments value-pre-folded.
     pub inc_v: Vec<Gf128>,
@@ -118,12 +121,20 @@ pub struct TwistShared {
     pub w_addr: Vec<usize>,
     /// `eq(r_cycle, j)`.
     pub eq_c: Vec<Gf128>,
+    /// `W(u) = Σ_o Inc(u, o)·2^o` — the packed per-cycle increment bits
+    /// (`ell ≤ 128`).
+    pub inc_packed: Vec<u128>,
 }
 
 impl TwistShared {
     pub fn new(inst: &TwistInstance, w_addr: Vec<usize>, inc: &[Gf128]) -> Self {
         let (a, ell, n) = (inst.a, inst.ell, inst.n);
         let cycles = 1usize << n;
+        let bits = 1usize << ell;
+        assert!(
+            ell <= 128,
+            "the packed-inc select-fold packs ell <= 128 value bits"
+        );
         let mut inc_v = inc.to_vec();
         // inc layout: bit low (ell), cycle high (n) — fold the ell low
         // bits at r_val (the fold position stays 0 as bits slide down).
@@ -138,11 +149,28 @@ impl TwistShared {
         }
         debug_assert_eq!(inc_v.len(), cycles);
         debug_assert_eq!(m0_v.len(), 1 << a);
+        // The packed per-cycle increment words — one pass, bit tests only.
+        let mut inc_packed = vec![0u128; cycles];
+        for u in 0..cycles {
+            let mut w = 0u128;
+            for o in 0..bits {
+                let v = inc[o | (u << ell)];
+                debug_assert!(
+                    v == ZERO || v == ONE,
+                    "the twist increments must be bit-valued"
+                );
+                if v == ONE {
+                    w |= 1u128 << o;
+                }
+            }
+            inc_packed[u] = w;
+        }
         TwistShared {
             inc_v,
             m0_v,
             w_addr,
             eq_c: magnetar_field::EqBits::build(&inst.r_cycle).values,
+            inc_packed,
         }
     }
 }
@@ -175,7 +203,6 @@ pub fn suffix_sums(v: &[Gf128], inclusive: bool) -> Vec<Gf128> {
 pub fn prove_port_linear(
     inst: &TwistInstance,
     shared: &TwistShared,
-    inc: &[Gf128],
     read_comps: &[AddressComponent],
     claim: Gf128,
     inclusive: bool,
@@ -297,52 +324,72 @@ pub fn prove_port_linear(
         .map(|(&e, &r)| mul(e, r))
         .collect();
     let sj: Gf128 = w.iter().copied().sum();
-    // M0k = M̂0(r_k, o): fold the full initial memory's address part.
-    let mut m0k = inst.m0.clone();
+    // M0k = M̂0(r_k, o): fold the full initial memory's address part —
+    // the value row the o-rounds weight per round.
+    let mut m0v = inst.m0.clone();
     for &c in &challenges[..a] {
-        par_bind_var(&mut m0k, 0, c);
+        par_bind_var(&mut m0v, 0, c);
     }
-    debug_assert_eq!(m0k.len(), 1 << ell);
+    debug_assert_eq!(m0v.len(), 1 << ell);
     // LTW(j') = Σ_j LT(j',j)·W(j) — the suffix sums of W.
     let ltw = suffix_sums(&w, inclusive);
-    // The increment columns, o-folded at the round challenges.
-    let mut inc_b = inc.to_vec();
-    let mut eqv = ONE;
 
-    // ---- o-rounds: fold the value dimension. ----
+    // ---- o-rounds: the packed-inc select-fold. ----
+    // The increment table is **bit-valued**, so instead of folding the
+    // `T·2^ell` table (a CLMUL pass per round), the eq-weighted sums are
+    // taken against the per-value-bit **masked dots**
+    // `D_o = Σ_{u: Inc bit o set} P[u]` (P = WFAEQ∘LTW, constant across
+    // the whole o-phase) — one select pass per port run. Every round's
+    // message is then `O(2^ell)` field ops: the round weight
+    // `wt[o] = hist[o]·eq_rest[o >> (b+1)]` (the challenge fold history
+    // times the r_val suffix table) multiplies `D_o` and the initial
+    // memory row `M0v[o]` — the per-cycle `I0/I1` tables and the
+    // `T·2^rem` folds are gone. The messages are byte-identical (the
+    // same polynomial, regrouped; addition is order-free in char 2).
     let _pt_o = Pt::new("port-o-rounds");
+    let bits = 1usize << ell;
+    let mut d_o = vec![ZERO; bits];
+    {
+        // P[u] = WFAEQ[u]·LTW[u] — the write-address × less-than weight.
+        for u in 0..cycles {
+            let p = mul(wfaeq[u], ltw[u]);
+            if p == ZERO {
+                continue;
+            }
+            let mut word = shared.inc_packed[u];
+            while word != 0 {
+                d_o[word.trailing_zeros() as usize] += p;
+                word &= word - 1;
+            }
+        }
+    }
+    // hist[o] = Π_{i<b} eq(d_i, o_i) — the o-fold challenge history.
+    let mut hist = vec![ONE; bits];
+    let mut eqv = ONE;
     for b in 0..ell {
-        let rem = ell - b; // remaining o variables (incl. the round's)
         let eq_rest = magnetar_field::EqBits::build(&inst.r_val[b + 1..]).values;
-        // s0/s1: the eq-sums of m0k at o_b = 0/1.
+        // The weighted sums: s0/s1 (the M0 row at o_b = 0/1) and the
+        // cval/dval increments parts (o_b = 0 / both halves).
         let mut s0 = ZERO;
         let mut s1 = ZERO;
-        for (i, &e) in eq_rest.iter().enumerate() {
-            s0 += mul(e, m0k[i << 1]);
-            s1 += mul(e, m0k[(i << 1) | 1]);
-        }
-        // I0/I1: the eq-sums of inc_b's o_b = 0/1 slices per cycle.
-        let mut i0 = vec![ZERO; cycles];
-        let mut i1 = vec![ZERO; cycles];
-        for u in 0..cycles {
-            let base = u << rem;
-            let mut a0 = ZERO;
-            let mut a1 = ZERO;
-            for (i, &e) in eq_rest.iter().enumerate() {
-                a0 += mul(e, inc_b[base | (i << 1)]);
-                a1 += mul(e, inc_b[base | (i << 1) | 1]);
+        let mut cpart = ZERO;
+        let mut dpart = ZERO;
+        for o in 0..bits {
+            let wt = mul(hist[o], eq_rest[o >> (b + 1)]);
+            let mv = mul(wt, m0v[o]);
+            let dv = mul(wt, d_o[o]);
+            if (o >> b) & 1 == 0 {
+                s0 += mv;
+                cpart += dv;
+            } else {
+                s1 += mv;
             }
-            i0[u] = a0;
-            i1[u] = a1;
+            dpart += dv;
         }
         // C = SJ·s0 + Σ WI·LTW·I0 (the o_b=0 value); D = SJ·(s0+s1) +
         // Σ WI·LTW·(I0+I1) (the MLE's X coefficient — value(0)+value(1)).
-        let mut cval = mul(sj, s0);
-        let mut dval = mul(sj, s0 + s1);
-        for u in 0..cycles {
-            cval += mul(mul(wfaeq[u], ltw[u]), i0[u]);
-            dval += mul(mul(wfaeq[u], ltw[u]), i0[u] + i1[u]);
-        }
+        let cval = mul(sj, s0) + cpart;
+        let dval = mul(sj, s0 + s1) + dpart;
         let a_const = ONE + inst.r_val[b];
         let coeffs = [
             mul(eqv, mul(a_const, cval)),
@@ -354,21 +401,44 @@ pub fn prove_port_linear(
         rounds.push(coeffs.to_vec());
         challenges.push(d);
         eqv = mul(eqv, ONE + inst.r_val[b] + d);
-        bind_var(&mut m0k, 0, d);
-        par_bind_var(&mut inc_b, 0, d);
+        let (f0, f1) = (ONE + d, d);
+        for o in 0..bits {
+            hist[o] = mul(hist[o], if (o >> b) & 1 == 1 { f1 } else { f0 });
+        }
     }
 
     drop(_pt_o);
+    // ---- the post-o state. ----
+    // eqf = eq(r_val, r_v); m0s = M̂0(r_k, r_v) = Σ_o hist[o]·M0v[o];
+    // inc_final(u) = Σ_{o: packed bit} hist[o] — the fully o-folded
+    // increment row, materialized per cycle by select over the packed
+    // word (the j-rounds' CUM scan consumes it).
+    let eqf = eqv;
+    let mut m0s = ZERO;
+    for o in 0..bits {
+        m0s += mul(hist[o], m0v[o]);
+    }
+    let inc_final: Vec<Gf128> = shared
+        .inc_packed
+        .iter()
+        .map(|&word| {
+            let mut acc = ZERO;
+            let mut w = word;
+            while w != 0 {
+                acc += hist[w.trailing_zeros() as usize];
+                w &= w - 1;
+            }
+            acc
+        })
+        .collect();
     // ---- j-rounds: everything is a T-vector. ----
     let _pt_j = Pt::new("port-j-rounds");
-    let eqf = eqv; // = eq(r_val, r_v)
-    let m0s = m0k[0]; // M̂0(r_k, r_v)
-                      // CUM(j) = M̂0(r_k,r_v) + Σ_{j'<j(≤)} WFAw(j')·Înc(r_v, j').
+    // CUM(j) = M̂0(r_k,r_v) + Σ_{j'<j(≤)} WFAw(j')·Înc(r_v, j').
     let mut cum = vec![ZERO; cycles];
     {
         let mut run = ZERO;
         for u in 0..cycles {
-            let wiv = mul(wfaeq[u], inc_b[u]);
+            let wiv = mul(wfaeq[u], inc_final[u]);
             if inclusive {
                 run += wiv;
             }

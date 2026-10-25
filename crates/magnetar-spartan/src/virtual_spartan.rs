@@ -357,6 +357,7 @@ pub fn prove_virtual_spartan(
     // rounds come from ONE pass over the un-folded tables (selects, not
     // CLMUL) — messages bit-identical to the generic engine's. The fld
     // prover's tables are field-valued: generic engine.
+    let _pt_win = _PtR::new("vs-win-build");
     let mut p_bin = if mask_mode {
         let (m0, m1, m2) = bin_masks;
         SumcheckProver::with_mask_window(
@@ -381,13 +382,16 @@ pub fn prove_virtual_spartan(
         )
     };
     let mut p_fld = SumcheckProver::with_dense_bits(&spec_fld, order, vec![false; 3]);
+    drop(_pt_win);
     let mut outer_shared = Vec::with_capacity(s);
     let mut r_inst_ch = Vec::with_capacity(s);
+    let _pt_shared = _PtR::new("vs-shared-rounds");
     for i in 0..s {
         let (r, msgs) = shared_round(&mut p_bin, &mut p_fld, t, &format!("vs-out-shared-{i}"));
         r_inst_ch.push(r);
         outer_shared.push(msgs);
     }
+    drop(_pt_shared);
     let row_vars_outer = row_vars_bin.max(row_vars_fld);
     let mut outer_bin = Vec::with_capacity(row_vars_bin);
     let mut outer_fld = Vec::with_capacity(row_vars_fld);
@@ -395,6 +399,7 @@ pub fn prove_virtual_spartan(
     let mut row_ch_fld = Vec::new();
     // Row rounds with separate cubes: all of the bin relation's row rounds
     // first (one message + challenge each), then all of the fld relation's.
+    let _pt_rb = _PtR::new("vs-row-rounds-bin");
     for i in 0..row_vars_bin {
         let label = format!("vs-out-rowbin-{i}");
         let m1 = p_bin.message();
@@ -408,6 +413,8 @@ pub fn prove_virtual_spartan(
         row_ch_bin.push(r1);
         outer_bin.push(m1.0);
     }
+    drop(_pt_rb);
+    let _pt_rf = _PtR::new("vs-row-rounds-fld");
     for i in 0..row_vars_fld {
         let label = format!("vs-out-rowfld-{i}");
         let m2 = p_fld.message();
@@ -421,6 +428,7 @@ pub fn prove_virtual_spartan(
         row_ch_fld.push(r2);
         outer_fld.push(m2.0);
     }
+    drop(_pt_rf);
     let _ = row_vars_outer;
     drop(_pt_r);
     let (claims_bin, _) = p_bin.finish();

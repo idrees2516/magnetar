@@ -237,12 +237,47 @@ impl WindowState {
         let eq_base = m_star * stride;
         let eq_hi_inv = inv(eq_hi);
 
-        let chunk = if stride >= 2 * magnetar_field::PAR_THRESHOLD {
-            (stride / (rayon::current_num_threads().max(1) * 4))
-                .clamp(magnetar_field::PAR_THRESHOLD, stride)
+        // The dense-mask complement form. The pair convolution is
+        // GF(2)-bilinear in the two masks, so with `a`/`b` the SPARSER of
+        // `(m0, ~m0)`/`(m1, ~m1)` and `u0`/`u1` the complement flags:
+        // `conv(m0, m1) = conv(a, b) + u0·Σ_{i1∈b} GSUM[i1]
+        //                  + u1·Σ_{i0∈a} GCOL[i0] + u0·u1·GTOTAL`
+        // where `GSUM[i1]` XORs the bitmaps over ALL i0 (GCOL transposed,
+        // GTOTAL over both) — precomputed once. The pair count drops from
+        // `p0·p1` to `min(p0, 64−p0)·min(p1, 64−p1)`: a fully dense
+        // window sub-cube (the structured tables of the real circuits)
+        // costs ~a dozen word XORs instead of 4096 pair iterations.
+        let words = n_ab.div_ceil(64).max(1);
+        // The valid window-pattern bits (v ≤ 6, but v < 6 masks leave the
+        // high bits of the u64 clear — the complements must stay in range).
+        let valid = if n_c == 64 {
+            u64::MAX
         } else {
-            stride
+            (1u64 << n_c as u32) - 1
         };
+        let mut gsum = vec![[0u64; 16]; n_c];
+        let mut gcol = vec![[0u64; 16]; n_c];
+        for i0 in 0..n_c {
+            for i1 in 0..n_c {
+                let idx = idx_table[i0 * n_c + i1] as usize;
+                gsum[i1][idx >> 6] ^= 1u64 << (idx & 63);
+                gcol[i0][idx >> 6] ^= 1u64 << (idx & 63);
+            }
+        }
+        let mut gtotal = [0u64; 16];
+        for g in &gsum {
+            for (t, &w) in g.iter().enumerate().take(words) {
+                gtotal[t] ^= w;
+            }
+        }
+
+        // Parallel at the right granularity: small strides still spread
+        // across cores (the previous PAR_THRESHOLD floor serialized the
+        // 2^11-suffix passes entirely); tiny strides stay sequential.
+        let chunk = (stride / (rayon::current_num_threads().max(1) * 4))
+            .max(256)
+            .min(stride)
+            .max(1);
         let mut acc: (Vec<Gf128>, Vec<Gf128>) = (0..stride)
             .into_par_iter()
             .chunks(chunk)
@@ -261,21 +296,57 @@ impl WindowState {
                     if w == ZERO {
                         continue;
                     }
-                    // The convolution D0 ⊗ D1 into the 3^v monomial set.
-                    let mut prod = [0u64; 12];
-                    let mut s0 = m0;
-                    while s0 != 0 {
-                        let i0 = s0.trailing_zeros() as usize;
-                        s0 &= s0 - 1;
-                        let mut s1 = m1;
-                        while s1 != 0 {
-                            let i1 = s1.trailing_zeros() as usize;
-                            s1 &= s1 - 1;
+                    // The convolution D0 ⊗ D1 into the 3^v monomial set —
+                    // the complement form (see above).
+                    let pc0 = m0.count_ones();
+                    let pc1 = m1.count_ones();
+                    let u0 = pc0 as usize > n_c / 2;
+                    let u1 = pc1 as usize > n_c / 2;
+                    let a = if u0 { m0 ^ valid } else { m0 };
+                    let b = if u1 { m1 ^ valid } else { m1 };
+                    let mut prod = [0u64; 16];
+                    let mut sa = a;
+                    while sa != 0 {
+                        let i0 = sa.trailing_zeros() as usize;
+                        sa &= sa - 1;
+                        let mut sb = b;
+                        while sb != 0 {
+                            let i1 = sb.trailing_zeros() as usize;
+                            sb &= sb - 1;
                             let idx = idx_table[i0 * n_c + i1] as usize;
                             prod[idx >> 6] ^= 1u64 << (idx & 63);
                         }
                     }
-                    for (wi, word) in prod.iter().enumerate() {
+                    let mut corr = [0u64; 16];
+                    if u0 {
+                        let mut sb = b;
+                        while sb != 0 {
+                            let g = &gsum[sb.trailing_zeros() as usize];
+                            for (t, &gw) in g.iter().enumerate().take(words) {
+                                corr[t] ^= gw;
+                            }
+                            sb &= sb - 1;
+                        }
+                    }
+                    if u1 {
+                        let mut sa2 = a;
+                        while sa2 != 0 {
+                            let g = &gcol[sa2.trailing_zeros() as usize];
+                            for (t, &gw) in g.iter().enumerate().take(words) {
+                                corr[t] ^= gw;
+                            }
+                            sa2 &= sa2 - 1;
+                        }
+                    }
+                    if u0 && u1 {
+                        for (t, &gw) in gtotal.iter().enumerate().take(words) {
+                            corr[t] ^= gw;
+                        }
+                    }
+                    for (t, &cw) in corr.iter().enumerate().take(words) {
+                        prod[t] ^= cw;
+                    }
+                    for (wi, word) in prod.iter().enumerate().take(words) {
                         let mut s = *word;
                         while s != 0 {
                             let idx = (wi << 6) + s.trailing_zeros() as usize;
