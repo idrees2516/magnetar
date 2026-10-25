@@ -202,24 +202,26 @@ fn outer_spec(
     }
 }
 
-/// Prove Virtual Spartan. `joint_z` is the joint assignment
-/// `Z(u, y) = z_u[y]` (row-major, `y` low bits); `q` the SIMD count;
-/// `z_bit_cols` marks, per column of `z`, whether the entries are
-/// bit-valued (`{0, 1}` — the w-half and the 1-column; the public x
-/// columns hold packed words). Bit columns enable the select-based
-/// application and the small-value message paths.
+/// Prove Virtual Spartan over the **packed** witness: `w_packed` is
+/// the bit-packed w-half (128 witness columns per `u128`, row-major
+/// per instance), `x_cols` the public x columns (shared across every
+/// instance). The packing is the paper's instance-batching discipline:
+/// the eq(r_inst)-fold of the bit half is a select-XOR pass over the
+/// packed words, the x-fold is the identity (Σ_u eq = 1), and the
+/// matrices' shared x-part is applied once.
 ///
 /// Returns the proof and the per-segment claims.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_virtual_spartan(
     rel: &DualRelation,
     layout: &SegmentLayout,
-    joint_z: &[Gf128],
+    w_packed: &[u128],
+    x_cols: &[Gf128],
     q: usize,
-    z_bit_cols: &[bool],
     t: &mut Transcript,
 ) -> (VirtualSpartanProof, Vec<SegmentClaim>) {
     let m = rel.m;
+    let w_cols = m / 2;
     let s = q.trailing_zeros() as usize; // instance vars
                                          // The outer sum-checks run over (instance ‖ constraint-row), each
                                          // relation over its OWN padded row count (only q and m are shared,
@@ -232,7 +234,8 @@ pub fn prove_virtual_spartan(
     let row_vars_fld = rows_fld.trailing_zeros() as usize;
     let joint_vars_bin = s + row_vars_bin;
     let joint_vars_fld = s + row_vars_fld;
-    debug_assert_eq!(joint_z.len(), q * m);
+    let w128 = (w_cols + 127) / 128;
+    debug_assert_eq!(w_packed.len(), q * w128);
     // Sample the two τ points (per-relation joint spaces).
     let tau_bin = t.challenge_field_vec("vs-tau-bin", joint_vars_bin);
     let tau_fld = t.challenge_field_vec("vs-tau-fld", joint_vars_fld);
@@ -273,17 +276,15 @@ pub fn prove_virtual_spartan(
         }
     }
     let _pt_apply = _Pt(std::time::Instant::now());
-    // Select-based application over the bit columns (small-value setting):
-    // every `entry · z_c` on a bit column is `entry` or `0` — no CLMUL. A
-    // table is bit-valued exactly when ITS matrix is binary and all its
-    // referenced columns are bits (checked per matrix, never assumed).
-    let apply_bits = |mat: &crate::SparseMatrix| -> (Vec<Gf128>, bool) {
-        if z_bit_cols.iter().any(|&b| b) {
-            mat.apply_simd_bits(joint_z, q, z_bit_cols)
-        } else {
-            (mat.apply_simd(joint_z, q), false)
-        }
-    };
+    // Packed application (small-value setting): every `entry · z_c` on a
+    // bit column is `entry` or `0` — a select, no CLMUL — and the shared
+    // x columns contribute once, not per instance. A table is bit-valued
+    // exactly when ITS matrix is binary and all its referenced columns
+    // are bits (checked per matrix, never assumed).
+    let apply_bits =
+        |mat: &crate::SparseMatrix| -> (Vec<Gf128>, bool) {
+            mat.apply_simd_packed(w_packed, x_cols, q, w_cols)
+        };
     let (az_bin, az_bits) = apply_bits(&rel.a_bin);
     let (bz_bin, bz_bits) = apply_bits(&rel.b_bin);
     let (cz_bin, cz_bits) = apply_bits(&rel.c_bin);
@@ -405,11 +406,21 @@ pub fn prove_virtual_spartan(
     // Inner sum-check over the COLUMN variables (log m).
     let row_vars = m.trailing_zeros() as usize;
     let m_combo = build_m_combo(rel, &alphas, &r_row_bin, &r_row_fld);
-    let z_fold = fold_joint_at_instances(joint_z, q, m, &r_inst, z_bit_cols);
+    // The eq(r_inst)-folded z in ONE packed select pass over the bit
+    // words (the paper's instance-batching discipline): the w-half folds
+    // by XOR of eq[u] on set bits — no CLMUL, no per-column gather — and
+    // the x-half is IDENTICAL across instances, so Σ_u eq[u]·x = x·(Σ eq)
+    // = x: a copy. The `1` column folds to Σ eq = 1.
+    let wf = fold_packed_w(w_packed, q, w_cols, &r_inst);
+    let mut z_fold = Vec::with_capacity(m);
+    z_fold.extend_from_slice(&wf);
+    z_fold.push(ONE);
+    z_fold.extend_from_slice(x_cols);
+    debug_assert_eq!(z_fold.len(), m);
     let inner_spec = SumcheckSpec {
         num_vars: row_vars,
-        dense: vec![z_fold.clone()],
-        public: vec![Box::new(TableFactor::new(m_combo.clone()))],
+        dense: vec![z_fold],
+        public: vec![Box::new(TableFactor::new(m_combo))],
         terms: vec![Term {
             coeff: ONE,
             dense: vec![0],
@@ -436,51 +447,25 @@ pub fn prove_virtual_spartan(
     t.absorb_field("vs-vz", &[v_z]);
     // Equation (1) + segment split. Column point r_col (increasing order).
     let r_col: Vec<Gf128> = r_col_ch;
-    let msb = r_col[row_vars - 1];
     let r_low: Vec<Gf128> = r_col[..row_vars - 1].to_vec();
-    // Witness-half fold at r_low, split over segments.
-    let w_half: Vec<Gf128> = {
-        // The w half occupies columns [0, m/2): the joint table restricted.
-        let half = m / 2;
-        let eq_inst = magnetar_field::EqBits::build(&r_inst).values;
-        let mut wf = vec![ZERO; half];
-        for y in 0..half {
-            let mut acc = ZERO;
-            for u in 0..q {
-                acc += mul(eq_inst[u], joint_z[u * m + y]);
-            }
-            wf[y] = acc;
-        }
-        wf
-    };
     // Per-segment values: v_i = Ŵ_f evaluated at (r_local of segment i).
-    // The instance fold of a bit witness is a select-dot per column —
-    // no CLMUL (small-value discipline).
-    let eq_inst = magnetar_field::EqBits::build(&r_inst).values;
+    // Every segment's eq(r_inst)-folded table is the packed fold's slice
+    // at the segment's column range (segments tile the w-half at aligned
+    // offsets) — the strided per-column dots are gone; only the small
+    // MLE evaluation at r_local remains.
     let mut segment_values = Vec::with_capacity(layout.len());
     let mut segment_claims = Vec::with_capacity(layout.len());
     for i in 0..layout.len() {
         let lv = layout.local_vars(i);
         let base = layout.offsets[i];
+        let len = 1usize << lv;
         // r_local: the low `lv` bits of r_low.
         let r_local: Vec<Gf128> = r_low[..lv].to_vec();
-        // The segment's folded table: eq(r_inst)-folded, then MLE at r_local.
-        let mut seg_table = vec![ZERO; 1usize << lv];
-        for (j, st) in seg_table.iter_mut().enumerate() {
-            let mut vals: Vec<Gf128> = Vec::with_capacity(q);
-            for u in 0..q {
-                vals.push(joint_z[u * m + base + j]);
-            }
-            *st = if z_bit_cols[base + j] {
-                magnetar_field::par_dot_bit_xor(&eq_inst, &vals)
-            } else {
-                magnetar_field::par_dot_xor(&eq_inst, &vals)
-            };
-        }
+        let seg_table = &wf[base..base + len];
         let v = if lv == 0 {
             seg_table[0]
         } else {
-            eval_mle(&seg_table, &r_local)
+            eval_mle(seg_table, &r_local)
         };
         segment_values.push(v);
         segment_claims.push(SegmentClaim {
@@ -493,8 +478,6 @@ pub fn prove_virtual_spartan(
     for (i, v) in segment_values.iter().enumerate() {
         t.absorb_field(&format!("vs-seg-{i}"), &[*v]);
     }
-    let _ = &w_half;
-    let _ = msb;
     (
         VirtualSpartanProof {
             outer_shared,
@@ -535,28 +518,55 @@ fn build_m_combo(
     combo
 }
 
-/// Fold the joint table at the instance point (y stays Boolean). Bit
-/// columns fold with select-dots — no CLMUL (small-value discipline);
-/// word columns keep the generic dot.
-fn fold_joint_at_instances(
-    joint_z: &[Gf128],
+/// The eq(r_inst)-fold of the packed bit half: `out[y] = Σ_u
+/// eq[u]·w(u, y)`, computed as ONE sequential pass over the packed
+/// words — for each instance, `eq[u]` is XOR-selected into exactly the
+/// columns whose bit is set (a 16-byte XOR per *set* bit, no CLMUL, no
+/// per-column gather). XOR accumulation is order-free, so the result
+/// is bit-identical to the naive per-column dot. Sparse-word skipping
+/// plus trailing-zero iteration keeps the work proportional to the
+/// set-bit count.
+fn fold_packed_w(
+    w_packed: &[u128],
     q: usize,
-    m: usize,
+    w_cols: usize,
     r_inst: &[Gf128],
-    z_bit_cols: &[bool],
 ) -> Vec<Gf128> {
     let eq = magnetar_field::EqBits::build(r_inst).values;
-    let mut out = vec![ZERO; m];
-    for y in 0..m {
-        let mut vals: Vec<Gf128> = Vec::with_capacity(q);
-        for u in 0..q {
-            vals.push(joint_z[u * m + y]);
+    let w128 = (w_cols + 127) / 128;
+    debug_assert_eq!(w_packed.len(), q * w128);
+    let mut out = vec![ZERO; w_cols];
+    for u in 0..q {
+        let e = eq[u];
+        if e == ZERO {
+            continue;
         }
-        out[y] = if z_bit_cols[y] {
-            magnetar_field::par_dot_bit_xor(&eq, &vals)
-        } else {
-            magnetar_field::par_dot_xor(&eq, &vals)
-        };
+        let row = &w_packed[u * w128..(u + 1) * w128];
+        for (k, &word) in row.iter().enumerate() {
+            let col_base = k * 128;
+            // Skip set bits beyond the w range (a partial last word).
+            let mut hi = if col_base + 64 < w_cols {
+                (word >> 64) as u64
+            } else {
+                0
+            };
+            let mut lo = if col_base + 64 <= w_cols {
+                word as u64
+            } else {
+                // Partial low half: mask off columns ≥ w_cols.
+                word as u64 & (u64::MAX >> (64 - (w_cols - col_base) % 64).max(0).min(64))
+            };
+            while lo != 0 {
+                let b = lo.trailing_zeros() as usize;
+                out[col_base + b] += e;
+                lo &= lo - 1;
+            }
+            while hi != 0 {
+                let b = hi.trailing_zeros() as usize;
+                out[col_base + 64 + b] += e;
+                hi &= hi - 1;
+            }
+        }
     }
     out
 }
@@ -841,9 +851,27 @@ mod tests {
             b_fld: b.clone(),
             c_fld: c.clone(),
         };
+        // The packed form: w-bits per instance (128 columns per u128)
+        // plus the shared x vector — this test's witness matches the
+        // protocol layout z = (w, 1, x) with a single shared x.
+        let w_cols = m / 2;
+        let w128 = (w_cols + 127) / 128;
+        let mut w_packed = vec![0u128; q * w128];
+        for u in 0..q {
+            for k in 0..w128 {
+                let mut word = 0u128;
+                for c in 0..128.min(w_cols - k * 128) {
+                    word |= (joint[u * m + k * 128 + c].0 & 1) << c;
+                }
+                w_packed[u * w128 + k] = word;
+            }
+        }
+        let x_cols: Vec<Gf128> = (0..m / 2 - 1)
+            .map(|j| joint[m / 2 + 1 + j])
+            .collect();
         let mut t = Transcript::new("vs", &[b"test"]);
         let (proof, claims) =
-            prove_virtual_spartan(&rel, &layout, &joint, q, &vec![false; rel.m], &mut t);
+            prove_virtual_spartan(&rel, &layout, &w_packed, &x_cols, q, &mut t);
         let mut tv = Transcript::new("vs", &[b"test"]);
         let vclaims = verify_virtual_spartan(&rel, &layout, q, &public, &proof, &mut tv)
             .expect("honest vs proof must verify");

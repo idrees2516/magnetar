@@ -107,6 +107,63 @@ impl SparseMatrix {
         self.entries.iter().all(|&(_, _, v)| v.0 <= 1)
     }
 
+    /// The SIMD application over the **packed** witness representation:
+    /// the w-half arrives bit-packed (`w_packed[u]` covers instance `u`'s
+    /// `w_cols` witness bits, 128 columns per `u128`, row-major), the
+    /// `1` column is constant, and the x columns are **shared across
+    /// instances** — so their contribution is hoisted out of the
+    /// per-instance loop and computed once. Bit columns take the
+    /// branchless select (`v & -(bit)` — no CLMUL); x columns one CLMUL
+    /// per entry, total. Returns the joint table plus the output's
+    /// bit-ness flag (binary matrix ∧ no x-column references).
+    ///
+    /// This is the paper's instance-batching discipline: the shared
+    /// public x-part never re-multiplies per instance.
+    pub fn apply_simd_packed(
+        &self,
+        w_packed: &[u128],
+        x_cols: &[Gf128],
+        q: usize,
+        w_cols: usize,
+    ) -> (Vec<Gf128>, bool) {
+        let w128 = (w_cols + 127) / 128;
+        debug_assert_eq!(w_packed.len(), q * w128);
+        let one_col = w_cols; // z = (w, 1, x): the constant-1 column
+        let mut out = vec![ZERO; q * self.rows];
+        // The shared (x ‖ 1) contribution — identical for every instance.
+        let mut xpart = vec![ZERO; self.rows];
+        let mut all_bits = self.is_binary();
+        let mut has_bits = false;
+        for &(r, c, v) in &self.entries {
+            if c == one_col {
+                xpart[r] += v;
+                has_bits = true;
+            } else if c > one_col {
+                xpart[r] += mul(v, x_cols[c - one_col - 1]);
+                all_bits = false;
+            } else {
+                has_bits = true;
+            }
+        }
+        let _ = has_bits;
+        for u in 0..q {
+            let out_u = &mut out[u * self.rows..(u + 1) * self.rows];
+            let row = &w_packed[u * w128..(u + 1) * w128];
+            for &(r, c, v) in &self.entries {
+                if c < w_cols {
+                    // branchless select: v & mask where mask = -(bit)
+                    let bit = (row[c >> 7] >> (c & 127)) & 1;
+                    out_u[r].0 ^= v.0 & bit.wrapping_neg();
+                }
+            }
+            // Fold the shared x-part in (XOR per position).
+            for (o, xp) in out_u.iter_mut().zip(xpart.iter()) {
+                o.0 ^= xp.0;
+            }
+        }
+        (out, all_bits)
+    }
+
     /// The SIMD application specialized to a **bit-valued witness column
     /// set** (`z_bit_cols[y]` marks the columns whose entries are all
     /// `{0, 1}` — the stack's dominant case: the w-half and the 1-column;

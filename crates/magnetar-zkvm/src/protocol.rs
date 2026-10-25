@@ -386,7 +386,15 @@ fn mosaic_components(n: usize, a_rom: usize) -> Vec<crate::mosaic::ComponentSpec
 
 /// One prover-side witness bundle.
 pub struct WitnessData {
-    joint_z: Vec<Gf128>,
+    /// The bit-packed w-half: 128 witness columns per `u128`, row-major
+    /// per instance (`q × W_COLS/128` words). This is the canonical
+    /// prover-side witness form — every consumer (the Spartan instance
+    /// fold, the matrix applications, the router inputs) reads bits by
+    /// word index, never by strided 16-byte gathers.
+    w_packed: Vec<u128>,
+    /// The public x columns (shared across every instance — the
+    /// eq(r_inst)-fold of a shared vector is the identity).
+    pub x_cols: Vec<Gf128>,
     /// The direct component tables (bits), in Mosaic order.
     direct_tables: Vec<Vec<bool>>,
     /// The register Twist's witness.
@@ -395,6 +403,20 @@ pub struct WitnessData {
     ram_wit: TwistWitness,
     /// The fetch component.
     fetch_comp: magnetar_memory::AddressComponent,
+}
+
+impl WitnessData {
+    /// Witness bit `(u, col)` of the w-half as a field element.
+    pub fn wbit(&self, u: usize, col: usize) -> Gf128 {
+        let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
+        Gf128(
+            ((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1) as u128,
+        )
+    }
+
+    pub fn w_packed(&self) -> &[u128] {
+        &self.w_packed
+    }
 }
 
 /// Assemble the witness from the trace.
@@ -419,14 +441,25 @@ fn build_witness(
         }
         v
     };
-    // The witness rows.
-    let mut joint_z = vec![ZERO; q * m];
+    // The witness: the bit-packed w-half (one word per 128 columns per
+    // instance) plus the shared public x vector. The former
+    // `q × m × 16 B` joint table — every bit a full field element — is
+    // gone: consumers read packed words and the x columns by index.
+    let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
+    let mut w_packed = vec![0u128; q * w128];
     for (u, rec) in trace.records.iter().enumerate() {
         let row = &rows[rec.micro_pc % rows.len()].row;
         let z = witness_row(rec, row, &public_x);
-        joint_z[u * m..(u + 1) * m].copy_from_slice(&z);
+        let dst = &mut w_packed[u * w128..(u + 1) * w128];
+        for (k, w) in dst.iter_mut().enumerate() {
+            let mut word = 0u128;
+            for c in 0..128 {
+                word |= (z[k * 128 + c].0 & 1) << c;
+            }
+            *w = word;
+        }
     }
-    // The direct segment tables.
+    // The direct segment tables (bit-extraction from the packed words).
     let mut direct_tables = Vec::new();
     for (name, len, _direct) in SEGMENTS.iter() {
         if !*_direct {
@@ -437,7 +470,8 @@ fn build_witness(
         let mut bits = vec![false; 1usize << (lv + n)];
         for (u, _) in trace.records.iter().enumerate() {
             for c in 0..*len {
-                bits[c | (u << lv)] = joint_z[u * m + off + c].0 & 1 == 1;
+                bits[c | (u << lv)] =
+                    (w_packed[u * w128 + ((off + c) >> 7)] >> ((off + c) & 127)) & 1 == 1;
             }
         }
         direct_tables.push(bits);
@@ -557,7 +591,8 @@ fn build_witness(
     };
     let fetch_comp = magnetar_memory::AddressComponent::from_bits(a_rom, n, &fetch_bits);
     WitnessData {
-        joint_z,
+        w_packed,
+        x_cols: public_x,
         direct_tables,
         reg_wit,
         ram_wit,
@@ -608,17 +643,8 @@ pub fn prove_inner(
     // bits; the public x columns hold packed words (output + inputs) and
     // stay generic. This is what makes the select-based application and
     // the small-value message paths sound.
-    let z_bit_cols: Vec<bool> = {
-        let w_cols = magnetar_cpu::WITNESS_LAYOUT::W_COLS;
-        let m = magnetar_cpu::WITNESS_LAYOUT::M;
-        let mut v = vec![false; m];
-        for c in v.iter_mut().take(w_cols + 1) {
-            *c = true;
-        }
-        v
-    };
     let (vs_proof, seg_claims) =
-        prove_virtual_spartan(&rel, &pk.layout, &wd.joint_z, q, &z_bit_cols, t);
+        prove_virtual_spartan(&rel, &pk.layout, wd.w_packed(), &wd.x_cols, q, t);
     drop(_pt);
     let seg = |name: &str| -> SegmentClaim {
         let i = pk.layout.index_of(name).expect("segment");
@@ -755,7 +781,7 @@ pub fn prove_inner(
         let mut x = vec![ZERO; (1usize << 6) * q];
         for (u, _) in trace.records.iter().enumerate() {
             for b in 0..64usize {
-                x[b | (u << 6)] = joint_bit(&wd.joint_z, u * m, shift_src_off + b);
+                x[b | (u << 6)] = wd.wbit(u, shift_src_off + b);
             }
         }
         x
@@ -827,8 +853,8 @@ pub fn prove_inner(
         let mut x = vec![ZERO; (1usize << u_vs) * q];
         for (u, _) in trace.records.iter().enumerate() {
             for b in 0..64usize {
-                x[b | (u << u_vs)] = joint_bit(&wd.joint_z, u * m, old_off + b);
-                x[(b + 64) | (u << u_vs)] = joint_bit(&wd.joint_z, u * m, src_off + b);
+                x[b | (u << u_vs)] = wd.wbit(u, old_off + b);
+                x[(b + 64) | (u << u_vs)] = wd.wbit(u, src_off + b);
             }
         }
         x
@@ -883,7 +909,7 @@ pub fn prove_inner(
             let mut x = vec![ZERO; (1usize << 6) * q];
             for (u, _) in trace.records.iter().enumerate() {
                 for b in 0..64usize {
-                    x[b | (u << 6)] = joint_bit(&wd.joint_z, u * m, old_off + b);
+                    x[b | (u << 6)] = wd.wbit(u, old_off + b);
                 }
             }
             x
@@ -892,7 +918,7 @@ pub fn prove_inner(
             let mut x = vec![ZERO; (1usize << 6) * q];
             for (u, _) in trace.records.iter().enumerate() {
                 for b in 0..64usize {
-                    x[b | (u << 6)] = joint_bit(&wd.joint_z, u * m, src_off + b);
+                    x[b | (u << 6)] = wd.wbit(u, src_off + b);
                 }
             }
             x
@@ -1306,10 +1332,6 @@ pub fn prove_with_wrap(
 }
 
 #[inline]
-fn joint_bit(z: &[Gf128], base: usize, col: usize) -> Gf128 {
-    z[base + col]
-}
-
 /// The X-claim point `(u-slice ++ j-slice)` from a terminal point.
 fn terminal_x_point(layout: &RoutingLayout, terminal: &[Gf128]) -> Vec<Gf128> {
     let [_, j_off, u_off, _, _] = layout.offsets();
