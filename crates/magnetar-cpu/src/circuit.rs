@@ -237,15 +237,19 @@ impl WITNESS_LAYOUT {
     pub const BUS_IMM: usize = 28;
 
     /// **Cycles per SIMD instance** (the paper §5.1 operating point):
-    /// the production default — measured best at every streaming scale on
-    /// the InstaBox AVX-512 host (2^16: 13,079 cycles/s and a 16% faster
-    /// streaming root vs the one-cycle layout; the per-instance discharge
-    /// work amortizes over 4 cycles, and the per-segment inner/m_combo
-    /// constants stay small enough not to eat the win — at cpi 8 they
-    /// already do). A power of two; `1` recovers the one-cycle-per-instance
-    /// layout. `keygen` reads this; the benches override it via
-    /// `MAGNETAR_CPI` for the density sweep.
-    pub const DEFAULT_CPI: usize = 4;
+    /// the production default. The 0.9.1 release measured `cpi = 4` best
+    /// at every scale (the per-instance discharge work amortized); the
+    /// 0.9.2 lever pass — the twists' packed-inc select-fold, the
+    /// store-router select-dots, and the window's complement-convolution —
+    /// attacked exactly those per-instance-amortizable phases, and the
+    /// measured ladder FLIPPED: `cpi = 1` now wins at every streaming
+    /// scale (2^13: 17,418 / 2^14: 17,568 / 2^15: 16,470 / 2^16: 15,405
+    /// cycles/s vs 17,108 / 16,922 / 16,128 / 14,952 at cpi 4) AND under
+    /// the 5-machine pooled contention (5,139 tx/s aggregate vs 4,585 at
+    /// cpi 4 — the lighter per-segment constants degrade less across
+    /// VMs). A power of two; `keygen` reads this; the benches override
+    /// via `MAGNETAR_CPI` for the density sweep.
+    pub const DEFAULT_CPI: usize = 1;
 
     /// The instance-batched geometry for `cpi` cycles per instance.
     pub fn geometry(cpi: usize) -> InstanceGeometry {

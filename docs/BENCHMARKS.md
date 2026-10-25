@@ -65,56 +65,50 @@ Proofs shrank by ~60–90 KiB (the anchors).
 balance transfers between two accounts with checked subtraction, every
 16th transfer failing the underflow check — 12 cycles per executed
 transfer at the 64-bit balance width of this RV64I reference CPU
-(default `cpi = 4`; `MAGNETAR_CPI=1|2|8` sweeps the instance density):
+(the 0.9.2 operating point is `cpi = 1` — the levers flipped the 0.9.1
+`cpi = 4` default; `MAGNETAR_CPI` sweeps the density):
 
 | T | segments | tx | prove (ms) | cycles/s | tx/s | peak RSS |
 |---|---|---|---|---|---|---|
-| 2^12 (monolithic) | — | 341 | 554 | 7,395 | 616 | 165 MiB |
-| 2^13 | 8 | 682 | 546 | 15,006 | 1,249 | 254 MiB |
-| 2^14 | 16 | 1,365 | 1,088 | 15,061 | 1,255 | 340 MiB |
-| 2^15 | 32 | 2,730 | 2,483 | 13,198 | 1,100 | 571 MiB |
-| 2^16 | 64 | 5,461 | 4,954 | **13,228** | **1,102** | 1.12 GiB |
+| 2^12 (monolithic) | — | 341 | 446 | 9,183 | 764 | 166 MiB |
+| 2^13 | 8 | 682 | 470 | **17,418** | **1,450** | 285 MiB |
+| 2^14 | 16 | 1,365 | 933 | **17,568** | **1,464** | 376 MiB |
+| 2^15 | 32 | 2,730 | 1,990 | 16,470 | 1,372 | 595 MiB |
+| 2^16 | 64 | 5,461 | 4,254 | 15,405 | 1,284 | 1.09 GiB |
 
 **The pooled proving-pool run** (5 × 4-vCPU instances proving
-independent 2^16 batches concurrently): ≈3,788 tx/s aggregate in the
-0.8.0 run — the per-machine rate has since moved 867 → 1,102 tx/s
-(0.8.0 → 0.9.1), so a fresh pool run lands ≈4,800 tx/s aggregate at
-the same contention. The honest per-machine rate is the lever the
-optimizations move. The measured remaining levers, in order of impact:
+independent 2^16 batches concurrently — the cpi × pool matrix, the
+aggregate over the 20 vCPUs):
 
-1. ~~The ring switch's FRI chain~~ **DONE** — the DP24 commitment-free
-   reduction (partials + the row batch + one sum-check with the packed
-   table as the dense factor + the main codeword's own chain): the
-   second encode, the level-0 C-tree, the c-table, the ring sum-check
-   over it, and the anchors are all gone; the residual ~0.39 s is the
-   Ligerito-inherent per-level tree hashing + the partials pass.
-2. **The hier body's local stages** (~0.85 s of the root): the
-   window's fast-forward (`ld-finish-window`) + the `bound_se`
-   group-fold + the word fold — ~52 ms of thread time per segment
-   instance. The chunked-axpy `bound_se` rewrite was attempted once and
-   REVERTED (it broke small-scale verification); the group-fold shape
-   needs a different decomposition.
-3. **The Virtual-Spartan outer rounds** (~0.33 s wall) and **the
-   twists** (~0.50 s wall): the twists' o-rounds still fold the `2^{ell}`
-   inc bit tables generically (the packed-inc/select-fold lever — the
-   same packed-word select the join's h-rounds now use); the outer
-   rounds' mask window is already the fast path.
-4. ~~The paper's per-instance amortization~~ **DONE (0.9.1)** — the
-   instance-batching restructure: `WITNESS_LAYOUT::DEFAULT_CPI = 4`
-   cycles per SIMD instance, the two relations' row indexing reshaped
-   over `(δ ‖ row-within-cycle)` blocks, the columns over the batched
-   segments (`col' = cpi·col + δ`, one shared δ variable), the `(1, x)`
-   half shared per instance, and the claims threaded `[δ ‖ instance]`
-   through every auxiliary argument. The honest measured effect (the
-   Spartan flop count is cpi-invariant — the gain is the per-instance
-   discharge work): **2^16 +3.5% cycles/s (12,641 → 13,079) and the
-   streaming root −16% (1,930 → 1,620 ms)**; flat below 2^15; the
-   verifier's public fold drops from per-instance to O(m/2) once.
-   This is the batch-dimension amortization of the Flock lineage
-   (ePrint 2026/1329: the batch-R1CS zerocheck + the cheap lincheck
-   over the batch dimension) applied to Magnetar's cycle instances;
-   the next Flock-shaped item is the zerocheck's small-value window
-   extended over the joint (instance ‖ row) cube.
+| cpi | per-machine tx/s | aggregate tx/s |
+|---|---|---|
+| **1** | 1,005–1,051 | **5,139** |
+| 4 | 847–975 | 4,585 |
+| 8 | 956–1,027 | 4,942 |
+
+The honest pooled operating point is `cpi = 1`: the lightest
+per-segment constants degrade least under cross-VM contention (the
+solo ladder's cpi 4 edge — the per-instance discharge amortization —
+was exactly what the 0.9.2 levers removed). The 0.8.0 pool measured
+≈3,788 tx/s; the same five machines now pool ≈5,139 tx/s (+36%). The
+remaining measured levers, in order of impact:
+
+1. **The discharge's `fw-bound-se` group-fold** (~19 ms per segment,
+   ~30% of the root's local stages): the eq(r)-weighted fold of the
+   packed words per distinct free-word point. A chunked-axpy rewrite
+   was attempted once and REVERTED (it broke small-scale verification);
+   the group-fold needs a different decomposition.
+2. **The VS window pass's residual** (`vs-win-build`, ~16 ms per
+   segment): the complement-convolution (0.9.2) cut it from ~26 ms;
+   the remaining cost is the eq-weighted pack over the 3^v monomial
+   state (one 16-byte scatter per set monomial per suffix).
+3. **The twists' Δ\* one-hot proofs** (`tw-onehot`, ~11 ms per segment
+   total across the two twists) and the port k-rounds (~4 ms).
+4. **The streaming root commitment** for 2^17+ monolithic-bounded
+   proving: the driver materializes the combined packed table, its
+   codeword, and the Merkle tree (≈3.3× the packed bytes); the
+   611-paper's shape (encode + hash per segment slice, the discharge
+   consuming packed words per segment) is the 2^23/2^24 gate.
 
 
 Every row proves **and verifies** end-to-end (the assert is in the
@@ -122,7 +116,45 @@ harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,
 0.2 GiB — on 12 M4 performance cores whose per-core CLMUL rate is
 ~5× this Xeon's measured 11.5 ns/mul.
 
-## The four optimizations of this pass
+## The three levers of the 0.9.2 pass
+
+1. **The twists' packed-inc select-fold** (the largest measured lever):
+   the BinaryTwist port sum-checks' o-rounds folded the `T·2^ell`
+   increment table generically (a CLMUL pass per round, ~4 ms per port
+   run). The increments are **bits**: `TwistShared` now packs them one
+   `u128` per cycle, one masked pass per port run computes
+   `D_o = Σ_{u: inc bit o} (WFAEQ·LTW)[u]`, and each round's message is
+   `O(2^ell)` — the round weight `hist[o]·eq_rest[o>>(b+1)]` multiplies
+   `D_o` and the address-folded `M0` row. The measured `port-o-rounds`
+   fell to **0.0 ms** (from ~4 ms × 5 port runs per segment); the
+   reconstruction's increment row is the eq(r_v,·) select over the packed
+   words (no `T·2^ell` clone per fold). Messages byte-identical
+   (`linear_port_prover_matches_dense`).
+2. **The store-router join's select-dots**: the routing tensors are 0/1,
+   so the extraction's `tau` sums are XOR-selects of the global
+   `eq_o[o]` (no CLMUL), and the o-rounds collapse from two products
+   **per pair per round** (the store router's byte-store columns carry
+   ~128 pairs, doubleword stores up to ~912) to one product **per nonzero
+   output bit** against a GLOBAL per-round weight vector — one pass over
+   the support builds the per-column `xo2[o]`. Measured: the
+   `4b-store-router` phase fell 45.4 → **4.4 ms per segment (~10×)**.
+   Non-binary tensors keep the generic per-pair path (byte-identity
+   pinned by the new `join_matches_sparse_prover_generic_coefs`).
+3. **The window pass's complement-convolution**: the small-value round
+   window's one-pass state build convolves the two tables' Möbius masks
+   per suffix — `O(popcount(m0)·popcount(m1))` pair iterations, dense
+   structured sub-cubes up to 4,096. The convolution is GF(2)-bilinear:
+   with `a`/`b` the sparser of `(m, ~m)`, the corrections are three
+   precomputed word vectors — dense sub-cubes cost ~a dozen word XORs.
+   The pass's chunking also no longer serializes small strides (the
+   previous `PAR_THRESHOLD` floor ran the 2^11-suffix VS window
+   single-threaded). `vs-win-build` fell ~26 → **16 ms per segment**.
+
+The verifier is unchanged by every optimization (all messages are
+engine-identical), which is what keeps the tamper suite meaningful
+through the optimization loop.
+
+## The four optimizations of the earlier pass
 
 1. **Circuit density (2048 → 512 rows/cycle)**: the binary relation's
    per-cycle row count was dominated by 1,127 *booleanity* rows

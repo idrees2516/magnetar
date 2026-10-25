@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.9.2 — the three-lever pass + the pooled operating point
+
+The three measured levers of the 0.9.1 anatomy (the twists' packed-inc
+o-rounds ~420 ms, the store-router join pass ~308 ms, the outer-rounds'
+window pass ~311 ms at 2^13), plus the cpi × pool matrix that flipped
+the default back to `cpi = 1`.
+
+### The levers
+- **The twists' packed-inc select-fold** (magnetar-memory): the port
+  sum-checks' o-rounds never touch the `T·2^ell` increment table — the
+  increments are bits, packed one `u128` per cycle in `TwistShared`;
+  one masked pass per port run builds the per-value-bit dots
+  `D_o = Σ_{u: inc bit o} (WFAEQ·LTW)[u]`, and every round is
+  `O(2^ell)` field ops (`port-o-rounds` 4 ms → 0.0 ms per port run).
+  The reconstruction's increment row is the eq(r_v,·) select over the
+  packed words.
+- **The store-router join select-dots** (magnetar-router): the 0/1
+  routing tensors make the extraction's `tau` XOR-selects of the global
+  `eq_o[o]`, and the o-rounds one-pass per-column `xo2[o]` dots against
+  GLOBAL round weights (the per-pair pref/suffix products are gone;
+  `4b-store-router` 45.4 → 4.4 ms per segment, ~10×). Non-binary
+  tensors keep the generic path — pinned byte-identical by the new
+  `join_matches_sparse_prover_generic_coefs` (every existing suite was
+  binary).
+- **The window's complement-convolution** (magnetar-sumcheck): the
+  small-value round window's one-pass build is GF(2)-bilinear in the
+  two Möbius masks — the sparser of `(m, ~m)` on each side plus three
+  precomputed correction vectors; dense sub-cubes cost ~a dozen word
+  XORs instead of up to 4,096 pair iterations, and the pass no longer
+  serializes strides below `PAR_THRESHOLD` (`vs-win-build` ~26 → 16 ms
+  per segment).
+- `MAGNETAR_TIME` sub-timers for the VS anatomy (`vs-win-build`,
+  `vs-shared-rounds`, `vs-row-rounds-*`) and `examples/window_bench`.
+
+### The measured effect (the same 4-vCPU EPYC host)
+| T | 0.9.1 (cpi 4) | 0.9.2 (cpi 1) | tx/s |
+|---|---|---|---|
+| 2^13 | 546 ms / 15,006 | **470 ms / 17,418** | **1,450** |
+| 2^14 | 1,088 ms / 15,061 | **933 ms / 17,568** | **1,464** |
+| 2^15 | 2,483 ms / 13,198 | **1,990 ms / 16,470** | **1,372** |
+| 2^16 | 4,954 ms / 13,228 | **4,254 ms / 15,405** | **1,284** |
+
+**The cpi × pool matrix** (5 × 4-vCPU instances, 2^16 batches,
+aggregate tx/s): cpi 1 **5,139** / cpi 4 4,585 / cpi 8 4,942 — the
+levers removed the per-instance amortization edge, and the lightest
+per-segment constants degrade least under cross-VM contention:
+`DEFAULT_CPI` returns to **1** with the measurement recorded in
+`WITNESS_LAYOUT`. Gate: 169 tests (debug + release), clippy clean,
+fmt clean.
+
 ## 0.9.1 — the instance-batching release (the paper's §5.1 operating point)
 
 **`WITNESS_LAYOUT::DEFAULT_CPI = 4` cycles per SIMD instance** — the
