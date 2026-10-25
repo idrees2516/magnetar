@@ -602,26 +602,86 @@ impl<'a> LocalDischarge<'a> {
             // The word walk (identity fast path — see the fold).
             let npat = 1usize << wpos.len();
             let identity = wpos.iter().enumerate().all(|(j, &p)| p == j);
-            for i in 0..npat {
-                let e = weq[i];
-                if e == ZERO {
+            // Split across threads by plane blocks then word ranges: the
+            // suffix cube factors as (word ‖ plane), so `bound_se`'s plane
+            // `p` occupies the contiguous block `[p·2^wb, (p+1)·2^wb)` and
+            // each block is walked independently (the group's eq table
+            // and the members' plane weights are read-only).
+            let n_planes = 1usize << (7 - v);
+            let wb = word_bits;
+            for p in 0..n_planes {
+                // The members contributing to this plane (their pattern
+                // list contains p with weight pe).
+                let contrib: Vec<(usize, Gf128)> = plane_supp
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(m, (_, pats))| {
+                        pats.iter()
+                            .find(|&&(pp, _)| pp == p)
+                            .map(|&(_, pe)| (m, pe))
+                    })
+                    .collect();
+                if contrib.is_empty() {
                     continue;
                 }
-                let word = if identity {
-                    base_word | i
+                let blk = 1usize << wb;
+                let base_idx = p * blk;
+                let (lo, hi) = (base_idx, base_idx + blk);
+                let mut slice = &mut bound_se[lo..hi];
+                let bw = *base_word;
+                let weq_c = weq;
+                let fw = wpos.len();
+                let supp_mask = (1usize << fw) - 1;
+                if identity {
+                    // The common production shape: the free word
+                    // positions are [0, fw). A plane-block offset is in
+                    // the support iff its HIGH bits match the base's —
+                    // the eq table indexes the low fw bits.
+                    slice
+                        .par_iter_mut()
+                        .enumerate()
+                        .chunks(1usize << 12)
+                        .for_each(|cells| {
+                            for (off, cell) in cells {
+                                if (off >> fw) != (bw >> fw) {
+                                    continue;
+                                }
+                                let i = off & supp_mask;
+                                let e = weq_c[i];
+                                if e == ZERO {
+                                    continue;
+                                }
+                                for (_m, pe) in contrib.iter() {
+                                    *cell += mul(*pe, e);
+                                }
+                            }
+                        });
                 } else {
-                    let mut w = *base_word;
-                    for (j, &pos) in wpos.iter().enumerate() {
-                        if (i >> j) & 1 == 1 {
-                            w |= 1usize << pos;
+                    // The general walk (rare: a component offset reaches
+                    // into the word bits, or non-identity positions).
+                    let wpos_c = wpos.clone();
+                    for i in 0..npat {
+                        let e = weq_c[i];
+                        if e == ZERO {
+                            continue;
                         }
-                    }
-                    w
-                };
-                for (_m, (_s, pats)) in plane_supp.iter().enumerate() {
-                    for &(p, pe) in pats {
-                        let x = word | (p << word_bits);
-                        bound_se[x] += mul(pe, e);
+                        let word = if identity {
+                            bw | i
+                        } else {
+                            let mut w = bw;
+                            for (j, &pos) in wpos_c.iter().enumerate() {
+                                if (i >> j) & 1 == 1 {
+                                    w |= 1usize << pos;
+                                }
+                            }
+                            w
+                        };
+                        if word >= blk {
+                            continue; // not this plane block's word range? word < 2^wb always
+                        }
+                        for (_m, pe) in contrib.iter() {
+                            slice[word] += mul(*pe, e);
+                        }
                     }
                 }
             }
