@@ -409,7 +409,7 @@ impl WitnessData {
     /// Witness bit `(u, col)` of the w-half as a field element.
     pub fn wbit(&self, u: usize, col: usize) -> Gf128 {
         let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
-        Gf128(((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1) as u128)
+        Gf128((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1)
     }
 
     pub fn w_packed(&self) -> &[u128] {
@@ -2170,19 +2170,17 @@ mod tests {
         // the chunk ring (40 queries).
         let tail_bytes = |p: &Proof| -> usize {
             // The full byte inventory of the evaluation-argument tail:
-            // round messages + level roots + queries + tail + anchors
+            // round messages + level roots + queries + tail + the partials
             // (+ the wrap's consistency openings).
             let ring = |r: &magnetar_pcs::RingProof| -> usize {
                 let mut n = r.rounds.iter().map(|m| m.len() * 16).sum::<usize>();
+                n += r.partials.len() * 16;
                 n += r.level_roots.len() * 32;
                 for q in &r.queries {
                     n += q.levels.len() * 3 * (16 + 32);
                 }
                 for (_v, path) in &r.tail {
                     n += 16 + path.len() * 32;
-                }
-                for a in &r.anchors {
-                    n += 16 + a.main_path.len() * 32 + 16 + a.c_path.len() * 32;
                 }
                 n
             };

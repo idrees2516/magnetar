@@ -855,8 +855,7 @@ pub fn fold_pairs(out: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> u
 /// Unit-tested against the scalar reference (`axpy_matches_scalar`).
 pub fn axpy_run(dst: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> usize {
     debug_assert_eq!(dst.len(), src.len());
-    let done;
-    match detect() {
+    let done = match detect() {
         #[cfg(target_arch = "x86_64")]
         SimdKind::Avx512 => {
             let n4 = count / 4;
@@ -879,7 +878,7 @@ pub fn axpy_run(dst: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> usi
                     );
                 }
             }
-            done = 4 * n4;
+            4 * n4
         }
         #[cfg(target_arch = "x86_64")]
         SimdKind::Avx2 => {
@@ -903,12 +902,10 @@ pub fn axpy_run(dst: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> usi
                     );
                 }
             }
-            done = 2 * n2;
+            2 * n2
         }
-        SimdKind::Scalar => {
-            done = count;
-        }
-    }
+        SimdKind::Scalar => count,
+    };
     for k in done..count {
         dst[k] += crate::gf128::mul(src[k], r);
     }

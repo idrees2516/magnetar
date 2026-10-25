@@ -64,15 +64,13 @@ fn cmd_profiles() {
         assert!(verify(&vk, &pub_in, &proof).is_ok());
         let ring = |r: &magnetar_pcs::RingProof| -> usize {
             let mut n = r.rounds.iter().map(|m| m.len() * 16).sum::<usize>();
+            n += r.partials.len() * 16;
             n += r.level_roots.len() * 32;
             for q in &r.queries {
                 n += q.levels.len() * 3 * (16 + 32);
             }
             for (_v, path) in &r.tail {
                 n += 16 + path.len() * 32;
-            }
-            for a in &r.anchors {
-                n += 16 + a.main_path.len() * 32 + 16 + a.c_path.len() * 32;
             }
             n
         };
@@ -97,15 +95,13 @@ fn cmd_profiles() {
     assert!(verify(&vk, &pub_in, &wrapped).is_ok());
     let ring = |r: &magnetar_pcs::RingProof| -> usize {
         let mut n = r.rounds.iter().map(|m| m.len() * 16).sum::<usize>();
+        n += r.partials.len() * 16;
         n += r.level_roots.len() * 32;
         for q in &r.queries {
             n += q.levels.len() * 3 * (16 + 32);
         }
         for (_v, path) in &r.tail {
             n += 16 + path.len() * 32;
-        }
-        for a in &r.anchors {
-            n += 16 + a.main_path.len() * 32 + 16 + a.c_path.len() * 32;
         }
         n
     };

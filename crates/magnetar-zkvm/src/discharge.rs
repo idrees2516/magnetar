@@ -51,20 +51,6 @@ use magnetar_sumcheck::public::{EqFactor, SumEqFactor, TableFactor};
 use magnetar_sumcheck::{BindOrder, RoundMsg, SumcheckSpec, Term};
 use rayon::prelude::*;
 
-/// The alternating SWAR masks for the in-place Möbius butterfly over a
-/// `u64` truth table (bit `t` = coordinate `t`, little-endian).
-#[inline]
-fn swirl_mask(j: usize) -> u64 {
-    match j {
-        0 => 0xAAAA_AAAA_AAAA_AAAA,
-        1 => 0xCCCC_CCCC_CCCC_CCCC,
-        2 => 0xF0F0_F0F0_F0F0_F0F0,
-        3 => 0xFF00_FF00_FF00_FF00,
-        4 => 0xFFFF_0000_FFFF_0000,
-        _ => 0xFFFF_FFFF_0000_0000,
-    }
-}
-
 /// One instance's windowed local batching sum-check over its local cube.
 ///
 /// The instance is a tree-IVC segment (the streaming root) or the whole
@@ -142,6 +128,7 @@ impl Support {
 
     /// Call `f(i, word)` for every free word pattern: `i` indexes
     /// [`Self::word_eq`] and `word` is the concrete word index.
+    #[allow(dead_code)] // kept for the window's future word-enumeration passes
     pub(crate) fn enumerate_words(&self, word_bits: usize, mut f: impl FnMut(usize, usize)) {
         let base_word = self.base_word(word_bits);
         if self.word_pos.is_empty() {
@@ -628,7 +615,7 @@ impl<'a> LocalDischarge<'a> {
                 let blk = 1usize << wb;
                 let base_idx = p * blk;
                 let (lo, hi) = (base_idx, base_idx + blk);
-                let mut slice = &mut bound_se[lo..hi];
+                let slice = &mut bound_se[lo..hi];
                 let bw = *base_word;
                 let weq_c = weq;
                 let fw = wpos.len();
@@ -1093,6 +1080,21 @@ pub(crate) fn verify_hier_body(
 
 #[cfg(test)]
 mod tests {
+    /// The alternating SWAR masks for the in-place Möbius butterfly over
+    /// a `u64` truth table (bit `t` = coordinate `t`, little-endian) —
+    /// the tests' reference Möbius against the production machinery.
+    #[inline]
+    pub(super) fn swirl_mask(j: usize) -> u64 {
+        match j {
+            0 => 0xAAAA_AAAA_AAAA_AAAA,
+            1 => 0xCCCC_CCCC_CCCC_CCCC,
+            2 => 0xF0F0_F0F0_F0F0_F0F0,
+            3 => 0xFF00_FF00_FF00_FF00,
+            4 => 0xFFFF_0000_FFFF_0000,
+            _ => 0xFFFF_FFFF_0000_0000,
+        }
+    }
+
     use super::*;
 
     /// The LocalDischarge's messages must be byte-identical to the
@@ -1264,6 +1266,9 @@ mod tests {
 
 #[cfg(test)]
 mod fold_debug_tests {
+    use super::tests::swirl_mask;
+    use magnetar_field::ZERO;
+
     use super::*;
 
     /// Brute-force the per-item window monomial state `q[c][m] =

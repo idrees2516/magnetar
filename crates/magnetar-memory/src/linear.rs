@@ -999,13 +999,12 @@ pub fn prove_cross_step_s1_linear(
             coeffs[1] += mul(a_j, mul(gamma, t0 + t1)) + mul(b_j, alpha0 + mul(gamma, t0));
             coeffs[2] += mul(b_j, mul(gamma, t0 + t1));
         }
-        if rounds.is_empty() {
-            debug_assert_eq!(
-                coeffs[1..].iter().copied().sum::<Gf128>(),
-                alpha0 + gamma,
-                "cs-s1 round 0 must sum to the claim"
-            );
-        }
+        // NOTE: no honest-data identity assert here — the prover must
+        // also run on adversarial witnesses (the tamper tests prove
+        // bad paths through this code), and the round-sum identity is
+        // the *verifier's* check (release: the jumped-pc sub-proof trips
+        // a data-dependent debug_assert here; the honest-path identity
+        // is covered by cross_step_roundtrip's verify).
         let c = absorb(&mut *t, &coeffs, label);
         rounds.push(coeffs);
         challenges.push(c);

@@ -2,81 +2,202 @@
 //! a **bit-valued** vector to claims on its **packed** `K`-valued
 //! representation, discharged against the main codeword commitment.
 //!
-//! ## Construction (and why it is sound)
+//! ## The commitment-free construction (Diamond–Posen, ePrint 2024/504 §4–5)
 //!
 //! The bit table `w: {0,1}^n × {0,1}^7 → B` is packed as
-//! `P(u) = Σ_b β_b w(u, b)` (polynomial basis: the bits of `P(u)` *are*
-//! `w(u, ·)`). For a claim `ŵ(r_A, r_B) = y`:
+//! `P(u) = Σ_b β_b w(u, b)` (polynomial basis: bit `b` of `P(u)` *is*
+//! `w(u, b)`). A claim `ŵ(r_A, r_B) = y` discharges as:
 //!
-//! 1. `c := (eq(r_B, b))_b` — 128 verifier-computable coefficients.
-//! 2. The **c-folded table** `C(u) := φ_c(P(u)) = Σ_b c_b w(u, b)`, so
-//!    `ŵ(r_A, r_B) = Σ_u eq(r_A, u)·C(u)`.
-//! 3. **Sum-check** over the `n` block variables, binding `r*`; terminal
-//!    claim `Ĉ(r*) = v''`.
-//! 4. **Discharge with a fold chain on C's codeword** (same challenges):
-//!    the tail entry `D_n(0) = Ĉ(r*)` is checked against `v''`; the chain
-//!    is authenticated by correlated path queries; and the level-0 cube
-//!    slice is anchored to the *main* commitment with exact `φ_c` checks:
-//!    at `q` random `x`, the verifier opens the main codeword's `(x, 0)`
-//!    entry (the packed leaf `P(x)`), reads its 128 bits, and checks
-//!    `C(x) = φ_c(P(x))` — exact bit extraction, no free witnesses.
+//! 1. **The partial evaluations**. The prover sends the 128 values
+//!    `s_b = ŵ_b(r_A) = Σ_u eq(r_A,u)·w(u,b)` — one pass over the packed
+//!    table. The verifier checks the recombination
+//!    `y = Σ_b eq(r_B,b)·s_b`, which pins the claim to the `s_b`.
+//! 2. **The row batch**. The verifier samples `ρ ← K^7` and derives
+//!    `σ = fold(s, eq(ρ,·))` — the bit-transpose pairing
+//!    `Σ_i eq(ρ,i)·b_i` with `b_i = Σ_j bit_i(s_j)·β_j`.
+//! 3. **One sum-check over the word cube** with the **packed table itself**
+//!    as the dense factor and the **transparent** factor
+//!    `A(u) = φ_{eq(ρ,·)}(eq(r_A, u))`:
+//!    `Σ_u P(u)·A(u) = σ`.
+//!    The identity is exact: both sides are the `β_j`-packed
+//!    `eq(ρ)`-projections of the per-plane partial sums, so the honest
+//!    proof passes by algebra. Every round binds a fresh word challenge
+//!    `r̃`, ending at the product claim `P̂(r̃)·A(r̃)`.
+//! 4. **The main codeword's own fold chain at the same challenges** —
+//!    levels `1..=n` fresh, level `0` **the commitment itself** — with
+//!    correlated path queries and the tail. No second encode, no separate
+//!    `C`-codeword, no anchors: the chain *is* the committed argument.
 //!
-//! The anchors defeat the "T-reveal slack" attack (sending folded-slice
-//! values as free witnesses has a 126-dimensional cheat space over `K`);
-//! every accepted value here is a fold of Merkle-authenticated data or an
-//! exact bit extraction. The fold-chain soundness follows the same
-//! FRI-style proximity analysis as the main PCS (see crate docs).
+//! ## Soundness
+//!
+//! The `s_b` are pinned by two independent checks. The recombination ties
+//! `y` to them; the row batch ties them to the committed table: completing
+//! the sum-check and the chain certifies
+//! `Σ_u P(u)·A(u) = fold(s, eq(ρ,·))`, and since the committed table's own
+//! partials `s*` satisfy the same identity with `A` (the correctness
+//! identity), any deviation `s ≠ s*` must satisfy
+//! `Σ_i eq(ρ,i)·E_i = 0` for the bit-transpose error `E ≠ 0` — a nonzero
+//! multilinear polynomial in `ρ` that vanishes with probability at most
+//! `7/2^128` (Schwartz–Zippel). With `s` pinned, the recombination pins
+//! `y = ŵ(r_A, r_B)` for the *committed* table, and the sum-check plus
+//! the fold chain carry the packed claim `P̂(r̃)` with the standard
+//! FRI-style proximity analysis of the main PCS (crate docs).
 
-use crate::code::{CodeParams, Codeword};
 use crate::eval::{level_domain, LevelOpen, PathQuery, PcsParams, PcsStatement};
-use magnetar_field::{eq_coefficients, mul, phi_c, Gf128};
+use magnetar_field::{eq_coefficients, mul, phi_c, EqBits, Gf128, ONE, ZERO};
 use magnetar_hash::{MerkleTree, Transcript, DIGEST};
 use magnetar_sumcheck::{
     engine::{SumcheckProver, SumcheckVerifier},
-    public::EqFactor,
     BindOrder, SumcheckSpec, Term,
 };
+use rayon::prelude::*;
 
-/// A ring-switch proof for one bit-vector claim.
+/// A ring-switch proof for one bit-vector claim: the DP24 reduction plus
+/// the main codeword's fold chain.
 #[derive(Clone, Debug)]
 pub struct RingProof {
-    /// Sum-check round messages (degree 2, 3 coefficients per round).
+    /// The 128 per-plane partial evaluations `s_b = ŵ_b(r_A)`.
+    pub partials: Vec<Gf128>,
+    /// Sum-check round messages over the word cube (degree 2, 3
+    /// coefficients per round).
     pub rounds: Vec<Vec<Gf128>>,
-    /// Fold-level roots of the C-codeword chain, levels 0..=n (level 0 is
-    /// the C-codeword's own root, pinned by the φ-anchors).
+    /// Fold-level roots of the main codeword's chain, levels `1..=n`
+    /// (level 0 is the commitment itself).
     pub level_roots: Vec<[u8; DIGEST]>,
-    /// The claimed `Ĉ(r*)` (= the tail entry `D_n(0)`).
+    /// The claimed `P̂(r̃)` (equals the tail entry `D_n(0)`).
     pub terminal_claim: Gf128,
-    /// Correlated path queries on the C-chain.
+    /// Correlated path queries on the main codeword's chain.
     pub queries: Vec<PathQuery>,
     /// The tail `D_n` (`2^k` values) with paths.
     pub tail: Vec<(Gf128, Vec<[u8; DIGEST]>)>,
-    /// Level-0 anchors `(x, packed_leaf, main_path, c_value, c_path)`: the
-    /// exact `φ_c` checks tying `C`'s cube slice to the main commitment.
-    pub anchors: Vec<Anchor>,
 }
 
-/// One φ-anchor opening.
+/// The transparent row-batched eq-indicator
+/// `A(u) = φ_{eq(ρ,·)}(eq(z, u))` — multilinear in `u` (each coordinate of
+/// a product of per-variable-linear elements is multilinear over the
+/// Boolean cube), verifier-evaluable in `O(n)` without any table.
 #[derive(Clone, Debug)]
-pub struct Anchor {
-    /// Cube position `x` (the table index).
-    pub x: usize,
-    /// The main codeword's `(x, 0)` entry: the packed leaf `P(x)`.
-    pub packed_leaf: Gf128,
-    pub main_path: Vec<[u8; DIGEST]>,
-    /// The C-codeword's `(x, 0)` entry.
-    pub c_value: Gf128,
-    pub c_path: Vec<[u8; DIGEST]>,
+pub struct RingEqInd {
+    /// The word point `z` (= `r_A`).
+    pub z: Vec<Gf128>,
+    /// The row-batch coefficients `eq(ρ, ·)`.
+    pub rb: [Gf128; 128],
+}
+
+impl RingEqInd {
+    /// The DP24 tensor-algebra evaluation — the multilinear extension of
+    /// the materialized Boolean table. (The *formula*
+    /// `φ_rb(eq(z, ·))` agrees with the table on the Boolean cube but is
+    /// **not** multilinear — the coordinate functionals are only
+    /// F₂-linear — so it may NOT be used off the cube. The tensor
+    /// recursion below is the correct extension: linear in each `q_i` by
+    /// construction, and agreeing with the table on the cube.)
+    fn tensor_eval(&self, point: &[Gf128]) -> Gf128 {
+        // T = from_vertical(ONE): a 128-component tensor state t with
+        // t[0] = 1. Each word coordinate applies
+        //   T ← T + z_i·T (vertical scale) + H(q_i)·T (horizontal scale),
+        // where the horizontal multiplication by q_i sends component k to
+        // Σ_j [β_j·q_i]_k · t_j (the transpose of the multiplication
+        // matrix, β_j = x^j).
+        let mut t = vec![ZERO; 128];
+        t[0] = ONE;
+        for (&z_i, &q_i) in self.z.iter().zip(point.iter()) {
+            let mut new_t = t.clone();
+            for j in 0..128usize {
+                let tj = t[j];
+                if tj == ZERO {
+                    continue;
+                }
+                new_t[j] += mul(tj, z_i);
+                let h = mul(Gf128(1u128 << j), q_i);
+                let mut bits = h.0;
+                while bits != 0 {
+                    let k = bits.trailing_zeros() as usize;
+                    new_t[k] += tj;
+                    bits &= bits - 1;
+                }
+            }
+            t = new_t;
+        }
+        // fold_vertical: the transpose-pairing with the row-batch
+        // coefficients (the same fold as the partials').
+        fold_partials(&t, &self.rb)
+    }
+}
+
+impl magnetar_sumcheck::public::PublicFactor for RingEqInd {
+    fn num_vars(&self) -> usize {
+        self.z.len()
+    }
+
+    fn materialize(&self) -> Vec<Gf128> {
+        let eq = EqBits::build(&self.z).values;
+        let rb = &self.rb;
+        eq.par_iter().map(|&e| phi_c(e, rb)).collect()
+    }
+
+    fn eval_at(&self, point: &[Gf128]) -> Gf128 {
+        self.tensor_eval(point)
+    }
+}
+
+/// The bit-transpose fold `σ = Σ_i rb_i·b_i` with
+/// `b_i = Σ_j bit_i(s_j)·β_j` — the row-batch pairing of the partials.
+#[inline]
+pub fn fold_partials(s: &[Gf128], rb: &[Gf128; 128]) -> Gf128 {
+    let mut acc = ZERO;
+    for i in 0..128 {
+        let mut bits = 0u128;
+        for (j, &s_j) in s.iter().enumerate() {
+            if (s_j.0 >> i) & 1 == 1 {
+                bits |= 1u128 << j;
+            }
+        }
+        acc += mul(rb[i], Gf128(bits));
+    }
+    acc
+}
+
+/// The 128 per-plane partial evaluations
+/// `s_b = Σ_u eq(r_A, u)·bit_b(P(u))` — one popcount-driven pass over the
+/// packed table with the eq table (parallel over chunks).
+fn partial_evals(eq_z: &[Gf128], packed: &[Gf128]) -> Vec<Gf128> {
+    debug_assert_eq!(eq_z.len(), packed.len());
+    packed
+        .par_iter()
+        .zip(eq_z.par_iter())
+        .fold(
+            || [ZERO; 128],
+            |mut acc, (&p, &e)| {
+                let mut bits = p.0;
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    acc[b] += e;
+                    bits &= bits - 1;
+                }
+                acc
+            },
+        )
+        .reduce(
+            || [ZERO; 128],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b.iter()) {
+                    *x += *y;
+                }
+                a
+            },
+        )
+        .to_vec()
 }
 
 /// Prove the bit-claim `ŵ(r_A, r_B) = y`, where the bit vector is given by
-/// its packed table `P` (the main committed table), `r_A` are the block
-/// variables and `r_B` the 7 packing (bit) variables. `main_codeword` /
-/// `main_tree` belong to the main commitment.
+/// its packed table `P` — the **main committed table**. `main_codeword` /
+/// `main_tree` belong to the main commitment; the fold chain reuses the
+/// codeword, so there is no second encode and no separate level-0 tree.
 #[allow(clippy::too_many_arguments)]
 pub fn prove_ring_switch(
     params: &PcsParams,
-    main_codeword: &Codeword,
+    main_codeword: &crate::code::Codeword,
     main_tree: &MerkleTree,
     packed: &[Gf128],
     r_a: &[Gf128],
@@ -86,20 +207,45 @@ pub fn prove_ring_switch(
 ) -> RingProof {
     let n = packed.len().trailing_zeros() as usize;
     debug_assert_eq!(r_a.len(), n);
-    // 1–2. c coefficients and the c-folded table.
-    let c = eq_coefficients(r_b);
-    let c_table: Vec<Gf128> = packed.iter().map(|&p| phi_c(p, &c)).collect();
-    // 3. Sum-check over the block variables.
+    // ---- 1. The partial evaluations s_b (one packed pass).
+    let eq_z = EqBits::build(r_a).values;
+    let partials = partial_evals(&eq_z, packed);
+    drop(eq_z);
+    // The honest identity: the partials recombine to the claim (the
+    // verifier checks this; asserting it catches prover-side wiring bugs).
+    {
+        let c = eq_coefficients(r_b);
+        let mut lhs = ZERO;
+        for (b, &s_b) in partials.iter().enumerate() {
+            lhs += mul(c[b], s_b);
+        }
+        debug_assert_eq!(
+            lhs, y,
+            "ring: the honest partials must recombine to the claim"
+        );
+    }
+    t.absorb_field("ring-partials", &partials);
+    // ---- 2. The row batch: sample rho, derive sigma.
+    let rho_vec = t.challenge_field_vec("ring-rho", 7);
+    let mut rho = [ZERO; 7];
+    rho.copy_from_slice(&rho_vec);
+    let rb = eq_coefficients(&rho);
+    let sigma = fold_partials(&partials, &rb);
+    // ---- 3. One sum-check over the word cube: dense = P, public = A.
+    let ind = RingEqInd {
+        z: r_a.to_vec(),
+        rb,
+    };
     let spec = SumcheckSpec {
         num_vars: n,
-        dense: vec![c_table.clone()],
-        public: vec![Box::new(EqFactor::new(r_a.to_vec()))],
+        dense: vec![packed.to_vec()],
+        public: vec![Box::new(ind)],
         terms: vec![Term {
             coeff: Gf128(1),
             dense: vec![0],
             public: vec![0],
         }],
-        claim: y,
+        claim: sigma,
     };
     let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(n);
@@ -112,38 +258,33 @@ pub fn prove_ring_switch(
     let (claims, _) = prover.finish();
     let terminal_claim = claims[0];
     t.absorb_field("ring-terminal", &[terminal_claim]);
-
-    // 4. The C-codeword chain at the same challenges.
-    let code_params = CodeParams::derive(n, params.k, &params.domain);
-    let mut cw = Codeword::encode(&code_params, &c_table);
-    let c_domain = format!("{}/ring", params.domain);
-    let mut trees = Vec::with_capacity(n + 1);
+    // ---- 4. The main codeword's own fold chain at the same challenges
+    //     (levels 1..=n fresh; level 0 is the commitment).
+    let mut cw = main_codeword.clone();
+    let mut trees = Vec::with_capacity(n);
     let mut values = Vec::with_capacity(n + 1);
-    trees.push(MerkleTree::build(&level_domain(&c_domain, 0), &cw.values));
     values.push(cw.values.clone());
     for (i, &rc) in challenges.iter().enumerate() {
         cw = cw.fold(0, rc);
         trees.push(MerkleTree::build(
-            &level_domain(&c_domain, i + 1),
+            &level_domain(&params.domain, i + 1),
             &cw.values,
         ));
         values.push(cw.values.clone());
     }
     let level_roots: Vec<[u8; DIGEST]> = trees.iter().map(|tr| tr.root()).collect();
     for (i, root) in level_roots.iter().enumerate() {
-        t.absorb_digest(&format!("ring-root-{i}"), root);
+        t.absorb_digest(&format!("ring-root-{}", i + 1), root);
     }
-
-    // Correlated queries.
-    let base_leaves = trees[0].n_leaves() as u64;
+    // Correlated queries (level 0 opens against the commitment's tree).
+    let base_leaves = main_tree.n_leaves() as u64;
     let mut queries = Vec::with_capacity(params.queries);
     for qi in 0..params.queries {
         let pos = t.challenge_index(&format!("ring-query-{qi}"), base_leaves) as usize;
-        queries.push(build_query(&trees, &values, pos));
+        queries.push(build_query(main_tree, &trees, &values, pos));
     }
-
     // Tail.
-    let tail_tree = trees.last().unwrap();
+    let tail_tree = trees.last().expect("n >= 1 for a real witness");
     let tail_vals = values.last().unwrap();
     let tail: Vec<(Gf128, Vec<[u8; DIGEST]>)> = (0..tail_tree.n_leaves())
         .map(|i| {
@@ -151,44 +292,40 @@ pub fn prove_ring_switch(
             (tail_vals[i], path)
         })
         .collect();
-
-    // Anchors: q random cube positions.
-    let mut anchors = Vec::with_capacity(params.queries);
-    for ai in 0..params.queries {
-        let x = t.challenge_index(&format!("ring-anchor-{ai}"), 1u64 << n) as usize;
-        let (_, main_path) = main_tree.open(x);
-        let packed_leaf = main_codeword.values[x];
-        let (_, c_path) = trees[0].open(x);
-        anchors.push(Anchor {
-            x,
-            packed_leaf,
-            main_path,
-            c_value: values[0][x],
-            c_path,
-        });
-    }
-
     RingProof {
+        partials,
         rounds,
         level_roots,
         terminal_claim,
         queries,
         tail,
-        anchors,
     }
 }
 
-fn build_query(trees: &[MerkleTree], values: &[Vec<Gf128>], pos: usize) -> PathQuery {
-    let n = trees.len() - 1;
+fn build_query(
+    main_tree: &MerkleTree,
+    trees: &[MerkleTree],
+    values: &[Vec<Gf128>],
+    pos: usize,
+) -> PathQuery {
+    let n = trees.len();
     let mut levels = Vec::with_capacity(n);
     let mut idx = pos;
     for i in 0..n {
         let a_idx = idx & !1usize;
         let b_idx = idx | 1usize;
         let next_idx = idx >> 1;
-        let (_, a_path) = trees[i].open(a_idx);
-        let (_, b_path) = trees[i].open(b_idx);
-        let (_, c_path) = trees[i + 1].open(next_idx);
+        let (a_path, b_path, c_path) = if i == 0 {
+            let (_, ap) = main_tree.open(a_idx);
+            let (_, bp) = main_tree.open(b_idx);
+            let (_, cp) = trees[0].open(next_idx);
+            (ap, bp, cp)
+        } else {
+            let (_, ap) = trees[i - 1].open(a_idx);
+            let (_, bp) = trees[i - 1].open(b_idx);
+            let (_, cp) = trees[i].open(next_idx);
+            (ap, bp, cp)
+        };
         levels.push(LevelOpen {
             a: values[i][a_idx],
             b: values[i][b_idx],
@@ -217,22 +354,44 @@ pub fn verify_ring_switch(
     if r_a.len() != n {
         return Err("ring: point length mismatch");
     }
-    if proof.rounds.len() != n || proof.level_roots.len() != n + 1 {
+    if proof.partials.len() != 128 {
+        return Err("ring: partial count mismatch");
+    }
+    if proof.rounds.len() != n || proof.level_roots.len() != n {
         return Err("ring: proof shape mismatch");
     }
-    if proof.queries.len() != params.queries || proof.anchors.len() != params.queries {
-        return Err("ring: query/anchor count mismatch");
+    if proof.queries.len() != params.queries {
+        return Err("ring: query count mismatch");
     }
+    // ---- 1. The recombination: y == Σ_b eq(r_B, b)·s_b.
     let c = eq_coefficients(r_b);
-    // ---- 1. Sum-check replay (captures the fold challenges).
+    let mut lhs = ZERO;
+    for (b, &s_b) in proof.partials.iter().enumerate() {
+        lhs += mul(c[b], s_b);
+    }
+    if lhs != y {
+        return Err("ring: partial recombination mismatch");
+    }
+    t.absorb_field("ring-partials", &proof.partials);
+    // ---- 2. The row batch: rho, sigma (verifier-derived).
+    let rho_vec = t.challenge_field_vec("ring-rho", 7);
+    let mut rho = [ZERO; 7];
+    rho.copy_from_slice(&rho_vec);
+    let rb = eq_coefficients(&rho);
+    let sigma = fold_partials(&proof.partials, &rb);
+    // ---- 3. Replay the sum-check (captures the fold challenges).
+    let ind = RingEqInd {
+        z: r_a.to_vec(),
+        rb,
+    };
     let public: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
-        vec![Box::new(EqFactor::new(r_a.to_vec()))];
+        vec![Box::new(ind)];
     let terms = vec![Term {
         coeff: Gf128(1),
         dense: vec![0],
         public: vec![0],
     }];
-    let mut verifier = SumcheckVerifier::new(n, y, &public, terms, BindOrder::Increasing);
+    let mut verifier = SumcheckVerifier::new(n, sigma, &public, terms, BindOrder::Increasing);
     let mut challenges = Vec::with_capacity(n);
     for msg in &proof.rounds {
         let round_msg = magnetar_sumcheck::RoundMsg(msg.clone());
@@ -240,12 +399,12 @@ pub fn verify_ring_switch(
     }
     verifier.finish(&[proof.terminal_claim])?;
     t.absorb_field("ring-terminal", &[proof.terminal_claim]);
+    // ---- 4. Level roots.
     for (i, root) in proof.level_roots.iter().enumerate() {
-        t.absorb_digest(&format!("ring-root-{i}"), root);
+        t.absorb_digest(&format!("ring-root-{}", i + 1), root);
     }
-    let c_domain = format!("{}/ring", params.domain);
     let leaves_at = |lvl: usize| -> u64 { 1u64 << (n - lvl + params.k) };
-    // ---- 2. Correlated queries.
+    // ---- 5. Correlated queries against the main commitment's chain.
     for (qi, q) in proof.queries.iter().enumerate() {
         let pos = t.challenge_index(&format!("ring-query-{qi}"), leaves_at(0)) as usize;
         if q.levels.len() != n {
@@ -256,20 +415,25 @@ pub fn verify_ring_switch(
             let a_idx = idx & !1usize;
             let b_idx = idx | 1usize;
             let next_idx = idx >> 1;
-            let dom_i = level_domain(&c_domain, i);
+            let dom_i = level_domain(&main_stmt.domain, i);
+            let expected_root = if i == 0 {
+                main_stmt.root
+            } else {
+                proof.level_roots[i - 1]
+            };
             let leaf = MerkleTree::leaf_digest_of(&dom_i, leaves_at(i) as usize, a_idx, lvl.a);
             let ra = MerkleTree::verify(&dom_i, leaves_at(i) as usize, a_idx, leaf, &lvl.a_path)
                 .map_err(|_| "ring: query path a invalid")?;
-            if ra != proof.level_roots[i] {
+            if ra != expected_root {
                 return Err("ring: query root a mismatch");
             }
             let leaf = MerkleTree::leaf_digest_of(&dom_i, leaves_at(i) as usize, b_idx, lvl.b);
-            let rb = MerkleTree::verify(&dom_i, leaves_at(i) as usize, b_idx, leaf, &lvl.b_path)
+            let rb_ = MerkleTree::verify(&dom_i, leaves_at(i) as usize, b_idx, leaf, &lvl.b_path)
                 .map_err(|_| "ring: query path b invalid")?;
-            if rb != proof.level_roots[i] {
+            if rb_ != expected_root {
                 return Err("ring: query root b mismatch");
             }
-            let dom_next = level_domain(&c_domain, i + 1);
+            let dom_next = level_domain(&main_stmt.domain, i + 1);
             let leaf =
                 MerkleTree::leaf_digest_of(&dom_next, leaves_at(i + 1) as usize, next_idx, lvl.c);
             let rc = MerkleTree::verify(
@@ -280,9 +444,10 @@ pub fn verify_ring_switch(
                 &lvl.c_path,
             )
             .map_err(|_| "ring: query path c invalid")?;
-            if rc != proof.level_roots[i + 1] {
+            if rc != proof.level_roots[i] {
                 return Err("ring: query root c mismatch");
             }
+            // Fold relation: (1+r)·a + r·b = c.
             let folded = lvl.a + mul(challenges[i], lvl.a + lvl.b);
             if folded != lvl.c {
                 return Err("ring: fold relation failed");
@@ -290,69 +455,21 @@ pub fn verify_ring_switch(
             idx = next_idx;
         }
     }
-    // ---- 3. Tail.
+    // ---- 6. Tail.
     if proof.tail.len() != (1usize << params.k) {
         return Err("ring: tail length mismatch");
     }
-    let tail_dom = level_domain(&c_domain, n);
+    let tail_dom = level_domain(&main_stmt.domain, n);
     for (i, (val, path)) in proof.tail.iter().enumerate() {
         let leaf = MerkleTree::leaf_digest_of(&tail_dom, 1usize << params.k, i, *val);
         let root = MerkleTree::verify(&tail_dom, 1usize << params.k, i, leaf, path)
             .map_err(|_| "ring: tail path invalid")?;
-        if root != proof.level_roots[n] {
+        if root != proof.level_roots[n - 1] {
             return Err("ring: tail root mismatch");
         }
     }
     if proof.tail[0].0 != proof.terminal_claim {
         return Err("ring: tail terminal entry mismatch");
-    }
-    // ---- 4. Anchors: φ_c ties the C-chain's cube slice to the main
-    // commitment.
-    let main_leaves = 1u64 << (n + params.k);
-    for anchor in &proof.anchors {
-        if anchor.x >= (1usize << n) {
-            return Err("ring: anchor index out of range");
-        }
-        // Main side: level-0 main codeword at (x, 0) — leaf index x.
-        let main_leaf = MerkleTree::leaf_digest_of(
-            &level_domain(&main_stmt.domain, 0),
-            main_leaves as usize,
-            anchor.x,
-            anchor.packed_leaf,
-        );
-        let main_root = MerkleTree::verify(
-            &level_domain(&main_stmt.domain, 0),
-            main_leaves as usize,
-            anchor.x,
-            main_leaf,
-            &anchor.main_path,
-        )
-        .map_err(|_| "ring: anchor main path invalid")?;
-        if main_root != main_stmt.root {
-            return Err("ring: anchor main root mismatch");
-        }
-        // Exact φ_c check.
-        if phi_c(anchor.packed_leaf, &c) != anchor.c_value {
-            return Err("ring: anchor phi_c mismatch");
-        }
-        // C side: the C-chain's level-0 entry at x.
-        let c_leaf = MerkleTree::leaf_digest_of(
-            &level_domain(&c_domain, 0),
-            leaves_at(0) as usize,
-            anchor.x,
-            anchor.c_value,
-        );
-        let c_root = MerkleTree::verify(
-            &level_domain(&c_domain, 0),
-            leaves_at(0) as usize,
-            anchor.x,
-            c_leaf,
-            &anchor.c_path,
-        )
-        .map_err(|_| "ring: anchor c path invalid")?;
-        if c_root != proof.level_roots[0] {
-            return Err("ring: anchor c root mismatch");
-        }
     }
     Ok(())
 }
@@ -419,9 +536,9 @@ mod tests {
         p.terminal_claim += Gf128(1);
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
-        // Tampered anchor (phi_c mismatch).
+        // Tampered partial (breaks the recombination).
         let mut p = proof.clone();
-        p.anchors[0].c_value += Gf128(1);
+        p.partials[0] += Gf128(1);
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
         // Tampered query fold value.
@@ -429,5 +546,74 @@ mod tests {
         p.queries[0].levels[0].a += Gf128(1);
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+        // Tampered level root.
+        let mut p = proof.clone();
+        p.level_roots[0][0] ^= 0xFF;
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+        // Tampered round message.
+        let mut p = proof.clone();
+        p.rounds[0][1] += Gf128(1);
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+        // Tampered tail entry.
+        let mut p = proof.clone();
+        p.tail[1].0 += Gf128(1);
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+    }
+
+    /// The core DP24 identity, checked end-to-end through the real
+    /// prover: the sum-check over `P × A` must close at exactly
+    /// `fold(s, eq(ρ,·))`, and the chain's tail must be `P̂(r̃)`.
+    #[test]
+    fn ring_honest_identity() {
+        use crate::eval::commit_table;
+        let mut rng = rand::rng();
+        let params = PcsParams {
+            k: 1,
+            queries: 4,
+            domain: "test-ring-id".into(),
+        };
+        let n = 5;
+        let (_bits, packed) = pack_random_bits(&mut rng, 1 << n);
+        let r_a: Vec<Gf128> = (0..n).map(|_| rg(&mut rng)).collect();
+        let r_b: [Gf128; 7] = std::array::from_fn(|_| rg(&mut rng));
+        // y via the dense definition.
+        let eq_a = magnetar_field::EqBits::build(&r_a).values;
+        let c = eq_coefficients(&r_b);
+        let mut y = ZERO;
+        for u in 0..(1 << n) {
+            let mut cw = ZERO;
+            for b in 0..128 {
+                if (packed[u].0 >> b) & 1 == 1 {
+                    cw += c[b];
+                }
+            }
+            y += mul(eq_a[u], cw);
+        }
+        let (main_cw, main_tree, stmt) = commit_table(&params, &packed);
+        let mut t = Transcript::new("ring-id", &[b"t"]);
+        let proof = prove_ring_switch(
+            &params, &main_cw, &main_tree, &packed, &r_a, &r_b, y, &mut t,
+        );
+        // The partials must equal the per-plane MLE evaluations.
+        for b in 0..128usize {
+            let mut want = ZERO;
+            for u in 0..(1 << n) {
+                if (packed[u].0 >> b) & 1 == 1 {
+                    want += eq_a[u];
+                }
+            }
+            assert_eq!(proof.partials[b], want, "partial {b}");
+        }
+        // The honest identity holds end-to-end: the verifier replays the
+        // rounds (including the terminal identity with the tensor-eval
+        // public factor) and checks the fold chain.
+        let mut tv = Transcript::new("ring-id", &[b"t"]);
+        assert!(
+            verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &proof, &mut tv).is_ok(),
+            "honest proof must verify"
+        );
     }
 }

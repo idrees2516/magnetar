@@ -234,7 +234,7 @@ pub fn prove_virtual_spartan(
     let row_vars_fld = rows_fld.trailing_zeros() as usize;
     let joint_vars_bin = s + row_vars_bin;
     let joint_vars_fld = s + row_vars_fld;
-    let w128 = (w_cols + 127) / 128;
+    let w128 = (w_cols).div_ceil(128);
     debug_assert_eq!(w_packed.len(), q * w128);
     // Sample the two τ points (per-relation joint spaces).
     let tau_bin = t.challenge_field_vec("vs-tau-bin", joint_vars_bin);
@@ -581,7 +581,7 @@ fn build_m_combo(
 /// set-bit count.
 fn fold_packed_w(w_packed: &[u128], q: usize, w_cols: usize, r_inst: &[Gf128]) -> Vec<Gf128> {
     let eq = magnetar_field::EqBits::build(r_inst).values;
-    let w128 = (w_cols + 127) / 128;
+    let w128 = (w_cols).div_ceil(128);
     debug_assert_eq!(w_packed.len(), q * w128);
     let mut out = vec![ZERO; w_cols];
     for u in 0..q {
@@ -602,7 +602,7 @@ fn fold_packed_w(w_packed: &[u128], q: usize, w_cols: usize, r_inst: &[Gf128]) -
                 word as u64
             } else {
                 // Partial low half: mask off columns ≥ w_cols.
-                word as u64 & (u64::MAX >> (64 - (w_cols - col_base) % 64).max(0).min(64))
+                word as u64 & (u64::MAX >> (64 - (w_cols - col_base) % 64).min(64))
             };
             while lo != 0 {
                 let b = lo.trailing_zeros() as usize;
@@ -903,7 +903,7 @@ mod tests {
         // plus the shared x vector — this test's witness matches the
         // protocol layout z = (w, 1, x) with a single shared x.
         let w_cols = m / 2;
-        let w128 = (w_cols + 127) / 128;
+        let w128 = (w_cols).div_ceil(128);
         let mut w_packed = vec![0u128; q * w128];
         for u in 0..q {
             for k in 0..w128 {
