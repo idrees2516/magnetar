@@ -317,7 +317,7 @@ pub fn prove_routing_join(
     let mut x_work = witness.x.clone();
     // Pack each column's X bits for the h-round selects (the X table is
     // still raw bits at this point — the u-fold has not run).
-    let words_per_col = u_v.div_ceil(64);
+    let words_per_col = (1usize << u_v).div_ceil(64); // 2^u_v slots per column
     for col in cols.iter_mut() {
         let mut bits = vec![0u64; words_per_col];
         let base = col.j << u_v;

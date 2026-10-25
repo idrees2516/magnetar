@@ -12,7 +12,7 @@ fn main() {
         // Warm the rayon pool.
         let _ = MerkleTree::build("bench/dom/level/0", &leaves[..1024]);
         let t0 = Instant::now();
-        let tree = MerkleTree::build("bench/dom/level/0", &leaves);
+        let _tree = MerkleTree::build("bench/dom/level/0", &leaves);
         let dt = t0.elapsed().as_secs_f64() * 1e3;
         println!(
             "2^{log2} leaves: {dt:7.1} ms  ({:6.0}k leaf-hashes/s)",
