@@ -39,8 +39,14 @@ pub struct PcsParams {
 
 impl Default for PcsParams {
     fn default() -> Self {
+        // The FastChunk operating point (rate 1/2): the fastest encode +
+        // Merkle phase — the **chunk** profile. Every profile's per-query
+        // far-word rejection is the Schwartz–Zippel bound `n/2^128` with
+        // `n ≤ 64` (≥ 122 bits per query), so each profile holds the
+        // 120-bit envelope on its own; the wrap re-proves the public tail
+        // at a deep rate for size.
         PcsParams {
-            k: 2,
+            k: 1,
             queries: 40,
             domain: "magnetar/pcs/default".to_string(),
         }
