@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.9.1 — the instance-batching release (the paper's §5.1 operating point)
+
+**`WITNESS_LAYOUT::DEFAULT_CPI = 4` cycles per SIMD instance** — the
+paper's "each SIMD instance covers a fixed number of consecutive
+cycles", as a runtime parameter through `keygen_with` (the benches
+sweep it via `MAGNETAR_CPI`; `cpi = 1` recovers the one-cycle layout
+byte-identically).
+
+### The restructure
+- `InstanceGeometry` (magnetar-cpu): the per-instance column map
+  `col' = cpi·col + δ` — the cycle-within-instance coordinate is the
+  LOW bits, **one variable shared by every segment** (a per-segment δ
+  placement breaks the pc-Ψ and the ram-addr-Ψ at cpi > 1: the
+  auxiliary arguments consume claims of *different* segments against
+  one cycle cube).
+- `build_circuit_batched(cpi)`: both relations' row indexing reshapes
+  over `(δ ‖ row-within-cycle)` blocks; the constraint set is the
+  per-cycle relation replicated — no new rows, the same soundness
+  surface (an assembled instance satisfies the batched circuit iff its
+  cycles satisfy the per-cycle circuit; tested at cpi 1/2/4/8).
+- The segment claims' local point is `[δ-vars ‖ col-vars]`; the cycle
+  point of cycle `u·cpi + δ` is `[δ-vars ‖ instance-vars]` — threaded
+  through the twists, the Ψs, the routers (the X claims reordered into
+  the components' `[δ ‖ bit-index ‖ instance]` convention), the shout,
+  the boundary claims, and the cross-step flags.
+- The Mosaic components keep their total cube (`len·T` bits at every
+  cpi); the direct tables' local index is `col·cpi + δ`.
+- The streaming ladder proves + verifies at cpi 2 and 4 end-to-end.
+
+### The measured effect (4-vCPU EPYC, AVX-512)
+| cpi | 2^13 | 2^14 | 2^15 | 2^16 | root(2^16) |
+|---|---|---|---|---|---|
+| 1 | 15,009 | 14,980 | 13,999 | 12,641 | 1,930 ms |
+| 2 | 14,907 | 14,972 | 14,002 | 12,656 | 1,814 ms |
+| **4** | **15,077** | **15,004** | **14,028** | **13,079** | **1,620 ms** |
+| 8 | 14,825 | 14,475 | 13,645 | 12,700 | 1,658 ms |
+
+The Spartan flop count is cpi-invariant (the joint cube, the applies,
+and the folds are the same total size) — the gain is the per-instance
+discharge work (the local `bound_se` walk) amortizing over 4 cycles;
+at cpi 8 the per-segment inner/m_combo constants already eat it.
+
+### Also in this release
+- The misplaced prover-side honesty debug-assert in the cross-step S1
+  (the tamper tests legitimately prove false claims; the verifier
+  rejects them — release builds compiled it out, which is why the
+  0.9.0 gate missed it on the debug side).
+- The newer toolchain's clippy lints (div_ceil, clamp, late-init,
+  cfg(test) helpers, items-after-test-module) — the gate is
+  `-D warnings` clean again.
+- The word-based witness loads (`wword_cycle`): the 64-bit word fast
+  path at cpi = 1, the strided gather at cpi > 1.
+
 ## [0.8.0] — the production-throughput release
 
 ### Added

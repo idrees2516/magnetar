@@ -64,23 +64,23 @@ Proofs shrank by ~60–90 KiB (the anchors).
 `magnetar-bench-erc20` proves the paper's `erc20-mixed-block` shape:
 balance transfers between two accounts with checked subtraction, every
 16th transfer failing the underflow check — 12 cycles per executed
-transfer at the 64-bit balance width of this RV64I reference CPU:
+transfer at the 64-bit balance width of this RV64I reference CPU
+(default `cpi = 4`; `MAGNETAR_CPI=1|2|8` sweeps the instance density):
 
 | T | segments | tx | prove (ms) | cycles/s | tx/s | peak RSS |
 |---|---|---|---|---|---|---|
-| 2^12 (monolithic) | — | 341 | 614 | 6,668 | 555 | 165 MiB |
-| 2^13 | 8 | 682 | 672 | 12,186 | 1,014 | 259 MiB |
-| 2^14 | 16 | 1,365 | 1,321 | 12,398 | 1,033 | 344 MiB |
-| 2^15 | 32 | 2,730 | 2,799 | 11,707 | 975 | 590 MiB |
-| 2^16 | 64 | 5,461 | 6,300 | 10,402 | 867 | 1.37 GiB |
+| 2^12 (monolithic) | — | 341 | 554 | 7,395 | 616 | 165 MiB |
+| 2^13 | 8 | 682 | 546 | 15,006 | 1,249 | 254 MiB |
+| 2^14 | 16 | 1,365 | 1,088 | 15,061 | 1,255 | 340 MiB |
+| 2^15 | 32 | 2,730 | 2,483 | 13,198 | 1,100 | 571 MiB |
+| 2^16 | 64 | 5,461 | 4,954 | **13,228** | **1,102** | 1.12 GiB |
 
 **The pooled proving-pool run** (5 × 4-vCPU instances proving
-independent 2^16 batches concurrently): ≈3,788 tx/s aggregate in this
-release's run — the free tier's workers landed on slower hosts than the
-development instance (~700 vs ~1,050 tx/s standalone), and the cross-VM
-contention eats ~35–40% today. The honest per-machine rate is the lever
-the optimizations move (936 → 1,034–1,109 tx/s this release). The
-measured remaining levers, in order of impact:
+independent 2^16 batches concurrently): ≈3,788 tx/s aggregate in the
+0.8.0 run — the per-machine rate has since moved 867 → 1,102 tx/s
+(0.8.0 → 0.9.1), so a fresh pool run lands ≈4,800 tx/s aggregate at
+the same contention. The honest per-machine rate is the lever the
+optimizations move. The measured remaining levers, in order of impact:
 
 1. ~~The ring switch's FRI chain~~ **DONE** — the DP24 commitment-free
    reduction (partials + the row batch + one sum-check with the packed
@@ -99,16 +99,23 @@ measured remaining levers, in order of impact:
    inc bit tables generically (the packed-inc/select-fold lever — the
    same packed-word select the join's h-rounds now use); the outer
    rounds' mask window is already the fast path.
-4. **The paper's per-instance amortization** — the largest structural
-   lever left (4–8×): the paper runs **several consecutive cycles per
-   SIMD instance** ("each SIMD instance covers a fixed number of
-   consecutive cycles, and cross-step constraints tie adjacent
-   instances together") while this implementation pays one instance
-   per cycle: the cross-step rows, the boundary binding, and the
-   per-instance row padding all divide by the cycles-per-instance count.
-   The restructure touches the witness layout (`W`'s columns become
-   per-instance column blocks), the two relations' row indexing, the
-   twists' cycle dimension, and the cross-step's next-MLE argument.
+4. ~~The paper's per-instance amortization~~ **DONE (0.9.1)** — the
+   instance-batching restructure: `WITNESS_LAYOUT::DEFAULT_CPI = 4`
+   cycles per SIMD instance, the two relations' row indexing reshaped
+   over `(δ ‖ row-within-cycle)` blocks, the columns over the batched
+   segments (`col' = cpi·col + δ`, one shared δ variable), the `(1, x)`
+   half shared per instance, and the claims threaded `[δ ‖ instance]`
+   through every auxiliary argument. The honest measured effect (the
+   Spartan flop count is cpi-invariant — the gain is the per-instance
+   discharge work): **2^16 +3.5% cycles/s (12,641 → 13,079) and the
+   streaming root −16% (1,930 → 1,620 ms)**; flat below 2^15; the
+   verifier's public fold drops from per-instance to O(m/2) once.
+   This is the batch-dimension amortization of the Flock lineage
+   (ePrint 2026/1329: the batch-R1CS zerocheck + the cheap lincheck
+   over the batch dimension) applied to Magnetar's cycle instances;
+   the next Flock-shaped item is the zerocheck's small-value window
+   extended over the joint (instance ‖ row) cube.
+
 
 Every row proves **and verifies** end-to-end (the assert is in the
 harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,
