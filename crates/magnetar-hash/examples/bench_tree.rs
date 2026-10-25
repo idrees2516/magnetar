@@ -6,7 +6,9 @@ use std::time::Instant;
 fn main() {
     for log2 in [16usize, 18, 20] {
         let n = 1usize << log2;
-        let leaves: Vec<Gf128> = (0..n).map(|i| Gf128(i as u128 * 0x9E3779B97F4A7C15)).collect();
+        let leaves: Vec<Gf128> = (0..n)
+            .map(|i| Gf128(i as u128 * 0x9E3779B97F4A7C15))
+            .collect();
         // Warm the rayon pool.
         let _ = MerkleTree::build("bench/dom/level/0", &leaves[..1024]);
         let t0 = Instant::now();

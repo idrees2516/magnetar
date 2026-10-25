@@ -961,7 +961,10 @@ pub fn prove_inner(
             }
             acc
         };
-        [eval_word_mle(old_off, &p_old_pt), eval_word_mle(src_off, &p_src_pt)]
+        [
+            eval_word_mle(old_off, &p_old_pt),
+            eval_word_mle(src_off, &p_src_pt),
+        ]
     };
     t.absorb_field("store-x", &store_x_claims);
     // ---- 6. BinaryShout for the bytecode.

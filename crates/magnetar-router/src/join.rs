@@ -125,6 +125,10 @@ struct Column {
     tau: Vec<Gf128>,
     /// o-phase: the sparse pairs at this column's selector position.
     pairs: Vec<Pair>,
+    /// The column's X slice packed as bits (`(u_v + 63) / 64` words) —
+    /// during the h-rounds the X table is still raw bits, so the row
+    /// contraction is a popcount-driven select, never a multiply.
+    x_bits: Vec<u64>,
 }
 
 struct Pair {
@@ -306,10 +310,31 @@ pub fn prove_routing_join(
                 lamh: if active { ONE } else { ZERO },
                 tau,
                 pairs,
+                x_bits: Vec::new(),
             });
         }
     }
     let mut x_work = witness.x.clone();
+    // Pack each column's X bits for the h-round selects (the X table is
+    // still raw bits at this point — the u-fold has not run).
+    let words_per_col = u_v.div_ceil(64);
+    for col in cols.iter_mut() {
+        let mut bits = vec![0u64; words_per_col];
+        let base = col.j << u_v;
+        debug_assert!(x_work[base..base + (1usize << u_v)]
+            .iter()
+            .all(|&v| v == ZERO || v == ONE));
+        let col_len = 1usize << u_v;
+        for (w, slot) in bits.iter_mut().enumerate() {
+            for b in 0..64usize {
+                let in_col = (w << 6) + b;
+                if in_col < col_len && x_work[base + in_col] == ONE {
+                    *slot |= 1u64 << b;
+                }
+            }
+        }
+        col.x_bits = bits;
+    }
 
     // ---- a-rounds: τ algebraic folding (stores only). ----
     for k in 0..a_v {
@@ -410,9 +435,37 @@ pub fn prove_routing_join(
     }
 
     // ---- o-rounds: sparse support pairs. ----
+    // The high-bit suffix `Π_{i>k} eq(r_o[i], o_i)` depends only on
+    // `o >> (k+1)` and the FIXED claim point `r_o` — one table per round
+    // (≈ 2^{o_v} entries total) instead of a product per pair per round.
+    // The pair's coefficient folds into `pref` (init = coef), so each
+    // round costs 2 muls + 1 lookup per pair.
+    let suffix_tabs: Vec<Vec<Gf128>> = (0..o_v)
+        .map(|k| {
+            let width = 1usize << (o_v - k - 1);
+            (0..width)
+                .map(|hi| {
+                    let mut v = ONE;
+                    for i in (k + 1)..o_v {
+                        v = mul(v, eqb(r_o[i], (hi >> (i - k - 1)) & 1 == 1));
+                    }
+                    v
+                })
+                .collect()
+        })
+        .collect();
+    // Fold each pair's coefficient into its running product (both the
+    // shift pairs, built raw, and the store pairs, whose coef is already
+    // the a-folded coefficient).
+    for col in cols.iter_mut() {
+        for p in col.pairs.iter_mut() {
+            p.pref = p.coef;
+        }
+    }
     let mut e_o = ONE; // eq(r_o, c_{o,<k}) — multiplies every later round.
     for k in 0..o_v {
         let rk = r_o[k];
+        let suffix = &suffix_tabs[k];
         let coeffs = cols
             .par_chunks(chunk_size(cycles))
             .map(|chunk| {
@@ -423,13 +476,10 @@ pub fn prove_routing_join(
                     }
                     let j = col.j;
                     let base = j << u_v;
+                    let wlam = mul(w[j], col.lam);
                     let mut v = [ZERO; 2];
                     for p in &col.pairs {
-                        let mut suff = ONE;
-                        for i in (k + 1)..o_v {
-                            suff = mul(suff, eqb(r_o[i], (p.o >> i) & 1 == 1));
-                        }
-                        let wgt = mul(mul(p.coef, p.pref), suff);
+                        let wgt = mul(p.pref, suffix[p.o >> (k + 1)]);
                         let xv = x_work[base + p.u];
                         if (p.o >> k) & 1 == 0 {
                             v[0] += mul(wgt, xv);
@@ -437,7 +487,7 @@ pub fn prove_routing_join(
                             v[1] += mul(wgt, xv);
                         }
                     }
-                    let q = quad_term(rk, v[0], v[1], mul(w[j], col.lam));
+                    let q = quad_term(rk, v[0], v[1], wlam);
                     local[0] += mul(e_o, q[0]);
                     local[1] += mul(e_o, q[1]);
                     local[2] += mul(e_o, q[2]);
@@ -501,12 +551,19 @@ pub fn prove_routing_join(
                         }
                         let j = col.j;
                         let h_lo = (col.h_pos >> (k + 1)) << 1;
-                        let base = j << u_v;
+                        let row0 = h_lo << u_v;
+                        let row1 = (h_lo | 1) << u_v;
                         let mut ab = [ZERO; 2];
-                        for u in 0..(1usize << u_v) {
-                            let xv = x_work[base + u];
-                            ab[0] += mul(xv, rtab[u | (h_lo << u_v)]);
-                            ab[1] += mul(xv, rtab[u | ((h_lo | 1) << u_v)]);
+                        // The X column is still bits: the contraction is
+                        // a select — one add per SET bit, no multiply.
+                        for (w, &word) in col.x_bits.iter().enumerate() {
+                            let mut bits = word;
+                            while bits != 0 {
+                                let u = bits.trailing_zeros() as usize;
+                                ab[0] += rtab[row0 + (w << 6) + u];
+                                ab[1] += rtab[row1 + (w << 6) + u];
+                                bits &= bits - 1;
+                            }
                         }
                         let s = mul(mul(mul(w[j], col.lam), col.lamh), e_o);
                         let hb = Gf128(((col.h_pos >> k) & 1) as u128);

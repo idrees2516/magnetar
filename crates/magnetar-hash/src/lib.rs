@@ -40,7 +40,8 @@ pub fn fe_to_bytes(x: magnetar_field::Gf128) -> [u8; 16] {
 /// instead of two per part; the output is bit-identical).
 pub fn sha3_domain(parts: &[&[u8]]) -> [u8; DIGEST] {
     let mut h = Sha3_256::new();
-    let mut buf = Vec::with_capacity(8 + parts.len() * 8 + parts.iter().map(|p| p.len()).sum::<usize>());
+    let mut buf =
+        Vec::with_capacity(8 + parts.len() * 8 + parts.iter().map(|p| p.len()).sum::<usize>());
     serialize_parts(parts, &mut buf);
     h.update(&buf);
     h.finalize().into()
@@ -75,7 +76,8 @@ fn serialize_prefix(total_nparts: usize, parts: &[&[u8]], buf: &mut Vec<u8>) {
 /// Domain-separated one-shot BLAKE3 over labeled parts (single `update`).
 pub fn blake3_domain(parts: &[&[u8]]) -> [u8; DIGEST] {
     let mut h = Blake3Hasher::new();
-    let mut buf = Vec::with_capacity(8 + parts.len() * 8 + parts.iter().map(|p| p.len()).sum::<usize>());
+    let mut buf =
+        Vec::with_capacity(8 + parts.len() * 8 + parts.iter().map(|p| p.len()).sum::<usize>());
     serialize_parts(parts, &mut buf);
     h.update(&buf);
     let mut out = [0u8; DIGEST];
@@ -117,7 +119,12 @@ impl LeafHashPrefix {
 
     /// The full leaf stream for `(index, value)` in `out`; returns its length.
     #[inline]
-    pub(crate) fn write_stream(&self, index: usize, value: magnetar_field::Gf128, out: &mut [u8; 160]) -> usize {
+    pub(crate) fn write_stream(
+        &self,
+        index: usize,
+        value: magnetar_field::Gf128,
+        out: &mut [u8; 160],
+    ) -> usize {
         let pfx = self.buf.len();
         out[..pfx].copy_from_slice(&self.buf);
         let mut at = pfx;
@@ -475,7 +482,6 @@ mod tests {
             assert_eq!(generic, pfx, "node {lvl}");
         }
     }
-
 
     use super::*;
 
