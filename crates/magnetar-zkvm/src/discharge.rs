@@ -69,75 +69,99 @@ fn swirl_mask(j: usize) -> u64 {
 ///
 /// The instance is a tree-IVC segment (the streaming root) or the whole
 /// proof (the monolithic path, `segments = 1`).
-/// One item's **support** in the suffix cube: the eq table
-/// `eq(pt, x)` is nonzero only where `x` matches `pt`'s Boolean
-/// coordinates, so the item's contribution lives on the subcube
-/// `base | (free pattern spread over the free positions)`.
+/// One item's suffix classification: the point's coordinates split into
+/// the **fixed Boolean** base and the **free** positions, with the free
+/// WORD-index coordinates (cube bits `< ell − 7`) separated from the free
+/// non-window PLANE coordinates (bits `[ell − 7, ell − v)`). The
+/// word-index part of every claim's support is (nearly) the full word
+/// range — all components' own coordinates are the LOW cube bits and
+/// their aligned offsets live in the high (plane) bits — so the
+/// eq-weighted fold over the free word coordinates is ONE packed-table
+/// pass per **distinct free-word point**, shared by every claim whose
+/// word coordinates coincide (the witness-segment claims share
+/// `r_low`-prefix ‖ `r_inst`; the memory claims share `r_k ‖ r_cycle`).
 pub(crate) struct Support {
-    /// The fixed Boolean coordinates' suffix bits (the support base).
+    /// The fixed Boolean suffix bits (word part low, plane part high).
     base: usize,
-    /// The suffix-space bit positions of the free coordinates.
-    free_pos: Vec<usize>,
-    /// `eq(pt_F, i)` over the free-coordinate patterns
-    /// (`2^{free}` entries, `EqBits::build` order — low free bit first).
-    eq_free: Vec<Gf128>,
+    /// The free word-index positions and the point's values there.
+    word_pos: Vec<usize>,
+    word_pts: Vec<Gf128>,
+    /// The free non-window plane positions (cube bits in
+    /// `[ell − 7, ell − v)`) and the point's values there.
+    plane_pos: Vec<usize>,
+    plane_pts: Vec<Gf128>,
+    /// The eq table over the free word coordinates.
+    word_eq: Vec<Gf128>,
 }
 
 impl Support {
-    /// Classify the suffix point `pt`: Boolean coordinates fix the base,
-    /// the rest are free.
-    pub(crate) fn build(pt: &[Gf128]) -> Self {
+    /// Classify the full suffix point `pt` (coords `[0, ell − v)`,
+    /// little-endian cube positions). `word_bits = ell − 7`,
+    /// `plane_hi = ell − v`.
+    pub(crate) fn build(pt: &[Gf128], word_bits: usize, plane_hi: usize) -> Self {
         let mut base = 0usize;
-        let mut free_vals: Vec<Gf128> = Vec::new();
-        let mut free_pos: Vec<usize> = Vec::new();
-        for (b, &v) in pt.iter().enumerate() {
-            if v == ZERO {
+        let mut word_pos = Vec::new();
+        let mut word_pts = Vec::new();
+        let mut plane_pos = Vec::new();
+        let mut plane_pts = Vec::new();
+        for (b, &val) in pt.iter().enumerate() {
+            if val == ZERO {
                 // fixed at 0
-            } else if v == ONE {
+            } else if val == ONE {
                 base |= 1usize << b;
+            } else if b < word_bits {
+                word_pos.push(b);
+                word_pts.push(val);
             } else {
-                free_vals.push(v);
-                free_pos.push(b);
+                debug_assert!(b < plane_hi, "window coordinate in the suffix classifier");
+                // The plane coordinate at cube bit b is PATTERN bit
+                // (b − word_bits) in the packed word's bit index.
+                plane_pos.push(b - word_bits);
+                plane_pts.push(val);
             }
         }
-        let eq_free = if free_vals.is_empty() {
+        let word_eq = if word_pts.is_empty() {
             vec![ONE]
         } else {
-            EqBits::build(&free_vals).values
+            EqBits::build(&word_pts).values
         };
-        Support { base, free_pos, eq_free }
+        Support { base, word_pos, word_pts, plane_pos, plane_pts, word_eq }
     }
 
-    /// The support size (`2^{free}`).
-    #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
-        self.eq_free.len()
+    /// The word-index part of the base.
+    #[inline]
+    pub(crate) fn base_word(&self, word_bits: usize) -> usize {
+        self.base & ((1usize << word_bits) - 1)
     }
 
-    /// Call `f(x, w)` for every support suffix `x` with its eq weight
-    /// `w = eq(pt, x)` (zero entries skipped).
-    pub(crate) fn enumerate(&self, mut f: impl FnMut(usize, Gf128)) {
-        if self.free_pos.is_empty() {
-            if self.eq_free[0] != ZERO {
-                f(self.base, self.eq_free[0]);
-            }
+    /// The free-plane part of the base (already positioned at the plane
+    /// cube bits).
+    #[inline]
+    pub(crate) fn base_plane(&self, word_bits: usize) -> usize {
+        self.base >> word_bits
+    }
+
+    /// Call `f(i, word)` for every free word pattern: `i` indexes
+    /// [`Self::word_eq`] and `word` is the concrete word index.
+    pub(crate) fn enumerate_words(&self, word_bits: usize, mut f: impl FnMut(usize, usize)) {
+        let base_word = self.base_word(word_bits);
+        if self.word_pos.is_empty() {
+            f(0, base_word);
             return;
         }
-        for (i, &w) in self.eq_free.iter().enumerate() {
-            if w == ZERO {
-                continue;
-            }
-            let mut x = self.base;
-            for (j, &pos) in self.free_pos.iter().enumerate() {
+        for i in 0..(1usize << self.word_pos.len()) {
+            let mut word = base_word;
+            for (j, &pos) in self.word_pos.iter().enumerate() {
                 if (i >> j) & 1 == 1 {
-                    x |= 1usize << pos;
+                    word |= 1usize << pos;
                 }
             }
-            f(x, w);
+            f(i, word);
         }
     }
 }
 
+/// One instance's windowed local batching sum-check over its local cube.
 pub(crate) struct LocalDischarge<'a> {
     ell: usize,
     /// The window size: covers the top `v` local variables (all within
@@ -161,9 +185,14 @@ pub(crate) struct LocalDischarge<'a> {
     tau_w: Vec<Vec<Gf128>>,
     /// Per item: the coefficient `α_c`.
     alphas: Vec<Gf128>,
-    /// Per item: the support-sparse suffix enumeration (free coords,
-    /// their eq table, and the Boolean base).
+    /// Per item: the suffix classification (fixed base, free word and
+    /// plane coordinates).
     supports: Vec<Support>,
+    /// The distinct free-word groups: (base_word, free word positions,
+    /// the shared eq table over the free word coordinates).
+    groups: Vec<(usize, Vec<usize>, Vec<Gf128>)>,
+    /// Each item's group index.
+    group_of: Vec<usize>,
     /// Window rounds completed.
     round: usize,
     /// The per-pattern MLE weights `eq(r_{<round}, m)` (G's contraction).
@@ -177,9 +206,13 @@ pub(crate) struct LocalDischarge<'a> {
 }
 
 impl<'a> LocalDischarge<'a> {
-    /// Build the instance's state and run the single pass over the packed
-    /// slice. `items` are `(α, local lifted point)` pairs; `claim` is
-    /// `Σ α_c·value_c`.
+    /// Build the instance's state: the **group-fold** over the free word
+    /// coordinates (one packed-table pass per distinct free-word point,
+    /// shared by every claim whose word coordinates coincide), then the
+    /// tiny per-claim plane folds and the window monomial butterfly.
+    /// Replaces the per-suffix 64-plane extraction + scatter of the
+    /// naive pass (measured 12–30× on the streaming scales) and the
+    /// `2^{ell-v}`-per-item suffix tables.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         layout: &MosaicLayout,
@@ -193,7 +226,8 @@ impl<'a> LocalDischarge<'a> {
         let v = 6.min(ell - 7).max(1).min(ell - 1);
         let stride = 1usize << (ell - v);
         let word_mask = (1usize << (ell - 7)) - 1;
-        let plane_lo_bits = 7 - v;
+        let word_bits = ell - 7;
+        let plane_hi = ell - v;
         let n_items = items.len();
         debug_assert!((1..=6).contains(&v));
         debug_assert!(n_items >= 1);
@@ -202,61 +236,157 @@ impl<'a> LocalDischarge<'a> {
             .map(|(_, pt)| (0..v).map(|j| pt[ell - 1 - j]).collect())
             .collect();
         let alphas: Vec<Gf128> = items.iter().map(|(a, _)| *a).collect();
-        // **The support-sparse suffix enumeration** (the SumEq
-        // sparse-support discipline): each item's suffix eq table
-        // `eq(pt_c, x)` is nonzero only on the subcube where `x` matches
-        // every BOOLEAN coordinate of `pt_c` — the aligned-subcube lift
-        // fixes most coordinates to 0/1, leaving the component's own
-        // (instance ‖ block ‖ plane) coordinates free. Enumerating the
-        // support instead of the whole suffix cube cuts the pass and the
-        // `bound_se` build by the support ratio (measured 12–30× at the
-        // streaming scales) and shrinks the per-item tables from
-        // `2^{ell-v}` to `2^{free_c}` field elements.
-        let _pt_sup = crate::protocol::PhaseTimer::new("ld-supports");
+        // Classify every claim's suffix point.
+        let _pt_cls = crate::protocol::PhaseTimer::new("ld-classify");
         let supports: Vec<Support> = items
             .iter()
-            .map(|(_, pt)| Support::build(&pt[..ell - v]))
+            .map(|(_, pt)| Support::build(&pt[..plane_hi], word_bits, plane_hi))
             .collect();
-        drop(_pt_sup);
+        drop(_pt_cls);
+        // Group the claims by (base word, free word positions, their
+        // point values): the fold output is shared within a group.
+        let _pt_grp = crate::protocol::PhaseTimer::new("ld-groups");
+        let mut group_of: Vec<usize> = vec![usize::MAX; n_items];
+        let mut groups: Vec<(usize, Vec<usize>, Vec<Gf128>)> = Vec::new(); // (base_word, word_pos, word_pts)
+        for (c, sup) in supports.iter().enumerate() {
+            let bw = sup.base_word(word_bits);
+            let mut found = None;
+            for (gi, g) in groups.iter().enumerate() {
+                if g.0 == bw
+                    && g.1 == sup.word_pos
+                    && g.2.iter().zip(sup.word_pts.iter()).all(|(a, b)| a == b)
+                {
+                    found = Some(gi);
+                    break;
+                }
+            }
+            match found {
+                Some(gi) => group_of[c] = gi,
+                None => {
+                    groups.push((bw, sup.word_pos.clone(), sup.word_pts.clone()));
+                    group_of[c] = groups.len() - 1;
+                }
+            }
+        }
+        drop(_pt_grp);
         if std::env::var("MAGNETAR_TIME").is_ok() {
-            let total_support: usize = supports.iter().map(|s| s.len()).sum();
+            let total_word: usize = groups
+                .iter()
+                .map(|g| 1usize << g.1.len())
+                .sum();
             eprintln!(
-                "[time] ld-shape: ell={ell} stride={stride} items={n_items} support_sum={total_support}"
+                "[time] ld-shape: ell={ell} stride={stride} items={n_items} groups={} word-vol={total_word}",
+                groups.len()
             );
         }
-        // The single pass: PER ITEM, walk only its support suffixes —
-        // G's window monomial mask from the packed word at each support
-        // suffix, then the eq-weighted pack into the item's accumulators.
-        let _pt_pass = crate::protocol::PhaseTimer::new("ld-pass");
-        let q: Vec<Vec<Gf128>> = supports
+        // Build each group's free-word eq table once (stored in the
+        // group tuple for the fold AND the later bound_se walk).
+        for g in groups.iter_mut() {
+            let eq = if g.2.is_empty() {
+                vec![ONE]
+            } else {
+                EqBits::build(&g.2).values
+            };
+            g.2 = eq;
+        }
+        // The group folds: out1 = the eq-weighted fold of the packed
+        // words over the group's free word coordinates, a 128-lane
+        // field table (one lane per plane pattern).
+        let _pt_fold = crate::protocol::PhaseTimer::new("ld-word-fold");
+        let folds: Vec<[Gf128; 128]> = groups
             .par_iter()
-            .map(|sup| {
-                let mut local = vec![ZERO; 1usize << v];
-                sup.enumerate(|x, w| {
-                    let u = x & word_mask;
-                    let b_lo = x >> (ell - 7);
-                    let word = packed[word_base + u].0;
-                    let mut mask = 0u64;
-                    for m in 0..(1usize << v) {
-                        if (word >> (b_lo + m * (1usize << plane_lo_bits))) & 1 == 1 {
-                            mask |= 1u64 << m;
+            .map(|(bw, wpos, weq)| {
+                let mut out = [ZERO; 128];
+                let npat = 1usize << wpos.len();
+                for i in 0..npat {
+                    let e = weq[i];
+                    if e == ZERO {
+                        continue;
+                    }
+                    let mut word = *bw;
+                    for (j, &pos) in wpos.iter().enumerate() {
+                        if (i >> j) & 1 == 1 {
+                            word |= 1usize << pos;
                         }
                     }
-                    for j in 0..v {
-                        mask ^= (mask << (1 << j)) & swirl_mask(j);
+                    // The word's set bits scatter into the plane lanes.
+                    let mut bits = packed[word_base + word].0;
+                    while bits != 0 {
+                        let pl = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        out[pl] += e;
                     }
-                    let mut s = mask;
-                    while s != 0 {
-                        let m = s.trailing_zeros() as usize;
-                        s &= s - 1;
-                        local[m] += w;
-                    }
-                });
-                local
+                }
+                out
             })
             .collect();
-        drop(_pt_pass);
-        debug_assert_eq!(q.len(), n_items);
+        drop(_pt_fold);
+        // Per claim: the plane folds + the window monomial butterfly.
+        let _pt_local = crate::protocol::PhaseTimer::new("ld-local-fold");
+        let q: Vec<Vec<Gf128>> = supports
+            .iter()
+            .enumerate()
+            .map(|(c, sup)| {
+                let out1 = &folds[group_of[c]];
+                // eq-fold over the free non-window plane coordinates
+                // (their cube bits sit at the pattern's low positions —
+                // plane coord ell-7 is pattern bit 0, and so on up to
+                // ell-v at pattern bit 7-v-1).
+                let n_plane = 1usize << sup.plane_pts.len();
+                let plane_eq = if sup.plane_pts.is_empty() {
+                    vec![ONE]
+                } else {
+                    EqBits::build(&sup.plane_pts).values
+                };
+                // Fold each free plane coordinate: the coord at cube bit
+                // (word_bits + orig_t) is pattern bit orig_t. `bind_var`
+                // folds AND HALVES the table, so the k-th bind works on
+                // position (orig_t − k) and the surviving lanes' bits
+                // shift down accordingly.
+                let mut tab: Vec<Gf128> = out1.to_vec();
+                for (k, &orig_t) in sup.plane_pos.iter().enumerate() {
+                    magnetar_field::bind_var(&mut tab, orig_t - k, sup.plane_pts[k]);
+                }
+                let _ = plane_eq;
+                let _ = n_plane;
+                let np = sup.plane_pos.len();
+                // Gather the window-pattern lanes: the surviving table is
+                // `2^{7-np}` lanes indexed by the (fixed-plane ‖ window)
+                // pattern with the free bits removed. The fixed base
+                // bits remap down by the number of free bits below them;
+                // the window block starts at `7 - v - np`.
+                let base_plane = sup.base_plane(word_bits); // the fixed plane bits
+                let win_lo = 7 - v - np;
+                let mut fixed = 0usize;
+                for q in 0..(7 - v) {
+                    if (base_plane >> q) & 1 == 1 {
+                        let below = sup.plane_pos.iter().filter(|&&t| t < q).count();
+                        fixed |= 1usize << (q - below);
+                    }
+                }
+                let mut out2 = vec![ZERO; 1usize << v];
+                for w in 0..(1usize << v) {
+                    let pat = fixed | (w << win_lo);
+                    out2[w] = tab[pat];
+                }
+                // The Möbius butterfly over the v window bits — field
+                // values: `out2[e] ← Σ_{m ⊆ e} raw[m]` (the high side
+                // accumulates the low, exactly the bit-mask swirl's
+                // semantics lifted to field entries).
+                let n = 1usize << v;
+                for j in 0..v {
+                    let bit = 1usize << j;
+                    for base in (0..n).step_by(bit * 2) {
+                        for o in 0..bit {
+                            let lo = out2[base + o];
+                            out2[base + bit + o] += lo;
+                        }
+                    }
+                }
+                out2
+            })
+            .collect();
+        drop(_pt_local);
         LocalDischarge {
             ell,
             v,
@@ -269,6 +399,8 @@ impl<'a> LocalDischarge<'a> {
             tau_w,
             alphas,
             supports,
+            groups,
+            group_of,
             round: 0,
             eq_r: vec![ONE; 1usize << v],
             running: claim,
@@ -410,18 +542,85 @@ impl<'a> LocalDischarge<'a> {
                     *out = acc;
                 }
             });
-        // The bound SumEq: Σ_c α_c·C_c·eq_c — per item, only its support
-        // suffixes contribute (the sparse discipline; the dense
-        // per-item stride pass is gone).
+        // The bound SumEq: Σ_c α_c·C_c·eq_c(x) over the suffix cube —
+        // the group outer product: within a group every member shares
+        // the free-word eq table, so the word dimension is walked once
+        // per group and each member contributes only its (tiny) plane
+        // support: at most `2^{7-v}` patterns per claim per word.
+        let word_bits = self.ell - 7;
         let mut bound_se = vec![ZERO; stride];
-        for (c, sup) in self.supports.iter().enumerate() {
-            let w = mul(self.alphas[c], self.c_eq[c]);
-            if w == ZERO {
-                continue;
+        let groups = &self.groups;
+        let group_of = &self.group_of;
+        let supports = &self.supports;
+        let alphas = &self.alphas;
+        let c_eq = &self.c_eq;
+        // Parallel over groups (each group's scatter is disjoint in the
+        // words it touches? no — groups share the word range; keep the
+        // scatter sequential per group but the groups rayon-parallel via
+        // per-thread buffers is overkill — sequential here, the volume is
+        // `Σ_groups 2^{|Fw|} · Σ_members 2^{np}`).
+        for (gi, (base_word, wpos, weq)) in groups.iter().enumerate() {
+            let members: Vec<usize> = (0..supports.len())
+                .filter(|&c| group_of[c] == gi)
+                .collect();
+            // Precompute each member's plane contribution:
+            // (scalar α_c·C_c, plane support (pattern → weight)).
+            let plane_supp: Vec<(Gf128, Vec<(usize, Gf128)>)> = members
+                .iter()
+                .map(|&c| {
+                    let s = mul(alphas[c], c_eq[c]);
+                    let sup = &supports[c];
+                    let np = sup.plane_pts.len();
+                    let peq = if np == 0 {
+                        vec![ONE]
+                    } else {
+                        EqBits::build(&sup.plane_pts).values
+                    };
+                    let base_plane = sup.base_plane(word_bits);
+                    let mut pats = Vec::with_capacity(1usize << np);
+                    for (j, &e) in peq.iter().enumerate() {
+                        if e == ZERO {
+                            continue;
+                        }
+                        let mut p = base_plane;
+                        for (t, &pos) in sup.plane_pos.iter().enumerate() {
+                            if (j >> t) & 1 == 1 {
+                                p |= 1usize << pos;
+                            }
+                        }
+                        pats.push((p, mul(s, e)));
+                    }
+                    (s, pats)
+                })
+                .collect();
+            let _ = &plane_supp;
+            // The word walk.
+            let npat = 1usize << wpos.len();
+            for i in 0..npat {
+                let e = weq[i];
+                if e == ZERO {
+                    continue;
+                }
+                let mut word = *base_word;
+                for (j, &pos) in wpos.iter().enumerate() {
+                    if (i >> j) & 1 == 1 {
+                        word |= 1usize << pos;
+                    }
+                }
+                for (m, (s, pats)) in plane_supp.iter().enumerate() {
+                    if pats.is_empty() {
+                        // The claim's plane part fully fixed.
+                        let plane = supports[members[m]].base_plane(word_bits);
+                        let x = word | (plane << word_bits);
+                        bound_se[x] += mul(*s, e);
+                        continue;
+                    }
+                    for &(p, pe) in pats {
+                        let x = word | (p << word_bits);
+                        bound_se[x] += mul(pe, e);
+                    }
+                }
             }
-            sup.enumerate(|x, t| {
-                bound_se[x] += mul(w, t);
-            });
         }
         drop(_pt_fw);
         let _pt_tail = crate::protocol::PhaseTimer::new("ld-tail-rounds");
@@ -992,6 +1191,88 @@ mod tests {
                 }
                 assert_eq!((m >> t) & 1, want as u64, "v={v} t={t}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fold_debug_tests {
+    use super::*;
+
+    /// Brute-force the per-item window monomial state `q[c][m] =
+    /// Σ_{x_suf} eq(pt_suf, x)·Ĝ_m(x)` and compare against the
+    /// LocalDischarge fold path on a small random instance.
+    #[test]
+    fn fold_q_matches_bruteforce() {
+        use crate::mosaic::{ComponentSpec, MosaicLayout};
+        let mut rng = rand::rng();
+        let per = MosaicLayout::build(vec![
+            ComponentSpec { name: "big".into(), vars: 12 },
+            ComponentSpec { name: "small".into(), vars: 10 },
+        ]);
+        let ell = per.ell;
+        let v = 6.min(ell - 7).max(1).min(ell - 1);
+        let plane_hi = ell - v;
+        let word_bits = ell - 7;
+        // One packed "instance": random bits over the full cube.
+        let n_bits = 1usize << ell;
+        let bits: Vec<bool> = (0..n_bits).map(|_| rand::RngExt::random::<bool>(&mut rng)).collect();
+        let mut packed = vec![Gf128(0); 1usize << word_bits];
+        for x in 0..n_bits {
+            if bits[x] {
+                let w = x & ((1usize << word_bits) - 1);
+                let p = x >> word_bits;
+                packed[w].0 |= 1u128 << p;
+            }
+        }
+        // One claim on "big": a fully random point.
+        let point: Vec<Gf128> = (0..12).map(|_| Gf128(rand::RngExt::random::<u128>(&mut rng))).collect();
+        let claim = crate::mosaic::MosaicClaim {
+            component: 0,
+            point: point.clone(),
+            value: ZERO,
+        };
+        let alphas = vec![Gf128(3)];
+        let inst = instance_items(&per, 1, &[claim], &alphas);
+        let (_, items) = &inst[0];
+        let claim_val = ZERO;
+        let ld = LocalDischarge::new(&per, &packed, 0, items, claim_val);
+        let pt = &items[0].1;
+        // ---- brute force ----
+        let suffix_eq = EqBits::build(&pt[..plane_hi]).values;
+        let stride = 1usize << plane_hi;
+        let plane_lo_bits = 7 - v;
+        let mut brute = vec![ZERO; 1usize << v];
+        for x in 0..stride {
+            let e = suffix_eq[x];
+            if e == ZERO {
+                continue;
+            }
+            let u = x & ((1usize << word_bits) - 1);
+            let b_lo = x >> word_bits;
+            let word = packed[u].0;
+            let mut mask = 0u64;
+            for m in 0..(1usize << v) {
+                if (word >> (b_lo + m * (1usize << plane_lo_bits))) & 1 == 1 {
+                    mask |= 1u64 << m;
+                }
+            }
+            for j in 0..v {
+                mask ^= (mask << (1 << j)) & swirl_mask(j);
+            }
+            let mut s = mask;
+            while s != 0 {
+                let m = s.trailing_zeros() as usize;
+                s &= s - 1;
+                brute[m] += e;
+            }
+        }
+        for m in 0..(1usize << v) {
+            assert_eq!(
+                ld.q[0][m], brute[m],
+                "monomial {m}: fold {:?} vs brute {:?} (ell={ell} v={v})",
+                ld.q[0][m], brute[m]
+            );
         }
     }
 }
