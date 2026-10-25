@@ -40,6 +40,18 @@ fn alu_program() -> Vec<u32> {
     ]
 }
 
+/// The segment-count ceiling: the streaming root's combined commitment
+/// still materializes `packed + codeword + tree` (≈3.3× the packed
+/// bytes), so the segment count is capped by the host's RAM, not the
+/// protocol. `MAGNETAR_MAX_SEGMENTS` overrides (default 16,384 = the
+/// 2^24 ladder at 2^10 cycles/segment).
+fn max_segments() -> usize {
+    std::env::var("MAGNETAR_MAX_SEGMENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16_384)
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let max_log2: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(10);
@@ -65,9 +77,8 @@ fn main() {
         "table B"
     );
     let prog = alu_program();
-    for log2_t in [8usize, 9, 10, 11, 12, 13, 14, 15, 16]
-        .iter()
-        .filter(|t| **t >= min_log2 && **t <= max_log2)
+    for log2_t in (8usize..=24)
+        .filter(|t| *t >= min_log2 && *t <= max_log2)
     {
         let total = 1usize << log2_t;
         let trace = magnetar_cpu::interp::execute(&prog, &[], total);
@@ -88,12 +99,15 @@ fn main() {
             if total / segments < 2 {
                 continue;
             }
-            if segments > 64 {
+            // The streaming envelope is bounded per worker; the segment
+            // count grows with the trace (the paper's ladder runs to 2^22
+            // with 4,096 segments — this one is uncapped).
+            if segments > max_segments() {
                 break;
             }
             // The monolithic (sequential) prover only fits the container
             // envelope up to 2^13; above that, streaming-only.
-            let run_seq_here = run_seq && log2_t <= &13;
+            let run_seq_here = run_seq && log2_t <= 13;
             if run_seq_here {
                 let t0 = Instant::now();
                 let seq = magnetar_ivc::prove_ivc(

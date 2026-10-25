@@ -287,6 +287,12 @@ pub fn prove_ivc_streaming(
     // Order the workers' results by segment (par_iter completion order).
     let mut ordered: Vec<_> = results;
     ordered.sort_by_key(|(s, ..)| *s);
+    if std::env::var_os("MAGNETAR_TIME").is_some() {
+        eprintln!(
+            "[rss] segments-phase peak: {:.1} MiB",
+            peak_rss_bytes() as f64 / 1048576.0
+        );
+    }
     let mut statements = Vec::with_capacity(segments);
     let mut inners = Vec::with_capacity(segments);
     let mut digests = Vec::with_capacity(segments);
@@ -342,6 +348,12 @@ pub fn prove_ivc_streaming(
         ell: combined.ell,
     };
     let _pt_mos = magnetar_zkvm::PhaseTimer::new("root-mosaic-hier");
+    if std::env::var_os("MAGNETAR_TIME").is_some() {
+        eprintln!(
+            "[rss] root entry: {:.1} MiB",
+            peak_rss_bytes() as f64 / 1048576.0
+        );
+    }
     let mosaic = prove_mosaic_hier(
         pcs,
         &per,
@@ -354,6 +366,12 @@ pub fn prove_ivc_streaming(
     );
     drop(_pt_mos);
     let wall_root = t2.elapsed();
+    if std::env::var_os("MAGNETAR_TIME").is_some() {
+        eprintln!(
+            "[rss] root exit: {:.1} MiB",
+            peak_rss_bytes() as f64 / 1048576.0
+        );
+    }
 
     let stats = StreamingStats {
         wall_checkpoints,
