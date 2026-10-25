@@ -300,7 +300,8 @@ pub fn prove_virtual_spartan(
         rel.b_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
         rel.c_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
     );
-    let mask_mode = matches!(bin_masks, (Some(_), Some(_), Some(_)));
+    let mask_mode =
+        v_win > 0 && matches!(bin_masks, (Some(_), Some(_), Some(_)));
     let spec_bin = if mask_mode {
         // The mask-mode spec: empty dense (the masks carry the tables),
         // the same terms and public factor.

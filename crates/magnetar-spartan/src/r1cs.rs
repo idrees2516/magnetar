@@ -387,7 +387,13 @@ impl SparseMatrix {
         s: usize,
         v: usize,
     ) -> Option<Vec<u64>> {
-        if !self.is_binary() || self.entries.iter().any(|&(_, c, _)| c >= w_cols) {
+        // Pure-bit output: a binary matrix over the bit witness and the
+        // constant-1 column only. Entries on the `1` column contribute
+        // their value as a constant row flip; entries on the (word-valued)
+        // public x columns disqualify the table.
+        if !self.is_binary()
+            || self.entries.iter().any(|&(_, c, _)| c > w_cols)
+        {
             return None;
         }
         let w128 = (w_cols + 127) / 128;
@@ -401,7 +407,15 @@ impl SparseMatrix {
             // bit (a word op, not a 16-byte accumulate).
             let mut parity = vec![0u64; (self.rows + 63) / 64];
             for &(r, c, val) in &self.entries {
-                if val.0 != 0 && (row_words[c >> 7] >> (c & 127)) & 1 == 1 {
+                if val.0 & 1 == 0 {
+                    continue;
+                }
+                if c < w_cols {
+                    if (row_words[c >> 7] >> (c & 127)) & 1 == 1 {
+                        parity[r >> 6] ^= 1u64 << (r & 63);
+                    }
+                } else {
+                    // The constant-1 column: a fixed row flip.
                     parity[r >> 6] ^= 1u64 << (r & 63);
                 }
             }

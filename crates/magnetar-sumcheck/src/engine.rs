@@ -111,7 +111,13 @@ impl SumcheckProver {
         order: BindOrder,
         masks: Vec<Vec<u64>>,
     ) -> Self {
-        spec.validate().expect("invalid sumcheck spec");
+        // The mask mode carries the dense tables packed; the generic
+        // length validation is replaced by the window's shape check
+        // below (empty dense is the expected form here).
+        debug_assert!(
+            spec.dense.iter().all(|d| d.is_empty()),
+            "the mask-mode spec carries its tables in the masks"
+        );
         assert_eq!(masks.len(), 3, "the mask window needs exactly 3 tables");
         assert!(
             matches!(order, BindOrder::HighBitsFirst { .. }),
@@ -167,7 +173,8 @@ impl SumcheckProver {
         if v == 0 || spec.num_vars < 2 {
             return None;
         }
-        let shape = spec.dense.is_empty()
+        let shape = spec.dense.len() == 3
+            && spec.dense.iter().all(|d| d.is_empty())
             && spec.terms.len() == 2
             && spec.terms[0].dense == vec![0, 1]
             && spec.terms[0].public == vec![0]
