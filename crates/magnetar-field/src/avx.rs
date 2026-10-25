@@ -849,6 +849,72 @@ pub fn fold_pairs(out: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> u
     }
 }
 
+/// Broadcast multiply-ACCUMULATE over a run: `dst[k] += src[k] · r` —
+/// the bound_se outer-product's inner op (the same fused-lane pipelines
+/// as [`mul_run`] plus the accumulate). Returns the entries consumed.
+/// Unit-tested against the scalar reference (`axpy_matches_scalar`).
+pub fn axpy_run(dst: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> usize {
+    debug_assert_eq!(dst.len(), src.len());
+    let done;
+    match detect() {
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx512 => {
+            let n4 = count / 4;
+            #[allow(unsafe_code)]
+            // SAFETY: the measured dispatch confirmed the target features.
+            unsafe {
+                use std::arch::x86_64::{
+                    _mm512_loadu_si512, _mm512_storeu_si512, _mm512_xor_si512,
+                };
+                let rb = [r; 4];
+                let rv = _mm512_loadu_si512(rb.as_ptr().cast());
+                for i in 0..n4 {
+                    let k = 4 * i;
+                    let v = _mm512_loadu_si512(src.as_ptr().add(k).cast());
+                    let prod = imp512::Avx.mul_mm_public(rv, v);
+                    let acc = _mm512_loadu_si512(dst.as_ptr().add(k).cast());
+                    _mm512_storeu_si512(
+                        dst.as_mut_ptr().add(k).cast(),
+                        _mm512_xor_si512(acc, prod),
+                    );
+                }
+            }
+            done = 4 * n4;
+        }
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx2 => {
+            let n2 = count / 2;
+            #[allow(unsafe_code)]
+            // SAFETY: the measured dispatch confirmed the target features.
+            unsafe {
+                use std::arch::x86_64::{
+                    _mm256_loadu_si256, _mm256_storeu_si256, _mm256_xor_si256,
+                };
+                let rb = [r; 2];
+                let rv = _mm256_loadu_si256(rb.as_ptr().cast());
+                for i in 0..n2 {
+                    let k = 2 * i;
+                    let v = _mm256_loadu_si256(src.as_ptr().add(k).cast());
+                    let prod = imp256::Avx2.mul_mm_public(rv, v);
+                    let acc = _mm256_loadu_si256(dst.as_ptr().add(k).cast());
+                    _mm256_storeu_si256(
+                        dst.as_mut_ptr().add(k).cast(),
+                        _mm256_xor_si256(acc, prod),
+                    );
+                }
+            }
+            done = 2 * n2;
+        }
+        SimdKind::Scalar => {
+            done = count;
+        }
+    }
+    for k in done..count {
+        dst[k] += crate::gf128::mul(src[k], r);
+    }
+    count
+}
+
 /// Broadcast multiply over a run: `dst[k] = src[k] · r` (the fused-lane
 /// form of the eq-tensor doubling). Returns the entries consumed.
 pub fn mul_run(dst: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> usize {
@@ -1096,5 +1162,27 @@ mod tests {
             assert_eq!(got[0], crate::gf128::mul(a[0], b[0]));
             assert_eq!(got[1], crate::gf128::mul(a[1], b[1]));
         }
+    }
+}
+
+#[test]
+fn axpy_matches_scalar() {
+    let mut rng_state = 0x12345678u64;
+    let mut rg = || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        Gf128((rng_state as u128) | ((rng_state >> 1) as u128) << 64)
+    };
+    for &n in &[3usize, 8, 17, 64, 100] {
+        let srcv: Vec<Gf128> = (0..n).map(|_| rg()).collect();
+        let r = rg();
+        let mut acc = vec![Gf128(0); n];
+        for k in 0..n {
+            acc[k] += crate::gf128::mul(srcv[k], r);
+        }
+        let mut got = vec![Gf128(0); n];
+        axpy_run(&mut got, &srcv, r, n);
+        assert_eq!(acc, got, "n={n}");
     }
 }

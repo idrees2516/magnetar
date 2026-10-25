@@ -281,10 +281,9 @@ pub fn prove_virtual_spartan(
     // x columns contribute once, not per instance. A table is bit-valued
     // exactly when ITS matrix is binary and all its referenced columns
     // are bits (checked per matrix, never assumed).
-    let apply_bits =
-        |mat: &crate::SparseMatrix| -> (Vec<Gf128>, bool) {
-            mat.apply_simd_packed(w_packed, x_cols, q, w_cols)
-        };
+    let apply_bits = |mat: &crate::SparseMatrix| -> (Vec<Gf128>, bool) {
+        mat.apply_simd_packed(w_packed, x_cols, q, w_cols)
+    };
     let az_fld = apply_bits(&rel.a_fld).0;
     let bz_fld = apply_bits(&rel.b_fld).0;
     let cz_fld = apply_bits(&rel.c_fld).0;
@@ -296,12 +295,14 @@ pub fn prove_virtual_spartan(
     // references the (word-valued) x columns.
     let v_win = magnetar_sumcheck::window_probe(s);
     let bin_masks = (
-        rel.a_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
-        rel.b_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
-        rel.c_bin.apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
+        rel.a_bin
+            .apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
+        rel.b_bin
+            .apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
+        rel.c_bin
+            .apply_simd_bit_masks(w_packed, q, w_cols, s, v_win),
     );
-    let mask_mode =
-        v_win > 0 && matches!(bin_masks, (Some(_), Some(_), Some(_)));
+    let mask_mode = v_win > 0 && matches!(bin_masks, (Some(_), Some(_), Some(_)));
     let spec_bin = if mask_mode {
         // The mask-mode spec: empty dense (the masks carry the tables),
         // the same terms and public factor.
@@ -361,7 +362,11 @@ pub fn prove_virtual_spartan(
         SumcheckProver::with_mask_window(
             &spec_bin,
             order,
-            vec![m0.expect("mask mode"), m1.expect("mask mode"), m2.expect("mask mode")],
+            vec![
+                m0.expect("mask mode"),
+                m1.expect("mask mode"),
+                m2.expect("mask mode"),
+            ],
         )
     } else {
         let (az_bits, bz_bits, cz_bits) = (
@@ -574,12 +579,7 @@ fn build_m_combo(
 /// is bit-identical to the naive per-column dot. Sparse-word skipping
 /// plus trailing-zero iteration keeps the work proportional to the
 /// set-bit count.
-fn fold_packed_w(
-    w_packed: &[u128],
-    q: usize,
-    w_cols: usize,
-    r_inst: &[Gf128],
-) -> Vec<Gf128> {
+fn fold_packed_w(w_packed: &[u128], q: usize, w_cols: usize, r_inst: &[Gf128]) -> Vec<Gf128> {
     let eq = magnetar_field::EqBits::build(r_inst).values;
     let w128 = (w_cols + 127) / 128;
     debug_assert_eq!(w_packed.len(), q * w128);
@@ -914,12 +914,9 @@ mod tests {
                 w_packed[u * w128 + k] = word;
             }
         }
-        let x_cols: Vec<Gf128> = (0..m / 2 - 1)
-            .map(|j| joint[m / 2 + 1 + j])
-            .collect();
+        let x_cols: Vec<Gf128> = (0..m / 2 - 1).map(|j| joint[m / 2 + 1 + j]).collect();
         let mut t = Transcript::new("vs", &[b"test"]);
-        let (proof, claims) =
-            prove_virtual_spartan(&rel, &layout, &w_packed, &x_cols, q, &mut t);
+        let (proof, claims) = prove_virtual_spartan(&rel, &layout, &w_packed, &x_cols, q, &mut t);
         let mut tv = Transcript::new("vs", &[b"test"]);
         let vclaims = verify_virtual_spartan(&rel, &layout, q, &public, &proof, &mut tv)
             .expect("honest vs proof must verify");

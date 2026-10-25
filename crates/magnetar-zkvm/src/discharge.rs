@@ -118,7 +118,13 @@ impl Support {
                 plane_pts.push(val);
             }
         }
-        Support { base, word_pos, word_pts, plane_pos, plane_pts }
+        Support {
+            base,
+            word_pos,
+            word_pts,
+            plane_pos,
+            plane_pts,
+        }
     }
 
     /// The word-index part of the base.
@@ -263,10 +269,7 @@ impl<'a> LocalDischarge<'a> {
         }
         drop(_pt_grp);
         if std::env::var("MAGNETAR_TIME").is_ok() {
-            let total_word: usize = groups
-                .iter()
-                .map(|g| 1usize << g.1.len())
-                .sum();
+            let total_word: usize = groups.iter().map(|g| 1usize << g.1.len()).sum();
             eprintln!(
                 "[time] ld-shape: ell={ell} stride={stride} items={n_items} groups={} word-vol={total_word}",
                 groups.len()
@@ -565,9 +568,7 @@ impl<'a> LocalDischarge<'a> {
         // per-thread buffers is overkill — sequential here, the volume is
         // `Σ_groups 2^{|Fw|} · Σ_members 2^{np}`).
         for (gi, (base_word, wpos, weq)) in groups.iter().enumerate() {
-            let members: Vec<usize> = (0..supports.len())
-                .filter(|&c| group_of[c] == gi)
-                .collect();
+            let members: Vec<usize> = (0..supports.len()).filter(|&c| group_of[c] == gi).collect();
             // Precompute each member's plane contribution:
             // (scalar α_c·C_c, plane support (pattern → weight)).
             let plane_supp: Vec<(Gf128, Vec<(usize, Gf128)>)> = members
@@ -1273,8 +1274,14 @@ mod fold_debug_tests {
         use crate::mosaic::{ComponentSpec, MosaicLayout};
         let mut rng = rand::rng();
         let per = MosaicLayout::build(vec![
-            ComponentSpec { name: "big".into(), vars: 12 },
-            ComponentSpec { name: "small".into(), vars: 10 },
+            ComponentSpec {
+                name: "big".into(),
+                vars: 12,
+            },
+            ComponentSpec {
+                name: "small".into(),
+                vars: 10,
+            },
         ]);
         let ell = per.ell;
         let v = 6.min(ell - 7).max(1).min(ell - 1);
@@ -1282,7 +1289,9 @@ mod fold_debug_tests {
         let word_bits = ell - 7;
         // One packed "instance": random bits over the full cube.
         let n_bits = 1usize << ell;
-        let bits: Vec<bool> = (0..n_bits).map(|_| rand::RngExt::random::<bool>(&mut rng)).collect();
+        let bits: Vec<bool> = (0..n_bits)
+            .map(|_| rand::RngExt::random::<bool>(&mut rng))
+            .collect();
         let mut packed = vec![Gf128(0); 1usize << word_bits];
         for x in 0..n_bits {
             if bits[x] {
@@ -1292,7 +1301,9 @@ mod fold_debug_tests {
             }
         }
         // One claim on "big": a fully random point.
-        let point: Vec<Gf128> = (0..12).map(|_| Gf128(rand::RngExt::random::<u128>(&mut rng))).collect();
+        let point: Vec<Gf128> = (0..12)
+            .map(|_| Gf128(rand::RngExt::random::<u128>(&mut rng)))
+            .collect();
         let claim = crate::mosaic::MosaicClaim {
             component: 0,
             point: point.clone(),

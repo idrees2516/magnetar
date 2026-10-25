@@ -106,11 +106,7 @@ impl SumcheckProver {
     /// state builds from the masks, and the fast-forward contracts the
     /// masks into the post-window dense tables. Requires the windowable
     /// shape (`eq·(D0·D1 + D2)`, high-bits-first) — panics otherwise.
-    pub fn with_mask_window(
-        spec: &SumcheckSpec,
-        order: BindOrder,
-        masks: Vec<Vec<u64>>,
-    ) -> Self {
+    pub fn with_mask_window(spec: &SumcheckSpec, order: BindOrder, masks: Vec<Vec<u64>>) -> Self {
         // The mask mode carries the dense tables packed; the generic
         // length validation is replaced by the window's shape check
         // below (empty dense is the expected form here).

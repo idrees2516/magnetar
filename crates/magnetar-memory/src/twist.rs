@@ -31,13 +31,20 @@ struct Pt {
 }
 impl Pt {
     fn new(label: &'static str) -> Self {
-        Pt { label, start: std::time::Instant::now() }
+        Pt {
+            label,
+            start: std::time::Instant::now(),
+        }
     }
 }
 impl Drop for Pt {
     fn drop(&mut self) {
         if std::env::var("MAGNETAR_TIME").is_ok() {
-            eprintln!("[time] {:<24} {:>9.1} ms", self.label, self.start.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[time] {:<24} {:>9.1} ms",
+                self.label,
+                self.start.elapsed().as_secs_f64() * 1e3
+            );
         }
     }
 }

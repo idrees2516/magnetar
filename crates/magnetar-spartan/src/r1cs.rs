@@ -391,9 +391,7 @@ impl SparseMatrix {
         // constant-1 column only. Entries on the `1` column contribute
         // their value as a constant row flip; entries on the (word-valued)
         // public x columns disqualify the table.
-        if !self.is_binary()
-            || self.entries.iter().any(|&(_, c, _)| c > w_cols)
-        {
+        if !self.is_binary() || self.entries.iter().any(|&(_, c, _)| c > w_cols) {
             return None;
         }
         let w128 = (w_cols + 127) / 128;

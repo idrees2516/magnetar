@@ -409,9 +409,7 @@ impl WitnessData {
     /// Witness bit `(u, col)` of the w-half as a field element.
     pub fn wbit(&self, u: usize, col: usize) -> Gf128 {
         let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
-        Gf128(
-            ((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1) as u128,
-        )
+        Gf128(((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1) as u128)
     }
 
     pub fn w_packed(&self) -> &[u128] {

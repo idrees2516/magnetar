@@ -211,13 +211,20 @@ pub fn prove_port_linear(
     }
     impl Pt {
         fn new(label: &'static str) -> Self {
-            Pt { label, start: std::time::Instant::now() }
+            Pt {
+                label,
+                start: std::time::Instant::now(),
+            }
         }
     }
     impl Drop for Pt {
         fn drop(&mut self) {
             if std::env::var("MAGNETAR_TIME").is_ok() {
-                eprintln!("[time] {:<24} {:>9.1} ms", self.label, self.start.elapsed().as_secs_f64() * 1e3);
+                eprintln!(
+                    "[time] {:<24} {:>9.1} ms",
+                    self.label,
+                    self.start.elapsed().as_secs_f64() * 1e3
+                );
             }
         }
     }
@@ -1192,7 +1199,11 @@ pub fn prove_st1_linear(
         }
         let coeffs = [s0, s0 + s1, ZERO];
         if rounds.is_empty() {
-            debug_assert_eq!(coeffs[1] + coeffs[2], ONE, "st1 round 0 must sum to the claim");
+            debug_assert_eq!(
+                coeffs[1] + coeffs[2],
+                ONE,
+                "st1 round 0 must sum to the claim"
+            );
         }
         let c = absorb(t, &coeffs);
         rounds.push(coeffs.to_vec());
@@ -1265,9 +1276,7 @@ mod st1_tests {
                 let spec = SumcheckSpec {
                     num_vars: kj_vars,
                     dense: vec![comp.table.clone()],
-                    public: vec![Box::new(
-                        magnetar_sumcheck::TableFactor::new(pubf),
-                    )],
+                    public: vec![Box::new(magnetar_sumcheck::TableFactor::new(pubf))],
                     terms: vec![Term {
                         coeff: ONE,
                         dense: vec![0],
