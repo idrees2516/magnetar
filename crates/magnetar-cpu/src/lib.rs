@@ -26,7 +26,10 @@ pub mod decode;
 pub mod expand;
 pub mod interp;
 
-pub use circuit::{build_circuit, CircuitSpec, WITNESS_LAYOUT};
+pub use circuit::{
+    assemble_instance_z, build_circuit, build_circuit_batched, CircuitSpec, InstanceGeometry,
+    SEGMENTS_CPU, WITNESS_LAYOUT,
+};
 pub use decode::{decode, Inst, Opcode};
 pub use expand::{expand_program, RomRow, VirtualInst};
 pub use interp::{execute, pad_records, ExecState, StreamCursor, Trace};

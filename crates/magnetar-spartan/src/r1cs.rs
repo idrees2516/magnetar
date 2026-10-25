@@ -272,6 +272,74 @@ pub fn fold_instances(per_instance: &[Gf128], r_inst: &[Gf128]) -> Gf128 {
     acc
 }
 
+impl SparseMatrix {
+    /// The SIMD application producing the joint table in **packed
+    /// window-mask form**: one `u64` per suffix holding the 64 window
+    /// sub-cube truth-table bits of the table at that suffix — the
+    /// layout the small-value round window reads (one word per suffix,
+    /// zero strided gathers). Requires the output to be **bit-valued**
+    /// (a binary matrix over the bit columns only — no x-references);
+    /// returns `None` otherwise.
+    ///
+    /// Joint layout: `(instance ‖ row)` with the instance high; the
+    /// window covers the top `v` variables (the instance's high bits),
+    /// so `t = u >> (s − v)` and the suffix is
+    /// `x = ((u & (2^{s−v} − 1)) << rows_log2) | row`.
+    pub fn apply_simd_bit_masks(
+        &self,
+        w_packed: &[u128],
+        q: usize,
+        w_cols: usize,
+        s: usize,
+        v: usize,
+    ) -> Option<Vec<u64>> {
+        // Pure-bit output: a binary matrix over the bit witness and the
+        // constant-1 column only. Entries on the `1` column contribute
+        // their value as a constant row flip; entries on the (word-valued)
+        // public x columns disqualify the table.
+        if !self.is_binary() || self.entries.iter().any(|&(_, c, _)| c > w_cols) {
+            return None;
+        }
+        let w128 = w_cols.div_ceil(128);
+        let rows_log2 = self.rows.trailing_zeros() as usize;
+        let stride = 1usize << (rows_log2 + s - v);
+        let low_mask = (1usize << (s - v)) - 1;
+        let mut masks = vec![0u64; stride];
+        for u in 0..q {
+            let row_words = &w_packed[u * w128..(u + 1) * w128];
+            // The row-parity bitset: one XOR per entry with a set witness
+            // bit (a word op, not a 16-byte accumulate).
+            let mut parity = vec![0u64; self.rows.div_ceil(64)];
+            for &(r, c, val) in &self.entries {
+                if val.0 & 1 == 0 {
+                    continue;
+                }
+                if c < w_cols {
+                    if (row_words[c >> 7] >> (c & 127)) & 1 == 1 {
+                        parity[r >> 6] ^= 1u64 << (r & 63);
+                    }
+                } else {
+                    // The constant-1 column: a fixed row flip.
+                    parity[r >> 6] ^= 1u64 << (r & 63);
+                }
+            }
+            let t = u >> (s - v);
+            let x_base = (u & low_mask) << rows_log2;
+            let mut pr = 0usize;
+            for blk in &parity {
+                let mut bits = *blk;
+                while bits != 0 {
+                    let r = pr + bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    masks[x_base + r] |= 1u64 << t;
+                }
+                pr += 64;
+            }
+        }
+        Some(masks)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,70 +436,3 @@ mod tests {
     }
 }
 
-impl SparseMatrix {
-    /// The SIMD application producing the joint table in **packed
-    /// window-mask form**: one `u64` per suffix holding the 64 window
-    /// sub-cube truth-table bits of the table at that suffix — the
-    /// layout the small-value round window reads (one word per suffix,
-    /// zero strided gathers). Requires the output to be **bit-valued**
-    /// (a binary matrix over the bit columns only — no x-references);
-    /// returns `None` otherwise.
-    ///
-    /// Joint layout: `(instance ‖ row)` with the instance high; the
-    /// window covers the top `v` variables (the instance's high bits),
-    /// so `t = u >> (s − v)` and the suffix is
-    /// `x = ((u & (2^{s−v} − 1)) << rows_log2) | row`.
-    pub fn apply_simd_bit_masks(
-        &self,
-        w_packed: &[u128],
-        q: usize,
-        w_cols: usize,
-        s: usize,
-        v: usize,
-    ) -> Option<Vec<u64>> {
-        // Pure-bit output: a binary matrix over the bit witness and the
-        // constant-1 column only. Entries on the `1` column contribute
-        // their value as a constant row flip; entries on the (word-valued)
-        // public x columns disqualify the table.
-        if !self.is_binary() || self.entries.iter().any(|&(_, c, _)| c > w_cols) {
-            return None;
-        }
-        let w128 = (w_cols).div_ceil(128);
-        let rows_log2 = self.rows.trailing_zeros() as usize;
-        let stride = 1usize << (rows_log2 + s - v);
-        let low_mask = (1usize << (s - v)) - 1;
-        let mut masks = vec![0u64; stride];
-        for u in 0..q {
-            let row_words = &w_packed[u * w128..(u + 1) * w128];
-            // The row-parity bitset: one XOR per entry with a set witness
-            // bit (a word op, not a 16-byte accumulate).
-            let mut parity = vec![0u64; (self.rows).div_ceil(64)];
-            for &(r, c, val) in &self.entries {
-                if val.0 & 1 == 0 {
-                    continue;
-                }
-                if c < w_cols {
-                    if (row_words[c >> 7] >> (c & 127)) & 1 == 1 {
-                        parity[r >> 6] ^= 1u64 << (r & 63);
-                    }
-                } else {
-                    // The constant-1 column: a fixed row flip.
-                    parity[r >> 6] ^= 1u64 << (r & 63);
-                }
-            }
-            let t = u >> (s - v);
-            let x_base = (u & low_mask) << rows_log2;
-            let mut pr = 0usize;
-            for blk in &parity {
-                let mut bits = *blk;
-                while bits != 0 {
-                    let r = pr + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    masks[x_base + r] |= 1u64 << t;
-                }
-                pr += 64;
-            }
-        }
-        Some(masks)
-    }
-}

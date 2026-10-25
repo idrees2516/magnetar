@@ -626,7 +626,7 @@ pub fn verify_virtual_spartan(
     rel: &DualRelation,
     layout: &SegmentLayout,
     q: usize,
-    public: &[Vec<Gf128>], // per-instance public inputs
+    x_shared: &[Gf128], // the public x columns, shared by every instance
     proof: &VirtualSpartanProof,
     t: &mut Transcript,
 ) -> Result<Vec<SegmentClaim>, &'static str> {
@@ -768,17 +768,15 @@ pub fn verify_virtual_spartan(
     let r_col: Vec<Gf128> = r_col_ch;
     let msb = r_col[row_vars - 1];
     let r_low: Vec<Gf128> = r_col[..row_vars - 1].to_vec();
-    // Public fold of the (1, x) half.
-    let half = m / 2;
-    let eq_inst = magnetar_field::EqBits::build(&r_inst).values;
+    // Public fold of the (1, x) half: the x vector is **shared** by every
+    // instance, so the eq(r_inst)-weighted instance sum collapses by the
+    // identity Σ_u eq(r_inst, u) = 1 — the fold is the single-instance
+    // term (O(m/2) once, not per instance).
     let eq_low = magnetar_field::EqBits::build(&r_low).values;
-    let mut public_fold = ZERO;
-    for (u, x) in public.iter().enumerate() {
-        let mut term = eq_low[0];
-        for (j, &xv) in x.iter().enumerate() {
-            term += mul(eq_low[j + 1], xv);
-        }
-        public_fold += mul(eq_inst[u], term);
+    debug_assert_eq!(x_shared.len(), m / 2 - 1);
+    let mut public_fold = eq_low[0];
+    for (j, &xv) in x_shared.iter().enumerate() {
+        public_fold += mul(eq_low[j + 1], xv);
     }
     // Segment combination: Σ_i eq(q_i, b_i)·v_i.
     let mut seg_sum = ZERO;
@@ -812,7 +810,6 @@ pub fn verify_virtual_spartan(
             value: proof.segment_values[i],
         })
         .collect();
-    let _ = half;
     Ok(claims)
 }
 
@@ -918,7 +915,7 @@ mod tests {
         let mut t = Transcript::new("vs", &[b"test"]);
         let (proof, claims) = prove_virtual_spartan(&rel, &layout, &w_packed, &x_cols, q, &mut t);
         let mut tv = Transcript::new("vs", &[b"test"]);
-        let vclaims = verify_virtual_spartan(&rel, &layout, q, &public, &proof, &mut tv)
+        let vclaims = verify_virtual_spartan(&rel, &layout, q, &public[0], &proof, &mut tv)
             .expect("honest vs proof must verify");
         assert_eq!(vclaims.len(), claims.len());
         for (a, b) in claims.iter().zip(vclaims.iter()) {
@@ -929,21 +926,21 @@ mod tests {
         let mut p = proof.clone();
         p.segment_values[0] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
-        assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
+        assert!(verify_virtual_spartan(&rel, &layout, q, &public[0], &p, &mut tv).is_err());
         // Tamper: terminal value.
         let mut p = proof.clone();
         p.terminals[0] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
-        assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
+        assert!(verify_virtual_spartan(&rel, &layout, q, &public[0], &p, &mut tv).is_err());
         // Tamper: inner message.
         let mut p = proof.clone();
         p.inner[0][1] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
-        assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
+        assert!(verify_virtual_spartan(&rel, &layout, q, &public[0], &p, &mut tv).is_err());
         // Tamper: outer row message.
         let mut p = proof.clone();
         p.outer_bin[0][1] += ONE;
         let mut tv = Transcript::new("vs", &[b"test"]);
-        assert!(verify_virtual_spartan(&rel, &layout, q, &public, &p, &mut tv).is_err());
+        assert!(verify_virtual_spartan(&rel, &layout, q, &public[0], &p, &mut tv).is_err());
     }
 }

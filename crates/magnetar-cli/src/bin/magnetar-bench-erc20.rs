@@ -29,6 +29,16 @@ use magnetar_pcs::PcsParams;
 use magnetar_zkvm::{keygen_with, proof_stats, prove, verify, PublicInput};
 use std::time::Instant;
 
+/// The instance-batching density knob (paper §5.1: cycles per SIMD
+/// instance). `MAGNETAR_CPI=1|2|4|8…` sweeps it; the default is the
+/// witness layout's production constant.
+fn cpi_from_env() -> usize {
+    std::env::var("MAGNETAR_CPI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI)
+}
+
 fn enc_i(imm: u32, rs1: u32, funct3: u32, rd: u32, op: u32) -> u32 {
     ((imm & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | op
 }
@@ -123,9 +133,10 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
+    let cpi = cpi_from_env();
     println!("ERC-20 mixed-block load test (the paper's Table-6 workload shape)");
     println!(
-        "(64-bit balances, checked subtraction, every 16th transfer fails; {} cycles/tx)\n",
+        "(64-bit balances, checked subtraction, every 16th transfer fails; {} cycles/tx, cpi={cpi})\n",
         CYCLES_PER_TX
     );
     // ---- The monolithic prover (the small scales). ----
@@ -138,7 +149,7 @@ fn main() {
         let n_tx = total / CYCLES_PER_TX;
         let prog = erc20_program(n_tx as u32);
         let input = vec![1_000_000u64, 0u64];
-        let (pk, vk) = keygen_with(prog.clone(), total, 2, PcsParams::default());
+        let (pk, vk) = keygen_with(prog.clone(), total, 2, PcsParams::default(), cpi);
         let trace = magnetar_cpu::interp::execute(&pk.program, &input, total);
         let out = trace.final_state.output;
         // Sanity: successful transfers each move 7 from ram[0].
@@ -199,9 +210,18 @@ fn main() {
             total,
             segments,
             &PcsParams::default(),
+            cpi,
         );
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let ok = magnetar_ivc::verify_ivc(&prog, &input, out, total, &proof, &PcsParams::default());
+        let ok = magnetar_ivc::verify_ivc(
+            &prog,
+            &input,
+            out,
+            total,
+            &proof,
+            &PcsParams::default(),
+            cpi,
+        );
         assert!(ok.is_ok(), "erc20 streaming at T=2^{log2_t} must verify");
         println!(
             "{:>7} {:>4} {:>10.0} {:>9.0}M {:>12.0} {:>10.0} {:>10.0} {:>9.0}",

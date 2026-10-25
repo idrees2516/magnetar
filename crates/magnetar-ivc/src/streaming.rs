@@ -129,6 +129,7 @@ pub fn prove_ivc_streaming(
     total_len: usize,
     segments: usize,
     pcs: &magnetar_pcs::PcsParams,
+    cpi: usize,
 ) -> (crate::IvcProof, StreamingStats) {
     let t_total = Instant::now();
     assert!(segments.is_power_of_two() && segments >= 1);
@@ -163,7 +164,7 @@ pub fn prove_ivc_streaming(
             + 64);
 
     // ---- The shared proving key + the combined layout. ----
-    let (pk, _vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone());
+    let (pk, _vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone(), cpi);
     let per = crate::per_segment_layout(&pk);
     let combined = combined_layout(&pk, segments);
     let n_comp = pk.mosaic.components.len();

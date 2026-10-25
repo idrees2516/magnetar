@@ -111,7 +111,8 @@ fn main() {
                     out,
                     total,
                     &seq,
-                    &PcsParams::default()
+                    &PcsParams::default(),
+                    magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
                 )
                 .is_ok());
                 println!(
@@ -136,6 +137,7 @@ fn main() {
                     total,
                     segments,
                     &PcsParams::default(),
+                    magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
                 );
                 assert!(magnetar_ivc::verify_ivc(
                     &prog,
@@ -143,7 +145,8 @@ fn main() {
                     out,
                     total,
                     &stream,
-                    &PcsParams::default()
+                    &PcsParams::default(),
+                    magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
                 )
                 .is_ok());
                 let bound = stats.packed_bytes

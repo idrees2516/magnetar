@@ -48,6 +48,88 @@ use crate::interp::CycleRecord;
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 use magnetar_spartan::SparseMatrix;
 
+/// The W-segment table (name, per-cycle length, direct) — **the source of
+/// truth for the witness layout**. The zkvm's `SEGMENTS` mirrors this
+/// (the crate boundary keeps the zkvm's claim plumbing naming); both
+/// must stay in declared order with aligned per-cycle offsets.
+pub const SEGMENTS_CPU: &[(&str, usize, bool)] = &[
+    ("rs1", 64, false),
+    ("rs2", 64, false),
+    ("rd", 64, false),
+    ("load-val", 64, false),
+    ("shift-out", 64, false),
+    ("t1", 64, true),
+    ("t2", 64, true),
+    ("carry", 64, true),
+    ("alu", 64, true),
+    ("shift-src", 64, true),
+    ("store-old", 64, true),
+    ("store-src", 64, true),
+    ("flags", 16, true),
+    ("off", 8, true),
+    ("ram-addr", 8, true),
+    ("pc", 8, false),
+    ("fetch", 64, false),
+    ("eqaux", 64, true),
+    ("crossaux", 1024, false),
+];
+
+/// The **instance-batched** per-instance geometry (paper §5.1: "Each SIMD
+/// instance covers a fixed number of consecutive cycles"): `cpi` cycles
+/// share one SIMD instance.
+///
+/// The per-instance column index of per-cycle column `col` in cycle δ is
+/// **`cpi·col + δ`** — the cycle-within-instance coordinate is the LOW
+/// `log cpi` bits of the column index, a **single variable shared by
+/// every segment** (the auxiliary arguments — Twist, Shout, Ψ, Router —
+/// consume the claims of different segments against ONE cycle cube, so
+/// the δ dimension must be one variable, not per-segment). Every
+/// per-cycle segment `s` still occupies the aligned contiguous block
+/// `[cpi·off_s, cpi·(off_s+len_s))`, and its local index is
+/// `col·cpi + δ` (δ = the low `log cpi` local bits, the column above) —
+/// a segment claim's local point is `[δ-vars ‖ col-vars]` and the cycle
+/// point of cycle `u·cpi+δ` is `[δ-vars ‖ instance-vars]`. The `(1, x)`
+/// half is **shared** by every cycle of the instance: one `1` column and
+/// one public x vector per instance.
+#[derive(Clone, Debug)]
+pub struct InstanceGeometry {
+    /// Cycles per SIMD instance (a power of two).
+    pub cpi: usize,
+    /// Per-instance witness columns `|w|` = `cpi·W_COLS`.
+    pub w_cols: usize,
+    /// Per-instance columns `m = 2·|w|` (the Spartan shape).
+    pub m: usize,
+    /// The `1` column index in the per-instance `z = (w, 1, x)`.
+    pub one_col: usize,
+    /// Packed words per instance (`w_cols / 128`).
+    pub w128: usize,
+}
+
+impl InstanceGeometry {
+    /// The per-instance column index of per-cycle column `col` in cycle
+    /// δ of an instance: `cpi·col + δ`.
+    pub fn map_col(&self, col: usize, delta: usize) -> usize {
+        self.cpi * col + delta
+    }
+
+    /// The per-instance column index of a per-cycle `(1, x)`-half column
+    /// (the shared half: the same position for every δ).
+    pub fn map_public_col(&self, col: usize) -> usize {
+        debug_assert!(col >= WITNESS_LAYOUT::W_COLS);
+        self.one_col + (col - WITNESS_LAYOUT::M / 2)
+    }
+
+    /// The per-instance column index of any per-cycle z column in cycle
+    /// δ of an instance.
+    pub fn map_z_col(&self, col: usize, delta: usize) -> usize {
+        if col < WITNESS_LAYOUT::W_COLS {
+            self.map_col(col, delta)
+        } else {
+            self.map_public_col(col)
+        }
+    }
+}
+
 /// Witness layout constants: one row of `z = (w, 1, x)`.
 #[allow(non_camel_case_types)] // a constants namespace, not a type
 pub struct WITNESS_LAYOUT;
@@ -153,9 +235,32 @@ impl WITNESS_LAYOUT {
     pub const BUS_RS2: usize = 19;
     pub const BUS_FUNCT3: usize = 25;
     pub const BUS_IMM: usize = 28;
+
+    /// **Cycles per SIMD instance** (the paper §5.1 operating point):
+    /// the production default. A power of two; `1` recovers the
+    /// one-cycle-per-instance layout. `keygen` reads this; the benches
+    /// override it via `MAGNETAR_CPI` for the density sweep.
+    pub const DEFAULT_CPI: usize = 1;
+
+    /// The instance-batched geometry for `cpi` cycles per instance.
+    pub fn geometry(cpi: usize) -> InstanceGeometry {
+        assert!(
+            cpi.is_power_of_two() && cpi >= 1,
+            "cpi must be a power of two"
+        );
+        let w_cols = Self::W_COLS * cpi;
+        InstanceGeometry {
+            cpi,
+            w_cols,
+            m: 2 * w_cols,
+            one_col: w_cols,
+            w128: w_cols / 128,
+        }
+    }
 }
 
-/// The dual-relation circuit spec: matrices over the M columns.
+/// The dual-relation circuit spec: matrices over the per-instance M
+/// columns.
 #[derive(Clone, Debug)]
 pub struct CircuitSpec {
     pub a_bin: SparseMatrix,
@@ -165,6 +270,10 @@ pub struct CircuitSpec {
     pub b_fld: SparseMatrix,
     pub c_fld: SparseMatrix,
     pub m: usize,
+    /// Cycles per SIMD instance (the row indexing reshapes over
+    /// `(δ ‖ row-within-cycle)` blocks; the column indexing over the
+    /// instance-batched segments).
+    pub cpi: usize,
 }
 
 /// Assemble one witness row `z = (w, 1, x)` from a cycle record and its
@@ -1008,7 +1117,80 @@ pub fn build_circuit() -> CircuitSpec {
         b_fld: b2,
         c_fld: c2,
         m,
+        cpi: 1,
     }
+}
+
+/// Build the **instance-batched** dual circuit: `cpi` cycles per SIMD
+/// instance (the paper §5.1 operating point). The two relations' **row
+/// indexing reshapes** over `(δ ‖ row-within-cycle)` blocks — row
+/// `δ·rows_per_cycle + ρ` carries the per-cycle constraint `ρ` of cycle
+/// δ — and the **column indexing reshapes** over the instance-batched
+/// segment layout (each per-cycle segment `s` at `cpi·off_s`, its cycle-δ
+/// copy contiguous at `δ·len_s`); the `(1, x)` half is shared per
+/// instance (the `1` column at `|w|`, the public x vector after it).
+///
+/// The constraint set is the per-cycle relation replicated — the SAME
+/// soundness surface, no new rows — so the batched circuit is satisfied
+/// exactly when every cycle row satisfies the per-cycle circuit.
+pub fn build_circuit_batched(cpi: usize) -> CircuitSpec {
+    let per = build_circuit();
+    if cpi == 1 {
+        return per;
+    }
+    assert!(cpi.is_power_of_two());
+    let geo = WITNESS_LAYOUT::geometry(cpi);
+    let rows_pad = |mat: &SparseMatrix| mat.rows.max(1);
+    let remap = |mat: &SparseMatrix| -> SparseMatrix {
+        let mut out = SparseMatrix::empty(cpi * rows_pad(mat), geo.m);
+        out.entries = Vec::with_capacity(mat.entries.len() * cpi);
+        for delta in 0..cpi {
+            let row_base = delta * rows_pad(mat);
+            for &(r, c, v) in &mat.entries {
+                let col = if c < WITNESS_LAYOUT::W_COLS {
+                    geo.map_col(c, delta)
+                } else {
+                    geo.one_col + (c - WITNESS_LAYOUT::M / 2)
+                };
+                out.entries.push((row_base + r, col, v));
+            }
+        }
+        out
+    };
+    CircuitSpec {
+        a_bin: remap(&per.a_bin),
+        b_bin: remap(&per.b_bin),
+        c_bin: remap(&per.c_bin),
+        a_fld: remap(&per.a_fld),
+        b_fld: remap(&per.b_fld),
+        c_fld: remap(&per.c_fld),
+        m: geo.m,
+        cpi,
+    }
+}
+
+/// Assemble one **instance**'s `z = (w, 1, x)` from `cpi` consecutive
+/// per-cycle rows and the shared public x vector (the per-cycle x
+/// convention: `x[0]` the output, `x[1+i]` the input words).
+pub fn assemble_instance_z(
+    geo: &InstanceGeometry,
+    cycle_zs: &[Vec<Gf128>],
+    per_cycle_x: &[Gf128],
+) -> Vec<Gf128> {
+    assert_eq!(cycle_zs.len(), geo.cpi);
+    let mut z = vec![ZERO; geo.m];
+    for (delta, cz) in cycle_zs.iter().enumerate() {
+        for col in 0..WITNESS_LAYOUT::W_COLS {
+            z[geo.map_col(col, delta)] = cz[col];
+        }
+    }
+    z[geo.one_col] = ONE;
+    for (j, &xv) in per_cycle_x.iter().enumerate() {
+        if geo.one_col + 1 + j < geo.m {
+            z[geo.one_col + 1 + j] = xv;
+        }
+    }
+    z
 }
 
 /// Check that a witness row satisfies both relations (test helper).
@@ -1095,6 +1277,76 @@ mod tests {
             let row = &trace.program.rows[rec.micro_pc % trace.program.rows.len()].row;
             let z = witness_row(rec, row, &[Gf128(0)]);
             assert!(check_row(&spec, &z).is_ok(), "row pc={}", rec.micro_pc);
+        }
+    }
+
+    /// The instance-batched circuit (cpi > 1): the per-cycle constraint
+    /// rows reshape over (δ ‖ row) blocks and the columns over the
+    /// batched segments; an assembled instance satisfies the batched
+    /// relations exactly when its cycles satisfy the per-cycle circuit.
+    #[test]
+    fn batched_circuit_satisfied_by_instances() {
+        // A mixed program: arithmetic, memory, shifts.
+        let prog = vec![
+            0x01000093,                                             // addi x1, x0, 16
+            0x0ab00113,                                             // addi x2, x0, 0xAB
+            ((2u32 << 20) | (1 << 15)) | 0x23,                      // sb x2, 0(x1)
+            (1 << 15) | (3 << 7) | 0x03,                            // lb x3, 0(x1)
+            (3u32 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x13, // slli x3, x1, 3
+            (2u32 << 20) | (1 << 15) | (4 << 7) | 0x33,             // add x4, x1, x2
+            0x0000_0073,
+        ];
+        let trace = crate::interp::execute(&prog, &[], 64);
+        let x = [Gf128(0)];
+        for cpi in [2usize, 4, 8] {
+            let geo = WITNESS_LAYOUT::geometry(cpi);
+            let spec = build_circuit_batched(cpi);
+            assert_eq!(spec.m, geo.m);
+            assert_eq!(spec.a_bin.rows, cpi * build_circuit().a_bin.rows);
+            for u in 0..trace.records.len() / cpi {
+                let zs: Vec<Vec<Gf128>> = (0..cpi)
+                    .map(|delta| {
+                        let rec = &trace.records[u * cpi + delta];
+                        let row = &trace.program.rows[rec.micro_pc % trace.program.rows.len()].row;
+                        witness_row(rec, row, &x)
+                    })
+                    .collect();
+                let z = assemble_instance_z(&geo, &zs, &x);
+                assert!(
+                    check_row(&spec, &z).is_ok(),
+                    "cpi={cpi} instance {u} failed"
+                );
+            }
+        }
+    }
+
+    /// The geometry's column map is a bijection into `[0, w_cols)` — every
+    /// per-cycle column lands on a distinct per-instance column — and the
+    /// batched segments stay aligned.
+    #[test]
+    fn geometry_map_is_bijection_and_aligned() {
+        for cpi in [1usize, 2, 4, 8] {
+            let geo = WITNESS_LAYOUT::geometry(cpi);
+            let mut seen = vec![false; geo.w_cols];
+            for col in 0..WITNESS_LAYOUT::W_COLS {
+                for delta in 0..cpi {
+                    let c = geo.map_col(col, delta);
+                    assert!(c < geo.w_cols, "cpi={cpi} col {col}δ{delta} → {c}");
+                    assert!(!seen[c], "cpi={cpi} collision at {c}");
+                    seen[c] = true;
+                }
+            }
+            // The shared (1, x) half sits above the witness half.
+            assert_eq!(geo.map_public_col(WITNESS_LAYOUT::M / 2), geo.one_col);
+            assert_eq!(
+                geo.map_public_col(WITNESS_LAYOUT::M / 2 + 1),
+                geo.one_col + 1
+            );
+            // The aligned-segment discipline: rs1's batched block is
+            // [0, 64·cpi) and the pc segment's base is cpi·800.
+            assert_eq!(geo.map_col(0, 0), 0);
+            assert_eq!(geo.map_col(63, cpi - 1), 64 * cpi - 1);
+            assert_eq!(geo.map_col(800, 0), 800 * cpi);
         }
     }
 }

@@ -53,7 +53,13 @@ fn cmd_profiles() {
         PcsProfile::DeepWrap,
     ] {
         let params = profile.params();
-        let (pk, vk) = keygen_with(program.clone(), 8, 2, params.clone());
+        let (pk, vk) = keygen_with(
+            program.clone(),
+            8,
+            2,
+            params.clone(),
+            magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+        );
         let pub_in = PublicInput {
             input: vec![],
             output: 0,
@@ -86,7 +92,13 @@ fn cmd_profiles() {
     }
     // The wrap: the same statement with the public tail discharged at
     // DeepWrap via the consistency spot-checks.
-    let (pk, vk) = keygen_with(program, 8, 2, PcsProfile::Balanced.params());
+    let (pk, vk) = keygen_with(
+        program,
+        8,
+        2,
+        PcsProfile::Balanced.params(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+    );
     let pub_in = PublicInput {
         input: vec![],
         output: 0,
