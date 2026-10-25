@@ -48,8 +48,8 @@ pub use mosaic::{
 };
 pub use protocol::{
     boundary_point_claims, build_segment, keygen, keygen_with, prove, prove_inner, verify,
-    verify_inner, Boundary, InnerProof, KeyGen, Proof, PublicInput, SegmentStatement, VerifyingKey,
-    WitnessData, AMOUNT_BITS,
+    verify_inner, Boundary, InnerProof, KeyGen, PhaseTimer, Proof, PublicInput, SegmentStatement,
+    VerifyingKey, WitnessData, AMOUNT_BITS,
 };
 pub use rom::RomTables;
 pub use stats::{proof_stats, ProofStats};

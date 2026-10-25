@@ -300,9 +300,13 @@ pub fn prove_ivc_streaming(
 
     // ---- Phase 3: the root — one commitment, one discharge. ----
     let t2 = Instant::now();
+    let _pt_enc = magnetar_zkvm::PhaseTimer::new("root-encode");
     let code_params = CodeParams::derive(n, pcs.k, &pcs.domain);
     let codeword = magnetar_pcs::code::Codeword::encode(&code_params, &packed);
+    drop(_pt_enc);
+    let _pt_mkl = magnetar_zkvm::PhaseTimer::new("root-merkle");
     let tree = MerkleTree::build(&format!("{}/level/0", pcs.domain), &codeword.values);
+    drop(_pt_mkl);
     let stmt = PcsStatement {
         root: tree.root(),
         n,
@@ -336,6 +340,7 @@ pub fn prove_ivc_streaming(
         stmt,
         ell: combined.ell,
     };
+    let _pt_mos = magnetar_zkvm::PhaseTimer::new("root-mosaic-hier");
     let mosaic = prove_mosaic_hier(
         pcs,
         &per,
@@ -346,6 +351,7 @@ pub fn prove_ivc_streaming(
         None,
         &mut t,
     );
+    drop(_pt_mos);
     let wall_root = t2.elapsed();
 
     let stats = StreamingStats {
