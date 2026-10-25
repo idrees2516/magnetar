@@ -90,8 +90,6 @@ pub(crate) struct Support {
     /// `[ell − 7, ell − v)`) and the point's values there.
     plane_pos: Vec<usize>,
     plane_pts: Vec<Gf128>,
-    /// The eq table over the free word coordinates.
-    word_eq: Vec<Gf128>,
 }
 
 impl Support {
@@ -120,12 +118,7 @@ impl Support {
                 plane_pts.push(val);
             }
         }
-        let word_eq = if word_pts.is_empty() {
-            vec![ONE]
-        } else {
-            EqBits::build(&word_pts).values
-        };
-        Support { base, word_pos, word_pts, plane_pos, plane_pts, word_eq }
+        Support { base, word_pos, word_pts, plane_pos, plane_pts }
     }
 
     /// The word-index part of the base.
@@ -519,6 +512,7 @@ impl<'a> LocalDischarge<'a> {
         } else {
             stride
         };
+        let _pt_bg = crate::protocol::PhaseTimer::new("fw-bound-g");
         bound_g
             .par_chunks_mut(chunk)
             .enumerate()
@@ -547,6 +541,8 @@ impl<'a> LocalDischarge<'a> {
         // the free-word eq table, so the word dimension is walked once
         // per group and each member contributes only its (tiny) plane
         // support: at most `2^{7-v}` patterns per claim per word.
+        drop(_pt_bg);
+        let _pt_bs = crate::protocol::PhaseTimer::new("fw-bound-se");
         let word_bits = self.ell - 7;
         let mut bound_se = vec![ZERO; stride];
         let groups = &self.groups;
@@ -624,6 +620,8 @@ impl<'a> LocalDischarge<'a> {
         }
         drop(_pt_fw);
         let _pt_tail = crate::protocol::PhaseTimer::new("ld-tail-rounds");
+        drop(_pt_bs);
+        let _pt_spec = crate::protocol::PhaseTimer::new("fw-tail-spec");
         let claim = self.running;
         let spec = SumcheckSpec {
             num_vars: ell - v,
