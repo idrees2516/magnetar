@@ -237,10 +237,15 @@ impl WITNESS_LAYOUT {
     pub const BUS_IMM: usize = 28;
 
     /// **Cycles per SIMD instance** (the paper §5.1 operating point):
-    /// the production default. A power of two; `1` recovers the
-    /// one-cycle-per-instance layout. `keygen` reads this; the benches
-    /// override it via `MAGNETAR_CPI` for the density sweep.
-    pub const DEFAULT_CPI: usize = 1;
+    /// the production default — measured best at every streaming scale on
+    /// the InstaBox AVX-512 host (2^16: 13,079 cycles/s and a 16% faster
+    /// streaming root vs the one-cycle layout; the per-instance discharge
+    /// work amortizes over 4 cycles, and the per-segment inner/m_combo
+    /// constants stay small enough not to eat the win — at cpi 8 they
+    /// already do). A power of two; `1` recovers the one-cycle-per-instance
+    /// layout. `keygen` reads this; the benches override it via
+    /// `MAGNETAR_CPI` for the density sweep.
+    pub const DEFAULT_CPI: usize = 4;
 
     /// The instance-batched geometry for `cpi` cycles per instance.
     pub fn geometry(cpi: usize) -> InstanceGeometry {

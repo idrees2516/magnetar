@@ -435,4 +435,3 @@ mod tests {
         assert_eq!(inst.fold_public_part(&r_inst, &r_low), want);
     }
 }
-
