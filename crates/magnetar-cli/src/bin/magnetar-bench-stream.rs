@@ -77,9 +77,7 @@ fn main() {
         "table B"
     );
     let prog = alu_program();
-    for log2_t in (8usize..=24)
-        .filter(|t| *t >= min_log2 && *t <= max_log2)
-    {
+    for log2_t in (8usize..=24).filter(|t| *t >= min_log2 && *t <= max_log2) {
         let total = 1usize << log2_t;
         let trace = magnetar_cpu::interp::execute(&prog, &[], total);
         let out = trace.final_state.output;

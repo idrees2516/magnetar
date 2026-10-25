@@ -76,21 +76,28 @@ transfer at the 64-bit balance width of this RV64I reference CPU
 | 2^15 | 32 | 2,730 | 1,990 | 16,470 | 1,372 | 595 MiB |
 | 2^16 | 64 | 5,461 | 4,254 | 15,405 | 1,284 | 1.09 GiB |
 
-**The pooled proving-pool run** (5 × 4-vCPU instances proving
-independent 2^16 batches concurrently — the cpi × pool matrix, the
-aggregate over the 20 vCPUs):
+**The pooled proving-pool run** — the cpi × pool matrix AND the batch
+shape × pool matrix (5 × 4-vCPU instances, independent batches proved
+concurrently, the aggregate over the 20 vCPUs):
 
-| cpi | per-machine tx/s | aggregate tx/s |
+| shape | per-machine tx/s | aggregate tx/s |
 |---|---|---|
-| **1** | 1,005–1,051 | **5,139** |
-| 4 | 847–975 | 4,585 |
-| 8 | 956–1,027 | 4,942 |
+| 2^13 batches, cpi 1 | 1,188–1,215 | **6,005** |
+| 2^14 batches, cpi 1 | 1,107–1,192 | 5,775 |
+| 2^16 batches, cpi 1 | 1,005–1,051 | 5,139 |
+| 2^16 batches, cpi 4 | 847–975 | 4,585 |
+| 2^16 batches, cpi 8 | 956–1,027 | 4,942 |
 
-The honest pooled operating point is `cpi = 1`: the lightest
-per-segment constants degrade least under cross-VM contention (the
-solo ladder's cpi 4 edge — the per-instance discharge amortization —
-was exactly what the 0.9.2 levers removed). The 0.8.0 pool measured
-≈3,788 tx/s; the same five machines now pool ≈5,139 tx/s (+36%). The
+The honest pooled operating points: `cpi = 1` AND the **2^13 batch**
+(smaller roots contend less; the solo ladder peaks at 2^14 but the pool
+peaks at 2^13). The 0.8.0 pool measured ≈3,788 tx/s at 2^16; the same
+five machines now pool **6,005 tx/s (+59%)**. `magnetar-bench-erc20-pool
+<LOG2_BATCH> <BATCHES>` drives one machine's share of a large total —
+the **2^23 pooled demonstration, measured**: 1,024 independent 2^13
+batches (8,388,608 cycles = 699,050 transfers) split 205/205/205/205/204
+across the five machines, every batch proved AND verified — **210 s
+wall, ≈3,330 tx/s sustained aggregate** (665–798 tx/s per machine
+under sustained cross-VM contention; the burst pool runs 6,005). The
 remaining measured levers, in order of impact:
 
 1. **The discharge's `fw-bound-se` group-fold** (~19 ms per segment,
@@ -104,12 +111,47 @@ remaining measured levers, in order of impact:
    state (one 16-byte scatter per set monomial per suffix).
 3. **The twists' Δ\* one-hot proofs** (`tw-onehot`, ~11 ms per segment
    total across the two twists) and the port k-rounds (~4 ms).
-4. **The streaming root commitment** for 2^17+ monolithic-bounded
-   proving: the driver materializes the combined packed table, its
-   codeword, and the Merkle tree (≈3.3× the packed bytes); the
-   611-paper's shape (encode + hash per segment slice, the discharge
-   consuming packed words per segment) is the 2^23/2^24 gate.
+4. **The streaming root** for 2^19+ single-machine proving — the
+   measured 2^23/2^24 gate (see below).
 
+## The single-machine envelope, measured (the 2^23/2^24 gate)
+
+The streaming driver's per-phase peak (`MAGNETAR_TIME=1`, the isolated
+single-scale runs on the 4-vCPU/8-GiB host):
+
+| T | segments | segments-phase peak | root entry | root exit | wall |
+|---|---|---|---|---|---|
+| 2^17 | 128 | 137 MiB | 457 MiB | 2,357 MiB | 37 s |
+| 2^18 | 256 | 261 MiB | 901 MiB | 4,750 MiB | 150 s |
+
+The **segments phase is bounded as designed** (O(one segment) per
+worker) — the wall is the root, and the root's cost is measured and
+structural: (a) the lockstep discharge holds every segment's local
+state simultaneously — the tail's bound tables are ~2 ×
+`2^(ell−v)` × 16 B ≈ **15 MiB per 2^10-cycle segment** (the engine's
+internal `spec.dense.clone()` doubles it), and (b) the combined
+commitment materializes `packed + codeword + tree` ≈ 3.3× the packed
+bytes (~14 GiB at 2^23). Both are linear in T, against the paper's
+~3 B/cycle streaming shape (2^22 in 6.4 GiB). The 2^23/2^24
+single-machine unlock, in order:
+
+1. **Per-segment independent discharges** — drop the lockstep (each
+   segment's local stage runs to completion in its own transcript,
+   then the segment stage batches the terminals; the proof size and
+   verifier work are unchanged in shape, the transcript flow changes):
+   the root's discharge memory becomes O(one segment).
+2. **The streamed commitment** — encode + Merkle per segment slice
+   (the code's linearity makes the encode per-block), keeping only the
+   tree's upper nodes and re-deriving per-slice packed words from the
+   checkpoints during the discharge (the 611-paper's small-space
+   prover shape).
+3. The local-stage rate (~0.22 ms/cycle measured at 2^18) then
+   parallelizes across the pool for the aggregate scales.
+
+Until then: **the pool is the 2^23/2^24 shape** — the total proven
+workload scales linearly in machines (the 2^23 demonstration above),
+and the per-machine envelope stays bounded at the 2^13–2^18 batch
+sizes.
 
 Every row proves **and verifies** end-to-end (the assert is in the
 harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,

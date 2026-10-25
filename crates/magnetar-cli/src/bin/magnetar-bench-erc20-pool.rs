@@ -93,7 +93,12 @@ fn erc20_program(n: u32) -> Vec<u32> {
     // skip:
     p.push(enc_i(-1i32 as u32, 1, 0, 1, 0x13)); // x1 -= 1
     let bne_pc = p.len();
-    p.push(enc_b(((loop_pc as i64 - bne_pc as i64) * 4) as i32, 0, 1, 1));
+    p.push(enc_b(
+        ((loop_pc as i64 - bne_pc as i64) * 4) as i32,
+        0,
+        1,
+        1,
+    ));
     p.push(enc_i(0, 0, 3, 10, 0x03)); // ld x10, 0(x0)
     p.push(0x0000_0073); // ecall
     p
