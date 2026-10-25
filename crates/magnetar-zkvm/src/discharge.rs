@@ -291,17 +291,26 @@ impl<'a> LocalDischarge<'a> {
             .map(|(bw, wpos, weq)| {
                 let mut out = [ZERO; 128];
                 let npat = 1usize << wpos.len();
+                // The free word positions are almost always the identity
+                // range [0, fw) (the components' own coordinates are the
+                // low cube bits) — take the branch-free fast path.
+                let identity = wpos.iter().enumerate().all(|(j, &p)| p == j);
                 for i in 0..npat {
                     let e = weq[i];
                     if e == ZERO {
                         continue;
                     }
-                    let mut word = *bw;
-                    for (j, &pos) in wpos.iter().enumerate() {
-                        if (i >> j) & 1 == 1 {
-                            word |= 1usize << pos;
+                    let word = if identity {
+                        bw | i
+                    } else {
+                        let mut w = *bw;
+                        for (j, &pos) in wpos.iter().enumerate() {
+                            if (i >> j) & 1 == 1 {
+                                w |= 1usize << pos;
+                            }
                         }
-                    }
+                        w
+                    };
                     // The word's set bits scatter into the plane lanes.
                     let mut bits = packed[word_base + word].0;
                     while bits != 0 {
@@ -590,27 +599,26 @@ impl<'a> LocalDischarge<'a> {
                 })
                 .collect();
             let _ = &plane_supp;
-            // The word walk.
+            // The word walk (identity fast path — see the fold).
             let npat = 1usize << wpos.len();
+            let identity = wpos.iter().enumerate().all(|(j, &p)| p == j);
             for i in 0..npat {
                 let e = weq[i];
                 if e == ZERO {
                     continue;
                 }
-                let mut word = *base_word;
-                for (j, &pos) in wpos.iter().enumerate() {
-                    if (i >> j) & 1 == 1 {
-                        word |= 1usize << pos;
+                let word = if identity {
+                    base_word | i
+                } else {
+                    let mut w = *base_word;
+                    for (j, &pos) in wpos.iter().enumerate() {
+                        if (i >> j) & 1 == 1 {
+                            w |= 1usize << pos;
+                        }
                     }
-                }
-                for (m, (s, pats)) in plane_supp.iter().enumerate() {
-                    if pats.is_empty() {
-                        // The claim's plane part fully fixed.
-                        let plane = supports[members[m]].base_plane(word_bits);
-                        let x = word | (plane << word_bits);
-                        bound_se[x] += mul(*s, e);
-                        continue;
-                    }
+                    w
+                };
+                for (_m, (_s, pats)) in plane_supp.iter().enumerate() {
                     for &(p, pe) in pats {
                         let x = word | (p << word_bits);
                         bound_se[x] += mul(pe, e);
