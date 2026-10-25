@@ -24,6 +24,24 @@ use magnetar_sumcheck::{
     BindOrder, SumcheckSpec, Term,
 };
 
+/// A drop-guard wall-clock phase timer (MAGNETAR_TIME=1 instrumentation).
+struct Pt {
+    label: &'static str,
+    start: std::time::Instant,
+}
+impl Pt {
+    fn new(label: &'static str) -> Self {
+        Pt { label, start: std::time::Instant::now() }
+    }
+}
+impl Drop for Pt {
+    fn drop(&mut self) {
+        if std::env::var("MAGNETAR_TIME").is_ok() {
+            eprintln!("[time] {:<24} {:>9.1} ms", self.label, self.start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+}
+
 /// A BinaryTwist instance.
 #[derive(Clone, Debug)]
 pub struct TwistInstance {
@@ -340,6 +358,7 @@ pub fn prove_twist(
     let mut read_recons = Vec::with_capacity(p);
     let mut read_component_claims = Vec::with_capacity(p);
     for s in 0..p {
+        let _pt = Pt::new("tw-port-read");
         let run = prove_port_linear(
             inst,
             &shared,
@@ -350,6 +369,7 @@ pub fn prove_twist(
             &format!("twist-read-{s}"),
             t,
         );
+        drop(_pt);
         // Component claims (address virtualization) at the run's point.
         let ad = a / d;
         let comps = &wit.ports[s];
@@ -365,6 +385,7 @@ pub fn prove_twist(
         for (i, &v) in comp_claims.iter().enumerate() {
             t.absorb_field(&format!("twist-comp-{s}-{i}"), &[v]);
         }
+        let _pt2 = Pt::new("tw-recon");
         let recon = run_reconstruction(
             &wit.ports[p],
             &wit.inc,
@@ -378,6 +399,7 @@ pub fn prove_twist(
             &format!("twist-recon-{s}"),
             t,
         );
+        drop(_pt2);
         t.absorb_field(
             &format!("twist-recon-claims-{s}"),
             &[recon.wfa_claim, recon.inc_claim],
@@ -387,6 +409,7 @@ pub fn prove_twist(
         read_runs.push(run);
     }
     // Write sum-check (Val + Inc).
+    let _ptw = Pt::new("tw-port-write");
     let write_run = prove_port_linear(
         inst,
         &shared,
@@ -397,6 +420,7 @@ pub fn prove_twist(
         "twist-write",
         t,
     );
+    drop(_ptw);
     let ad = a / d;
     let wcomps = &wit.ports[p];
     let write_component_claims: Vec<Gf128> = wcomps
@@ -429,6 +453,7 @@ pub fn prove_twist(
         &[write_recon.wfa_claim, write_recon.inc_claim],
     );
     // Sum-to-one per (port, component).
+    let _ptst1 = Pt::new("tw-st1");
     let mut st1 = Vec::new();
     let mut st1_claims = Vec::new();
     let mut st1_pcs: Vec<Vec<PcsPoint>> = Vec::new();
@@ -473,12 +498,14 @@ pub fn prove_twist(
         st1_claims.push(claims_per);
         st1_pcs.push(pcs_per);
     }
+    drop(_ptst1);
     for (port, claims) in st1_claims.iter().enumerate() {
         for (i, v) in claims.iter().enumerate() {
             t.absorb_field(&format!("twist-st1-claim-{port}-{i}"), &[*v]);
         }
     }
     // Δ* per (port, component).
+    let _ptoh = Pt::new("tw-onehot");
     let mut onehot = Vec::new();
     let mut onehot_pts = Vec::new();
     for (port, comps) in wit.ports.iter().enumerate() {
@@ -493,6 +520,7 @@ pub fn prove_twist(
         onehot.push(per);
         onehot_pts.push(per_pts);
     }
+    drop(_ptoh);
     // Assemble the PCS claims.
     let mk_comp_pt = |r_joint: &[Gf128], i: usize, ad: usize, a: usize, n: usize| {
         let mut pt = r_joint[i * ad..(i + 1) * ad].to_vec();

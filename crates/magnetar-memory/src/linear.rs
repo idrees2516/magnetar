@@ -181,6 +181,23 @@ pub fn prove_port_linear(
     };
 
     // ---- k-rounds: the one-hot kill + the same-address prefix sums. ----
+    struct Pt {
+        label: &'static str,
+        start: std::time::Instant,
+    }
+    impl Pt {
+        fn new(label: &'static str) -> Self {
+            Pt { label, start: std::time::Instant::now() }
+        }
+    }
+    impl Drop for Pt {
+        fn drop(&mut self) {
+            if std::env::var("MAGNETAR_TIME").is_ok() {
+                eprintln!("[time] {:<24} {:>9.1} ms", self.label, self.start.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+    }
+    let _pt_k = Pt::new("port-k-rounds");
     for bit in 0..a {
         let shift = bit + 1;
         let suff_space = 1usize << (a - shift);
@@ -240,6 +257,7 @@ pub fn prove_port_linear(
         bind_var(&mut m0_v, 0, c);
     }
 
+    drop(_pt_k);
     // ---- the post-k per-cycle state. ----
     let raw = raeq.clone(); // RA-MLE(r_k, j)
     let w: Vec<Gf128> = eq_c
@@ -261,6 +279,7 @@ pub fn prove_port_linear(
     let mut eqv = ONE;
 
     // ---- o-rounds: fold the value dimension. ----
+    let _pt_o = Pt::new("port-o-rounds");
     for b in 0..ell {
         let rem = ell - b; // remaining o variables (incl. the round's)
         let eq_rest = magnetar_field::EqBits::build(&inst.r_val[b + 1..]).values;
@@ -308,7 +327,9 @@ pub fn prove_port_linear(
         par_bind_var(&mut inc_b, 0, d);
     }
 
+    drop(_pt_o);
     // ---- j-rounds: everything is a T-vector. ----
+    let _pt_j = Pt::new("port-j-rounds");
     let eqf = eqv; // = eq(r_val, r_v)
     let m0s = m0k[0]; // M̂0(r_k, r_v)
                       // CUM(j) = M̂0(r_k,r_v) + Σ_{j'<j(≤)} WFAw(j')·Înc(r_v, j').
@@ -359,6 +380,7 @@ pub fn prove_port_linear(
         bind_var(&mut cumt, 0, e);
     }
 
+    drop(_pt_j);
     PortRun {
         rounds,
         r_joint: challenges,
