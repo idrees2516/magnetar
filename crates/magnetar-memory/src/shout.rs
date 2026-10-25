@@ -166,13 +166,18 @@ pub fn prove_shout(
     }
     // r_addr = the captured challenges (Increasing order: variable i).
     let r_addr: Vec<Gf128> = prover.challenges();
-    // Component claims via the product identity.
+    // Component claims via the product identity (sparse per-cycle
+    // address traces — the dense table dots are gone).
+    let comp_addrs: Vec<Vec<usize>> = components
+        .iter()
+        .map(|comp| crate::linear::addr_bits_lenient(std::slice::from_ref(comp)))
+        .collect();
     let component_claims: Vec<Gf128> = components
         .iter()
         .enumerate()
         .map(|(i, comp)| {
             let slice: Vec<Gf128> = (0..ad).map(|b| r_addr[i * ad + b]).collect();
-            comp.eval_at(&slice, &inst.r_cycle)
+            comp.eval_at_sparse(&slice, &inst.r_cycle, &comp_addrs[i])
         })
         .collect();
     for (i, v) in component_claims.iter().enumerate() {
@@ -181,7 +186,7 @@ pub fn prove_shout(
     // Δ* one-hotness per component.
     let mut onehot = Vec::with_capacity(d);
     for (i, comp) in components.iter().enumerate() {
-        let (oh, _) = prove_onehot(comp, t, &format!("shout-onehot-{i}"));
+        let (oh, _) = prove_onehot(comp, &comp_addrs[i], t, &format!("shout-onehot-{i}"));
         onehot.push(oh);
     }
     ShoutProof {
@@ -197,13 +202,14 @@ pub fn prove_shout(
 /// place the two evaluation claims on the component).
 pub fn prove_onehot(
     comp: &AddressComponent,
+    addr: &[usize],
     t: &mut Transcript,
     label: &str,
 ) -> (OneHotProof, Vec<Gf128>) {
     let (r, r_prime, c_product) = sample_refined_points(t, comp.addr_vars);
     let rho = t.challenge_field_vec(&format!("{label}-rho"), comp.cycle_vars);
-    let row_r = comp.row_at(&r);
-    let row_rp = comp.row_at(&r_prime);
+    let row_r = comp.row_at_sparse(&r, addr);
+    let row_rp = comp.row_at_sparse(&r_prime, addr);
     let spec = SumcheckSpec {
         num_vars: comp.cycle_vars,
         dense: vec![row_r, row_rp],

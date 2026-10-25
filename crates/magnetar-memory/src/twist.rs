@@ -253,8 +253,10 @@ fn run_port_sumcheck(
 }
 
 /// Run one reconstruction sum-check at a joint point.
+#[allow(clippy::too_many_arguments)]
 fn run_reconstruction(
     wfa_comps: &[AddressComponent],
+    wfa_comp_addrs: &[Vec<usize>],
     inc: &[Gf128],
     val_claim: Gf128,
     r_joint: &[Gf128],
@@ -277,7 +279,16 @@ fn run_reconstruction(
     let eq_j = magnetar_field::EqBits::build(&r_c).values;
     let lt_col = suffix_sums(&eq_j, inclusive);
     // wfa row at r_k: the one-hot address product — O(T·a), not O(T·K).
-    let w_addr = addr_bits(wfa_comps);
+    // The full per-cycle write address = the OR of the component traces.
+    let w_addr: Vec<usize> = {
+        let mut acc = vec![0usize; 1usize << n];
+        for tr in wfa_comp_addrs {
+            for (j, &a) in tr.iter().enumerate() {
+                acc[j] |= a;
+            }
+        }
+        acc
+    };
     let wfa_row: Vec<Gf128> = (0..(1usize << n))
         .map(|jp| {
             let mut acc = ONE;
@@ -324,7 +335,7 @@ fn run_reconstruction(
         .enumerate()
         .map(|(i, comp)| {
             let slice: Vec<Gf128> = (0..ad).map(|b| r_k[i * ad + b]).collect();
-            comp.eval_at(&slice, &r_c)
+            comp.eval_at_sparse(&slice, &r_c, &wfa_comp_addrs[i])
         })
         .collect();
     for (i, &cv) in wfa_component_claims.iter().enumerate() {
@@ -348,10 +359,22 @@ pub fn prove_twist(
 ) -> (TwistProof, TwistPcsClaims) {
     let (a, ell, n, p) = (inst.a, inst.ell, inst.n, inst.p);
     let d = wit.d();
+    // The per-(port, component) cycle-address traces — computed once,
+    // threaded through the claims, st1, onehot, and reconstruction paths.
+    let port_addrs: Vec<Vec<Vec<usize>>> = wit
+        .ports
+        .iter()
+        .map(|comps| {
+            comps
+                .iter()
+                .map(|c| crate::linear::addr_bits(std::slice::from_ref(c)))
+                .collect()
+        })
+        .collect();
     // The shared linear-prover precomputation (the value-pre-folded
     // increments and initial memory, the write-address trace).
     let w_addr = addr_bits(&wit.ports[p]);
-    let shared = TwistShared::new(inst, w_addr, &wit.inc);
+    let shared = TwistShared::new(inst, w_addr.clone(), &wit.inc);
     // Read sum-checks (the linear-in-T prover: cycle enumeration with
     // the one-hot kill, never the joint materialization).
     let mut read_runs = Vec::with_capacity(p);
@@ -379,7 +402,7 @@ pub fn prove_twist(
             .map(|(i, comp)| {
                 let slice: Vec<Gf128> = (0..ad).map(|b| run.r_joint[i * ad + b]).collect();
                 let r_j: Vec<Gf128> = run.r_joint[a + ell..].to_vec();
-                comp.eval_at(&slice, &r_j)
+                comp.eval_at_sparse(&slice, &r_j, &port_addrs[s][i])
             })
             .collect();
         for (i, &v) in comp_claims.iter().enumerate() {
@@ -388,6 +411,7 @@ pub fn prove_twist(
         let _pt2 = Pt::new("tw-recon");
         let recon = run_reconstruction(
             &wit.ports[p],
+            &port_addrs[p],
             &wit.inc,
             run.val_claim,
             &run.r_joint,
@@ -429,7 +453,7 @@ pub fn prove_twist(
         .map(|(i, comp)| {
             let slice: Vec<Gf128> = (0..ad).map(|b| write_run.r_joint[i * ad + b]).collect();
             let r_j: Vec<Gf128> = write_run.r_joint[a + ell..].to_vec();
-            comp.eval_at(&slice, &r_j)
+            comp.eval_at_sparse(&slice, &r_j, &port_addrs[p][i])
         })
         .collect();
     for (i, &v) in write_component_claims.iter().enumerate() {
@@ -437,6 +461,7 @@ pub fn prove_twist(
     }
     let write_recon = run_reconstruction(
         wcomps,
+        &port_addrs[p],
         &wit.inc,
         write_run.val_claim,
         &write_run.r_joint,
@@ -463,36 +488,21 @@ pub fn prove_twist(
         let mut pcs_per = Vec::new();
         for (i, comp) in comps.iter().enumerate() {
             let rho = t.challenge_field_vec(&format!("twist-st1-{port}-{i}-rho"), n);
-            let eq_rho = magnetar_field::EqBits::build(&rho).values;
-            let kj_vars = ad + n;
-            let mut pubf = vec![ZERO; 1usize << kj_vars];
-            for idx in 0..pubf.len() {
-                let j = idx >> ad;
-                pubf[idx] = eq_rho[j];
-            }
-            let spec = SumcheckSpec {
-                num_vars: kj_vars,
-                dense: vec![comp.table.clone()],
-                public: vec![Box::new(TableFactor::new(pubf))],
-                terms: vec![Term {
-                    coeff: ONE,
-                    dense: vec![0],
-                    public: vec![0],
-                }],
-                claim: ONE,
-            };
-            let mut pr = SumcheckProver::new(&spec, BindOrder::Increasing);
-            let mut rounds = Vec::new();
-            for _ in 0..kj_vars {
-                let msg = pr.message();
-                rounds.push(msg.0.clone());
-                pr.absorb_and_fold(t, &format!("twist-st1-{port}-{i}"));
-            }
-            let st1_pt = pr.challenges();
-            let (cclaims, _) = pr.finish();
+            // The linear sum-to-one prover (the one-hot kill): O(T) per
+            // round over the per-cycle address trace — no 2^{ad+n} table
+            // clone, no dense engine pass. Messages byte-identical to the
+            // generic engine's (cross-validated by tests).
+            let (rounds, st1_pt, claim) = crate::linear::prove_st1_linear(
+                &port_addrs[port][i],
+                ad,
+                &rho,
+                t,
+                &format!("twist-st1-{port}-{i}"),
+            );
             rounds_per.push(rounds);
-            claims_per.push(cclaims[0]);
-            pcs_per.push(PcsPoint::new(st1_pt, cclaims[0]));
+            claims_per.push(claim);
+            pcs_per.push(PcsPoint::new(st1_pt, claim));
+            let _ = comp;
         }
         st1.push(rounds_per);
         st1_claims.push(claims_per);
@@ -512,8 +522,12 @@ pub fn prove_twist(
         let mut per = Vec::new();
         let mut per_pts = Vec::new();
         for (i, comp) in comps.iter().enumerate() {
-            let (oh, cyc_pt) =
-                crate::shout::prove_onehot(comp, t, &format!("twist-onehot-{port}-{i}"));
+            let (oh, cyc_pt) = crate::shout::prove_onehot(
+                comp,
+                &port_addrs[port][i],
+                t,
+                &format!("twist-onehot-{port}-{i}"),
+            );
             per.push(oh);
             per_pts.push(cyc_pt);
         }

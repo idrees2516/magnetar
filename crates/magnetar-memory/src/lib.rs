@@ -105,6 +105,45 @@ impl AddressComponent {
         addr | (cycle << self.addr_vars)
     }
 
+    /// The sparse row evaluation: `Â(r, j)` per cycle from the
+    /// per-cycle address trace — `O(T·addr_vars)` products, not the dense
+    /// `O(2^ad·T)` table dot (the component is one-hot per cycle).
+    pub fn row_at_sparse(&self, r: &[Gf128], addr: &[usize]) -> Vec<Gf128> {
+        debug_assert_eq!(r.len(), self.addr_vars);
+        debug_assert_eq!(addr.len(), 1usize << self.cycle_vars);
+        addr.iter()
+            .map(|&a| {
+                let mut acc = magnetar_field::ONE;
+                for (b, &rb) in r.iter().enumerate() {
+                    acc = magnetar_field::mul(
+                        acc,
+                        magnetar_field::ONE + rb + Gf128(((a >> b) & 1) as u128),
+                    );
+                }
+                acc
+            })
+            .collect()
+    }
+
+    /// The sparse column evaluation: `G(k) = Âi(k, r_cycle)` — a T-scan
+    /// bucketed by the per-cycle address, not the dense table dot.
+    pub fn column_at_sparse(&self, r_cycle: &[Gf128], addr: &[usize]) -> Vec<Gf128> {
+        debug_assert_eq!(r_cycle.len(), self.cycle_vars);
+        let eq = magnetar_field::EqBits::build(r_cycle).values;
+        let mut col = vec![magnetar_field::ZERO; 1usize << self.addr_vars];
+        for (j, &a) in addr.iter().enumerate() {
+            col[a] += eq[j];
+        }
+        col
+    }
+
+    /// The sparse full-point evaluation `Â(r_addr, r_cycle)` from the
+    /// per-cycle address trace — `O(T·addr_vars)`.
+    pub fn eval_at_sparse(&self, r_addr: &[Gf128], r_cycle: &[Gf128], addr: &[usize]) -> Gf128 {
+        let row = self.row_at_sparse(r_addr, addr);
+        magnetar_field::eval_mle(&row, r_cycle)
+    }
+
     /// The row table `R(j) = Â(r, j)` — the component's MLE with the
     /// address coordinates fixed at `r`.
     pub fn row_at(&self, r: &[Gf128]) -> Vec<Gf128> {

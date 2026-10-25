@@ -56,6 +56,30 @@ fn eqb(c: Gf128, bit: bool) -> Gf128 {
     c + Gf128(bit as u128) + ONE
 }
 
+/// The LENIENT per-cycle address trace: cycles with zero or multiple
+/// hot bits (a malformed component — the tamper tests' shape) resolve to
+/// the first hot address or 0, so provers never panic on bad witnesses;
+/// the soundness layers reject the resulting proofs.
+pub fn addr_bits_lenient(comps: &[AddressComponent]) -> Vec<usize> {
+    let ad = comps[0].addr_vars;
+    let n = comps[0].cycle_vars;
+    let cycles = 1usize << n;
+    let mut out = vec![0usize; cycles];
+    for (i, comp) in comps.iter().enumerate() {
+        let av = comp.addr_vars;
+        for j in 0..cycles {
+            let base = j << av;
+            for k in 0..(1usize << av) {
+                if comp.table[base + k] == ONE {
+                    out[j] |= k << (i * ad);
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// A per-cycle address trace: the full address bits of one port,
 /// extracted from the one-hot components (`O(K^{1/d}·T)`).
 pub fn addr_bits(comps: &[AddressComponent]) -> Vec<usize> {
@@ -1107,4 +1131,173 @@ pub fn prove_cross_step_s1_linear(
         bind_var(&mut lhw, 0, e);
     }
     (rounds, challenges, [aw[0], sw[0], ltw[0], lhw[0]])
+}
+
+// ---------------------------------------------------------------------------
+// The linear sum-to-one prover (the twist st1 sum-check, one-hot-kill form).
+// ---------------------------------------------------------------------------
+
+/// The **linear sum-to-one prover**: proves
+/// `Σ_{k,j} eq(ρ, j)·comp(k, j) = 1` over the joint `(k | j)` cube
+/// (address bits low, cycle bits high, bound in increasing order) for a
+/// component that is **one-hot per cycle** (`comp(k, j) = [k == addr(j)]`).
+///
+/// The k-rounds use the one-hot kill: summing over the address cube picks
+/// the addressed cell per cycle, so each round is an O(T) scan — the
+/// unbound address bits collapse to `Σ_b eq(X_b, q_b) = 1` — and the
+/// j-rounds run over T-length vectors. Never a `2^{ad+n}` materialization.
+///
+/// The round messages are byte-identical to the generic dense engine's
+/// (cross-validated by `linear_st1_matches_engine`).
+///
+/// Returns `(rounds, point, component_claim)` where the claim is the
+/// component's MLE at the full point `(r_k, r_j)`.
+pub fn prove_st1_linear(
+    addr: &[usize],
+    ad: usize,
+    rho: &[Gf128],
+    t: &mut Transcript,
+    label: &str,
+) -> (Vec<Vec<Gf128>>, Vec<Gf128>, Gf128) {
+    let n = rho.len();
+    let cycles = addr.len();
+    debug_assert_eq!(cycles, 1usize << n);
+    let mut rounds: Vec<Vec<Gf128>> = Vec::with_capacity(ad + n);
+    let mut challenges: Vec<Gf128> = Vec::with_capacity(ad + n);
+    let mut eqt = magnetar_field::EqBits::build(rho).values; // eq(ρ, ·)
+    let mut w = vec![ONE; cycles]; // Π_{bound k-bits} eq(r_b, q_b(j))
+    let absorb = |t: &mut Transcript, coeffs: &[Gf128]| -> Gf128 {
+        let mut buf = Vec::with_capacity(coeffs.len() * 16);
+        for c in coeffs {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+        }
+        t.absorb_bytes(label, &buf);
+        t.challenge_field(label)
+    };
+    // ---- k-rounds: the one-hot kill. ----
+    // The summand is eq(ρ,j)·comp(k,j): at a k-round the public factor is
+    // constant (its pair coefficient is zero), so the engine's message is
+    // [S0, S0+S1, 0] with S_b = Σ_{q_bit=b} eq·w — degree-2 vector shape,
+    // byte-identical to the generic engine's.
+    for bit in 0..ad {
+        let mut s0 = ZERO;
+        let mut s1 = ZERO;
+        for u in 0..cycles {
+            let v = mul(eqt[u], w[u]);
+            if (addr[u] >> bit) & 1 == 0 {
+                s0 += v;
+            } else {
+                s1 += v;
+            }
+        }
+        let coeffs = [s0, s0 + s1, ZERO];
+        if rounds.is_empty() {
+            debug_assert_eq!(coeffs[1] + coeffs[2], ONE, "st1 round 0 must sum to the claim");
+        }
+        let c = absorb(t, &coeffs);
+        rounds.push(coeffs.to_vec());
+        challenges.push(c);
+        // Fold the per-cycle address product at the round challenge.
+        for u in 0..cycles {
+            w[u] = mul(w[u], eqb(c, (addr[u] >> bit) & 1 == 1));
+        }
+    }
+    // ---- j-rounds: two T-vectors (eq(ρ,·) and the comp row at r_k). ----
+    // Pair coefficient convention (a, a+t1): c0 = e0·w0, c1 = e0·ws +
+    // es·w0, c2 = es·ws with es = e0+e1, ws = w0+w1.
+    for _ in 0..n {
+        let half = eqt.len() / 2;
+        let mut coeffs = [ZERO; 3];
+        for i in 0..half {
+            let e0 = eqt[i << 1];
+            let es = e0 + eqt[(i << 1) | 1];
+            let w0 = w[i << 1];
+            let ws = w0 + w[(i << 1) | 1];
+            coeffs[0] += mul(e0, w0);
+            coeffs[1] += mul(e0, ws) + mul(es, w0);
+            coeffs[2] += mul(es, ws);
+        }
+        let c = absorb(t, &coeffs);
+        rounds.push(coeffs.to_vec());
+        challenges.push(c);
+        bind_var(&mut eqt, 0, c);
+        bind_var(&mut w, 0, c);
+    }
+    (rounds, challenges, w[0])
+}
+
+#[cfg(test)]
+mod st1_tests {
+    use super::*;
+    use magnetar_sumcheck::{BindOrder, SumcheckProver, SumcheckSpec, Term};
+
+    /// The linear st1 prover emits **byte-identical** round messages and
+    /// challenges to the generic dense engine's for the same statement,
+    /// with the same terminal component claim — the cross-validation that
+    /// gates its use in the protocol.
+    #[test]
+    fn linear_st1_matches_engine() {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        for &(ad, n) in &[(3usize, 4usize), (6, 5), (8, 4)] {
+            let cycles = 1usize << n;
+            // A random one-hot component (exactly one set bit per cycle).
+            let mut b = vec![false; (1usize << ad) * cycles];
+            for j in 0..cycles {
+                b[rng.random_range(0..(1usize << ad)) + j * (1usize << ad)] = true;
+            }
+            let comp = crate::AddressComponent::from_bits(ad, n, &b);
+            let addr = addr_bits(std::slice::from_ref(&comp));
+            // Two identically-seeded transcripts: rho sampled the same way.
+            let rho = {
+                let mut t = magnetar_hash::Transcript::new("st1", &[b"test"]);
+                t.challenge_field_vec("rho", n)
+            };
+            // ---- the generic dense engine (the old path). ----
+            let (e_rounds, e_pt, e_claim) = {
+                let eq_rho = magnetar_field::EqBits::build(&rho).values;
+                let kj_vars = ad + n;
+                let mut pubf = vec![ZERO; 1usize << kj_vars];
+                for idx in 0..pubf.len() {
+                    let j = idx >> ad;
+                    pubf[idx] = eq_rho[j];
+                }
+                let spec = SumcheckSpec {
+                    num_vars: kj_vars,
+                    dense: vec![comp.table.clone()],
+                    public: vec![Box::new(
+                        magnetar_sumcheck::TableFactor::new(pubf),
+                    )],
+                    terms: vec![Term {
+                        coeff: ONE,
+                        dense: vec![0],
+                        public: vec![0],
+                    }],
+                    claim: ONE,
+                };
+                let mut pr = SumcheckProver::new(&spec, BindOrder::Increasing);
+                let mut rounds = Vec::new();
+                let mut t = magnetar_hash::Transcript::new("st1", &[b"test"]);
+                t.challenge_field_vec("rho", n); // consume rho identically
+                for _ in 0..kj_vars {
+                    let msg = pr.message();
+                    rounds.push(msg.0.clone());
+                    pr.absorb_and_fold(&mut t, "st1");
+                }
+                let pt = pr.challenges();
+                let (claims, _) = pr.finish();
+                (rounds, pt, claims[0])
+            };
+            // ---- the linear prover. ----
+            let mut t = magnetar_hash::Transcript::new("st1", &[b"test"]);
+            t.challenge_field_vec("rho", n);
+            let (rounds, pt, claim) = prove_st1_linear(&addr, ad, &rho, &mut t, "st1");
+            assert_eq!(rounds.len(), e_rounds.len(), "round count (ad={ad}, n={n})");
+            for (r, e) in rounds.iter().zip(e_rounds.iter()) {
+                assert_eq!(r, e, "round message (ad={ad}, n={n})");
+            }
+            assert_eq!(pt, e_pt, "challenge point (ad={ad}, n={n})");
+            assert_eq!(claim, e_claim, "component claim (ad={ad}, n={n})");
+        }
+    }
 }

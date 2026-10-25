@@ -368,11 +368,15 @@ pub fn prove_bus_shout(
     let weights = pc_weights(&spec.pc_r_local, a);
     let (_, pc_psi) = prove_psi_claim(components, &spec.r_cycle, &weights, "bus-pc-psi", t);
     let psi_claims = pc_psi.component_claims.clone();
-    // Δ\* per component.
+    // Δ\* per component (sparse per-cycle address traces).
+    let comp_addrs: Vec<Vec<usize>> = components
+        .iter()
+        .map(|comp| crate::linear::addr_bits_lenient(std::slice::from_ref(comp)))
+        .collect();
     let mut onehot = Vec::with_capacity(d);
     let mut onehot_claims = Vec::with_capacity(d);
     for (i, comp) in components.iter().enumerate() {
-        let (oh, cyc_pt) = prove_onehot(comp, t, &format!("bus-onehot-{i}"));
+        let (oh, cyc_pt) = prove_onehot(comp, &comp_addrs[i], t, &format!("bus-onehot-{i}"));
         let mut pt_r = oh.r.clone();
         pt_r.extend_from_slice(&cyc_pt);
         let mut pt_rp = oh.r_prime.clone();
