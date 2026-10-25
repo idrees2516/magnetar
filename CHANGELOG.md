@@ -548,3 +548,39 @@ interpreter, the dual SIMD R1CS circuit, and MosaicPCS.
   the streaming Twist, parallelism), the verifier-guest/wrap recursion,
   zero-knowledge, QROM, ISA completeness (LB/LH sign extension, the
   workload suite), and the production-engineering backlog.
+
+## 0.9.0 — the commitment-free ring switch release
+
+- **The Diamond–Posen (ePrint 2024/504) ring switch**: the c-chain
+  redundancy eliminated. The prover sends the 128 per-plane partial
+  evaluations, the verifier checks the recombination and samples the row
+  batch, and the claim discharges through ONE sum-check with the packed
+  table itself as the dense factor and the transparent tensor-algebra
+  factor A — whose correct multilinear extension is the DP24 tensor
+  recursion (the *formula* φ_rb(eq(z,·)) agrees on the Boolean cube but
+  is not multilinear off it; cross-checked against the materialized
+  table's MLE). The main codeword's own fold chain carries the terminal:
+  no second encode, no level-0 C-tree, no c-table, no anchors (~60–90
+  KiB off every proof; the ring phase 1.1 s → ~0.39 s at 2^16).
+- **One-shot Merkle hashing**: every leaf/node digest is a single
+  BLAKE3 update over a pre-serialized buffer with per-tree/per-level
+  prefixes (bit-identity locked by a differential test) — ~2–3× on every
+  tree in the system.
+- **The join prover**: the o-round suffix tables (the per-pair-per-round
+  suffix product → one table per round) and the h-round packed-bit
+  selects (the X columns pack into u64 words once; the contraction is a
+  popcount-driven select) — the store router halved. A store-shape
+  regression (two-word columns + the a-rounds) is pinned in
+  join_seeded_regress.
+- **The per-segment glue**: whole-word witness reads (wword), the
+  store-X claims evaluated directly from the packed words via the
+  tabulated φ, the x/selector tables moved into the join witnesses.
+- **PhiTab**: the tabulated φ_c (32 nibble lookups vs the 128-iteration
+  branch loop) — ~100× on the ring's A-factor materialization.
+- Gate repairs for the current toolchain (the cs-s1 honest-data assert
+  that fired on the adversarial sub-proofs, the 1.99 clippy lints).
+- Measured on the 4-vCPU EPYC host: 2^16 erc20-mixed-block at
+  12,4–13,3k cycles/s = 1,034–1,109 tx/s per machine (was 936), the
+  root 2.34 s → 1.60 s; pooled ~3,788 tx/s across the 5 free-tier
+  instances (the workers are slower hosts with ~35–40% cross-VM
+  contention).

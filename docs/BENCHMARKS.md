@@ -22,9 +22,11 @@ cargo run --release -p magnetar-cli --bin magnetar -- profiles     # dual-rate t
 
 ## End-to-end results (this implementation)
 
-Current numbers (the production-throughput release: the packed witness,
-the mask-major bin outer, the group-fold discharge, the linear st1,
-the FastChunk rate, the parallel hierarchical root):
+Current numbers (the commitment-free ring switch release: the DP24
+partial-evaluations reduction, the one-shot Merkle hashing, the join
+prover's suffix tables + bit selects, the tabulated phi_c, the packed
+witness, the mask-major bin outer, the group-fold discharge, the linear
+st1, the FastChunk rate, the parallel hierarchical root):
 
 | workload | T | prove (ms) | verify (ms) | cycles/s | proof (KiB) |
 |---|---|---|---|---|---|
@@ -38,6 +40,24 @@ the FastChunk rate, the parallel hierarchical root):
 
 Peak RSS at 2^12 monolithic: **165 MiB** (was 619 MiB two releases ago);
 at 2^16 streaming: 1.4 GiB.
+
+## The commitment-free ring switch release (measured on the InstaBox
+## 4-vCPU EPYC host; ±5% host-contention noise between runs)
+
+| T | prove (ms) | root (ms) | cycles/s | tx/s | vs. session start |
+|---|---|---|---|---|---|
+| 2^13 | ~460 | — | ~14,2xx | ~1,18x | +18% |
+| 2^16 | 4,924–5,280 | 1,603–1,641 | 12,414–13,310 | **1,034–1,109** | **+11–19%** |
+
+The root phase fell 2.34 s → 1.60 s: the ring switch alone 1.1 s →
+~0.39 s (the DP24 reduction: no second encode, no level-0 C-tree, no
+anchors — plus the one-shot leaf/node hashing and the tabulated `phi_c`,
+which was the single biggest cost inside the new ring at ~400 ms). The
+segment phase fell ~10%: the join prover's o-round suffix tables (≈17
+muls → 2 per pair per round) and the h-round packed-bit selects, plus
+the per-segment glue elimination (whole-word witness reads, the store-X
+claims evaluated directly from the packed words, no table clones).
+Proofs shrank by ~60–90 KiB (the anchors).
 
 ## The ERC-20 mixed-block load test (the paper's Table-6 workload shape)
 
@@ -55,26 +75,40 @@ transfer at the 64-bit balance width of this RV64I reference CPU:
 | 2^16 | 64 | 5,461 | 6,300 | 10,402 | 867 | 1.37 GiB |
 
 **The pooled proving-pool run** (5 × 4-vCPU instances proving
-independent 2^16 batches concurrently): ≈3,880 tx/s aggregate (the
-per-machine rate drops ~12% under cross-VM contention). The production
-50k-tx/s target therefore needs ~13× more per-core efficiency; the
+independent 2^16 batches concurrently): ≈3,788 tx/s aggregate in this
+release's run — the free tier's workers landed on slower hosts than the
+development instance (~700 vs ~1,050 tx/s standalone), and the cross-VM
+contention eats ~35–40% today. The honest per-machine rate is the lever
+the optimizations move (936 → 1,034–1,109 tx/s this release). The
 measured remaining levers, in order of impact:
 
-1. **The ring switch's FRI chain** (~35% of the streaming root): the
-   per-level Merkle trees are Ligerito-inherent, but the c-chain still
-   materializes the derived c-table + a second encode; the paper's
-   commitment-free ring switch reduces to the packed-PCS claim and
-   reuses the main codeword's argument (est. −0.3–0.5 s/root).
-2. **The per-segment transcript/claims glue** (~20–30% of each
-   segment): hundreds of small Fiat–Shamir absorbs per proof; batching
-   the absorbs and the claim serializations (est. −15–20% per segment).
-3. **The twists' o-rounds** (the inc-table folds + the eq-sum passes):
-   the packed-inc refactor (u64 words per cycle instead of the
-   `2^{6+n}` bit table) mirrors the witness packing (est. −5–8%).
-4. **The paper's per-instance amortization**: the circuit still pads
-   the rows to 512/cycle against the paper's several-cycles-per-
-   instance operating point — the single largest structural constant
-   left (4–8× at the paper's density).
+1. ~~The ring switch's FRI chain~~ **DONE** — the DP24 commitment-free
+   reduction (partials + the row batch + one sum-check with the packed
+   table as the dense factor + the main codeword's own chain): the
+   second encode, the level-0 C-tree, the c-table, the ring sum-check
+   over it, and the anchors are all gone; the residual ~0.39 s is the
+   Ligerito-inherent per-level tree hashing + the partials pass.
+2. **The hier body's local stages** (~0.85 s of the root): the
+   window's fast-forward (`ld-finish-window`) + the `bound_se`
+   group-fold + the word fold — ~52 ms of thread time per segment
+   instance. The chunked-axpy `bound_se` rewrite was attempted once and
+   REVERTED (it broke small-scale verification); the group-fold shape
+   needs a different decomposition.
+3. **The Virtual-Spartan outer rounds** (~0.33 s wall) and **the
+   twists** (~0.50 s wall): the twists' o-rounds still fold the `2^{ell}`
+   inc bit tables generically (the packed-inc/select-fold lever — the
+   same packed-word select the join's h-rounds now use); the outer
+   rounds' mask window is already the fast path.
+4. **The paper's per-instance amortization** — the largest structural
+   lever left (4–8×): the paper runs **several consecutive cycles per
+   SIMD instance** ("each SIMD instance covers a fixed number of
+   consecutive cycles, and cross-step constraints tie adjacent
+   instances together") while this implementation pays one instance
+   per cycle: the cross-step rows, the boundary binding, and the
+   per-instance row padding all divide by the cycles-per-instance count.
+   The restructure touches the witness layout (`W`'s columns become
+   per-instance column blocks), the two relations' row indexing, the
+   twists' cycle dimension, and the cross-step's next-MLE argument.
 
 Every row proves **and verifies** end-to-end (the assert is in the
 harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,
