@@ -478,17 +478,21 @@ pub(crate) fn prove_hier_body(
         "ZK masking of the hierarchical discharge requires a single instance"
     );
     let inst = instance_items(per, segments, claims, alphas);
-    // The per-instance discharges (the pass runs inside `new`).
+    // The per-instance discharges (the pass runs inside `new`) —
+    // rayon-parallel across the instances (the construction pass is
+    // pure per-instance work: suffix eq tables + packed reads).
     let mut dis: Vec<LocalDischarge> = inst
-        .iter()
+        .par_iter()
         .enumerate()
         .map(|(s, (claim, items))| LocalDischarge::new(per, packed, s << n, items, *claim))
         .collect();
     let mut masker = magnetar_sumcheck::zk::ZkMasker::new();
     let mut local_rounds: Vec<Vec<Vec<Gf128>>> = vec![Vec::with_capacity(ell_s); segments];
     // ---- The lockstep local rounds. ----
+    // The per-instance messages compute rayon-parallel (order-preserving
+    // collect; every instance absorbs the SAME shared challenge after).
     for _j in 0..ell_s {
-        let msgs: Vec<RoundMsg> = dis.iter().map(|d| d.message()).collect();
+        let msgs: Vec<RoundMsg> = dis.par_iter().map(|d| d.message()).collect();
         let mut transmitted: Vec<Vec<Gf128>> = Vec::with_capacity(segments);
         if zk {
             for m in &msgs {
@@ -515,9 +519,9 @@ pub(crate) fn prove_hier_body(
         if zk {
             masker.commit(r);
         }
-        for (d, m) in dis.iter_mut().zip(msgs.iter()) {
-            d.bind_msg(m, r);
-        }
+        dis.par_iter_mut()
+            .zip(msgs.par_iter())
+            .for_each(|(d, m)| d.bind_msg(m, r));
     }
     let mut terminals = Vec::with_capacity(segments);
     let mut r_local = Vec::new();
