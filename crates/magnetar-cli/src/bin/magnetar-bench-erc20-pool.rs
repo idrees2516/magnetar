@@ -53,11 +53,11 @@ fn enc_b(imm: i32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
 }
 
 fn enc_sub(a: u32, b: u32, d: u32) -> u32 {
-    (0x20 << 25) | (a << 20) | (b << 15) | (0 << 12) | (d << 7) | 0x33
+    (0x20 << 25) | (a << 20) | (b << 15) | (d << 7) | 0x33
 }
 
 fn enc_add(a: u32, b: u32, d: u32) -> u32 {
-    (0x00 << 25) | (a << 20) | (b << 15) | (0 << 12) | (d << 7) | 0x33
+    (a << 20) | (b << 15) | (d << 7) | 0x33
 }
 
 /// The paper's `erc20-mixed-block` guest — the exact program the
