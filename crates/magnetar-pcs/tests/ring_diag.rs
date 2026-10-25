@@ -191,3 +191,18 @@ fn ring_eval_at_identity() {
     }
     println!("eval_at identity OK (on and off the cube)");
 }
+
+/// The PhiTab fast path must be bit-identical to the per-bit phi_c.
+#[test]
+fn phi_tab_matches_phi_c() {
+    let mut rng = rand::rng();
+    use rand::RngExt;
+    for _ in 0..64 {
+        let rb: [Gf128; 128] = std::array::from_fn(|_| Gf128(rng.random::<u128>()));
+        let tab = magnetar_field::PhiTab::build(&rb);
+        for _ in 0..64 {
+            let p = Gf128(rng.random::<u128>());
+            assert_eq!(tab.apply(p), phi_c(p, &rb));
+        }
+    }
+}

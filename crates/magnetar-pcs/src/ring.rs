@@ -44,7 +44,7 @@
 //! FRI-style proximity analysis of the main PCS (crate docs).
 
 use crate::eval::{level_domain, LevelOpen, PathQuery, PcsParams, PcsStatement};
-use magnetar_field::{eq_coefficients, mul, phi_c, EqBits, Gf128, ONE, ZERO};
+use magnetar_field::{eq_coefficients, mul, EqBits, Gf128, PhiTab, ONE, ZERO};
 use magnetar_hash::{MerkleTree, Transcript, DIGEST};
 use magnetar_sumcheck::{
     engine::{SumcheckProver, SumcheckVerifier},
@@ -132,8 +132,8 @@ impl magnetar_sumcheck::public::PublicFactor for RingEqInd {
 
     fn materialize(&self) -> Vec<Gf128> {
         let eq = EqBits::build(&self.z).values;
-        let rb = &self.rb;
-        eq.par_iter().map(|&e| phi_c(e, rb)).collect()
+        let tab = PhiTab::build(&self.rb);
+        eq.par_iter().map(|&e| tab.apply(e)).collect()
     }
 
     fn eval_at(&self, point: &[Gf128]) -> Gf128 {
