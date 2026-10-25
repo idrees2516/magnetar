@@ -412,6 +412,30 @@ impl WitnessData {
         Gf128((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1)
     }
 
+    /// The 64-bit witness word at a 64-aligned column `col` of cycle `u` —
+    /// one packed-word load instead of 64 per-bit extractions (the
+    /// witness segments are 64-bit words, so the segment offsets are
+    /// 64-aligned by construction).
+    #[inline]
+    pub fn wword(&self, u: usize, col: usize) -> u64 {
+        debug_assert_eq!(col % 64, 0);
+        let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
+        let w = self.w_packed[u * w128 + (col >> 7)];
+        if col & 64 == 0 {
+            w as u64
+        } else {
+            (w >> 64) as u64
+        }
+    }
+
+    /// The per-64-bit-word row `(col, col+64)` of cycle `u` as one u128
+    /// (low half = the word at `col`, high = the word at `col + 64`).
+    #[inline]
+    pub fn wword2(&self, u: usize, col: usize) -> u128 {
+        debug_assert_eq!(col % 64, 0);
+        self.wword(u, col) as u128 | ((self.wword(u, col + 64) as u128) << 64)
+    }
+
     pub fn w_packed(&self) -> &[u128] {
         &self.w_packed
     }
@@ -778,8 +802,11 @@ pub fn prove_inner(
     let x_shift: Vec<Gf128> = {
         let mut x = vec![ZERO; (1usize << 6) * q];
         for (u, _) in trace.records.iter().enumerate() {
-            for b in 0..64usize {
-                x[b | (u << 6)] = wd.wbit(u, shift_src_off + b);
+            let mut bits = wd.wword(u, shift_src_off);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                x[b | (u << 6)] = ONE;
+                bits &= bits - 1;
             }
         }
         x
@@ -797,15 +824,15 @@ pub fn prove_inner(
     // The shift router runs the join-enumeration prover (linear in T):
     // the per-column X and selector tables, never a joint materialization.
     let shift_wit = JoinWitness {
-        x: x_shift.clone(),
+        x: x_shift,
         selectors: vec![
             SelCol {
-                table: sel_lo.clone(),
+                table: sel_lo,
                 h_off: 0,
                 h_vars: pk.amount_bits,
             },
             SelCol {
-                table: sel_hi.clone(),
+                table: sel_hi,
                 h_off: pk.amount_bits,
                 h_vars: 2,
             },
@@ -850,9 +877,15 @@ pub fn prove_inner(
     let x_store: Vec<Gf128> = {
         let mut x = vec![ZERO; (1usize << u_vs) * q];
         for (u, _) in trace.records.iter().enumerate() {
-            for b in 0..64usize {
-                x[b | (u << u_vs)] = wd.wbit(u, old_off + b);
-                x[(b + 64) | (u << u_vs)] = wd.wbit(u, src_off + b);
+            let old_bits = wd.wword(u, old_off);
+            let src_bits = wd.wword(u, src_off);
+            for (half, bits) in [(0usize, old_bits), (64, src_bits)] {
+                let mut b = bits;
+                while b != 0 {
+                    let bit = b.trailing_zeros() as usize;
+                    x[(bit + half) | (u << u_vs)] = ONE;
+                    b &= b - 1;
+                }
             }
         }
         x
@@ -872,9 +905,9 @@ pub fn prove_inner(
     let _ = off_off;
     // The store router runs the join-enumeration prover as well.
     let store_wit = JoinWitness {
-        x: x_store.clone(),
+        x: x_store,
         selectors: vec![SelCol {
-            table: sel_st.clone(),
+            table: sel_st,
             h_off: 0,
             h_vars: h_vs,
         }],
@@ -899,32 +932,36 @@ pub fn prove_inner(
         t,
     );
     drop(_pt);
-    // The store X split claims (the two segment MLEs at the router's
-    // terminal point).
+    // The store X split claims: the two 64-bit segment MLEs at the
+    // router's terminal point, evaluated DIRECTLY from the packed
+    // witness words — the word at cycle u contributes
+    // eq(p_j, u) · φ_{eq(p_bits,·)}(word), one popcount-weighted select
+    // per cycle (the old path rebuilt both 64·q bit tables).
     let store_x_claims: [Gf128; 2] = {
         let [p_old_pt, p_src_pt] = terminal_store_src_points(&store_layout, &store_router.terminal);
-        let old_mle = {
-            let mut x = vec![ZERO; (1usize << 6) * q];
-            for (u, _) in trace.records.iter().enumerate() {
-                for b in 0..64usize {
-                    x[b | (u << 6)] = wd.wbit(u, old_off + b);
+        let eval_word_mle = |off: usize, pt: &[Gf128]| -> Gf128 {
+            let (p_bits, p_j) = pt.split_at(6);
+            let eq_b = magnetar_field::EqBits::build(p_bits).values;
+            let eq_j = magnetar_field::EqBits::build(p_j).values;
+            let mut acc = ZERO;
+            for u in 0..q {
+                if eq_j[u] == ZERO {
+                    continue;
                 }
-            }
-            x
-        };
-        let src_mle = {
-            let mut x = vec![ZERO; (1usize << 6) * q];
-            for (u, _) in trace.records.iter().enumerate() {
-                for b in 0..64usize {
-                    x[b | (u << 6)] = wd.wbit(u, src_off + b);
+                let word = wd.wword(u, off);
+                // φ over the set bits only (the cleared bits multiply 0).
+                let mut inner = ZERO;
+                let mut bits = word;
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    inner += eq_b[b];
+                    bits &= bits - 1;
                 }
+                acc += mul(eq_j[u], inner);
             }
-            x
+            acc
         };
-        [
-            magnetar_field::eval_mle(&old_mle, &p_old_pt),
-            magnetar_field::eval_mle(&src_mle, &p_src_pt),
-        ]
+        [eval_word_mle(old_off, &p_old_pt), eval_word_mle(src_off, &p_src_pt)]
     };
     t.absorb_field("store-x", &store_x_claims);
     // ---- 6. BinaryShout for the bytecode.
