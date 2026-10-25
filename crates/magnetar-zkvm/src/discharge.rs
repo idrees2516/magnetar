@@ -212,13 +212,22 @@ impl<'a> LocalDischarge<'a> {
         // `bound_se` build by the support ratio (measured 12–30× at the
         // streaming scales) and shrinks the per-item tables from
         // `2^{ell-v}` to `2^{free_c}` field elements.
+        let _pt_sup = crate::protocol::PhaseTimer::new("ld-supports");
         let supports: Vec<Support> = items
             .iter()
             .map(|(_, pt)| Support::build(&pt[..ell - v]))
             .collect();
+        drop(_pt_sup);
+        if std::env::var("MAGNETAR_TIME").is_ok() {
+            let total_support: usize = supports.iter().map(|s| s.len()).sum();
+            eprintln!(
+                "[time] ld-shape: ell={ell} stride={stride} items={n_items} support_sum={total_support}"
+            );
+        }
         // The single pass: PER ITEM, walk only its support suffixes —
         // G's window monomial mask from the packed word at each support
         // suffix, then the eq-weighted pack into the item's accumulators.
+        let _pt_pass = crate::protocol::PhaseTimer::new("ld-pass");
         let q: Vec<Vec<Gf128>> = supports
             .par_iter()
             .map(|sup| {
@@ -246,6 +255,7 @@ impl<'a> LocalDischarge<'a> {
                 local
             })
             .collect();
+        drop(_pt_pass);
         debug_assert_eq!(q.len(), n_items);
         LocalDischarge {
             ell,
@@ -361,6 +371,7 @@ impl<'a> LocalDischarge<'a> {
     /// table as the `α·C`-weighted sum of the suffix tables, and hand the
     /// remaining `ell − v` rounds to the generic engine.
     fn finish_window(&mut self) {
+        let _pt_fw = crate::protocol::PhaseTimer::new("ld-finish-window");
         let plane_lo_bits = 7 - self.v;
         let stride = self.stride;
         let v = self.v;
@@ -412,6 +423,8 @@ impl<'a> LocalDischarge<'a> {
                 bound_se[x] += mul(w, t);
             });
         }
+        drop(_pt_fw);
+        let _pt_tail = crate::protocol::PhaseTimer::new("ld-tail-rounds");
         let claim = self.running;
         let spec = SumcheckSpec {
             num_vars: ell - v,
