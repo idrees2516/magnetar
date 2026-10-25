@@ -34,7 +34,7 @@ mod multilinear;
 mod pack;
 pub mod parallel;
 
-pub use eq::{eq_char2, eq_table, EqBits};
+pub use eq::{eq_build_fused, eq_build_fused_into, eq_char2, eq_table, EqBits};
 pub use gf128::{inv, is_bit, mul, mul_bit, pow, square, Gf128, ONE, ZERO};
 pub use multilinear::{bind_var, eval_mle, fold_pairs, Multilinear};
 pub use pack::{
