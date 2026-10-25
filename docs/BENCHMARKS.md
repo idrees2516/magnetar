@@ -98,7 +98,9 @@ batches (8,388,608 cycles = 699,050 transfers) split 205/205/205/205/204
 across the five machines, every batch proved AND verified — **210 s
 wall, ≈3,330 tx/s sustained aggregate** (665–798 tx/s per machine
 under sustained cross-VM contention; the burst pool runs 6,005). The
-remaining measured levers, in order of impact:
+**2^24 pooled demonstration, measured**: 2,048 batches (16,777,216
+cycles = 1,398,100 transfers, 410×4 + 408) — **400 s wall, ≈3,495
+tx/s sustained**. The remaining measured levers, in order of impact:
 
 1. **The discharge's `fw-bound-se` group-fold** (~19 ms per segment,
    ~30% of the root's local stages): the eq(r)-weighted fold of the
@@ -149,9 +151,10 @@ single-machine unlock, in order:
    parallelizes across the pool for the aggregate scales.
 
 Until then: **the pool is the 2^23/2^24 shape** — the total proven
-workload scales linearly in machines (the 2^23 demonstration above),
-and the per-machine envelope stays bounded at the 2^13–2^18 batch
-sizes.
+workload scales linearly in machines (the 2^23 demonstration at 699k
+transfers in 3.5 min and the 2^24 at 1.40 M transfers in 6.7 min, every
+batch independently verified), and the per-machine envelope stays
+bounded at the 2^13–2^18 batch sizes.
 
 Every row proves **and verifies** end-to-end (the assert is in the
 harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,

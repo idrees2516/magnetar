@@ -47,8 +47,16 @@ aggregate tx/s): cpi 1 **5,139** / cpi 4 4,585 / cpi 8 4,942 — the
 levers removed the per-instance amortization edge, and the lightest
 per-segment constants degrade least under cross-VM contention:
 `DEFAULT_CPI` returns to **1** with the measurement recorded in
-`WITNESS_LAYOUT`. Gate: 169 tests (debug + release), clippy clean,
-fmt clean.
+`WITNESS_LAYOUT`. The batch-shape × pool sweep: **2^13 batches pool
+best — 6,005 tx/s burst** (0.8.0's pool: 3,788). The large-scale pooled
+demonstrations (`magnetar-bench-erc20-pool`): **2^23** — 1,024 × 2^13
+batches = 699,050 transfers, every batch proved AND verified, 210 s
+(≈3,330 tx/s sustained); **2^24** — 2,048 batches = 1,398,100
+transfers, 400 s (≈3,495 tx/s). The single-machine envelope extended
+to 2^18 (the segments phase bounded at 261 MiB; the root's lockstep
+discharge + combined commitment measured as the 2^19+ gate, with the
+unlock path documented). Gate: 169 tests (debug + release), clippy
+clean, fmt clean.
 
 ## 0.9.1 — the instance-batching release (the paper's §5.1 operating point)
 
