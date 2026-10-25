@@ -111,13 +111,16 @@ workflow and the `gpu_parity` acceptance test on CUDA hardware.
 
 ```sh
 cargo build --release
-cargo test --workspace      # 125 tests: field, hash, sum-check (dense +
-                             # sparse), PCS + ring switching, Virtual Spartan,
-                             # Twist, Shout, the discharge helpers, Router
-                             # (routing + join enumeration), CPU, tree-IVC
-                             # (recursive + streaming), the bitsliced
-                             # sum-check core + tower↔K interop, end-to-end +
-                             # tamper classes
+cargo test --workspace --release
+                             # 152 tests: field, hash, sum-check (dense +
+                             # sparse + the round window), PCS + ring
+                             # switching, Virtual Spartan, Twist, Shout,
+                             # the discharge helpers, Router (routing +
+                             # join enumeration), CPU, the hierarchical
+                             # Mosaic discharge, tree-IVC (recursive +
+                             # streaming), the bitsliced sum-check core +
+                             # tower↔K interop, end-to-end + tamper classes
+                             # (including the ERC-20 mixed-block workload)
 cargo run --release --bin magnetar -- fib 5
 
 # GPU proving program, Phase 1 (CUDA 13.x toolkit + sm_80+ required):
@@ -154,8 +157,11 @@ Scope notes (paper-faithful): the cross-step micro-PC constraints are
 omitted exactly as the paper's Remark 4 omits them; the decode-vs-flag
 correlation and the register-shift stage-select are documented engineering
 extensions. Trace lengths in tests are 2^3–2^5 cycles (CI-scale); the
-paper's production envelope is 2^22 cycles at ~6.5–7.7M cycles/s with
-~600 KiB proofs and 10–12 ms verification.
+benchmarks run the streaming ladder through 2^16 cycles (1,707 cycles/s
+at 2^16 on a 2-core container, bounded memory) plus the paper's
+erc20-mixed-block load test; the paper's production envelope is 2^22
+cycles at ~6.5–7.7M cycles/s on 12 M4 cores with ~600 KiB proofs and
+10–12 ms verification.
 
 ```sh
 $ cargo run --release --bin magnetar -- fib 2

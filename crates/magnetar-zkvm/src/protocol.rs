@@ -2046,6 +2046,17 @@ mod tests {
             | ((imm & 0x1f) << 7)
             | op
     }
+    fn enc_b(imm: i32, rs2: u32, rs1: u32, funct3: u32) -> u32 {
+        let imm = imm as u32;
+        (((imm >> 12) & 1) << 31)
+            | (((imm >> 5) & 0x3f) << 25)
+            | (rs2 << 20)
+            | (rs1 << 15)
+            | (funct3 << 12)
+            | (((imm >> 1) & 0xf) << 8)
+            | (((imm >> 11) & 1) << 7)
+            | 0x63
+    }
 
     #[test]
     fn end_to_end_fibonacci() {
@@ -2103,7 +2114,7 @@ mod tests {
         assert!(verify(&vk, &pub_in, &p).is_err());
         // A tampered masked round breaks the round check.
         let mut p = proof.clone();
-        p.mosaic.batch_rounds[0][1] += magnetar_field::ONE;
+        p.mosaic.local_rounds[0][0][1] += magnetar_field::ONE;
         assert!(verify(&vk, &pub_in, &p).is_err());
     }
 
@@ -2212,6 +2223,65 @@ mod tests {
         assert!(
             verify(&vk, &pub_in, &proof).is_ok(),
             "honest load/store proof must verify"
+        );
+    }
+
+    #[test]
+    fn end_to_end_erc20_mixed_block() {
+        // The paper's Table-6 workload shape: balance transfers between
+        // two accounts, every 16th failing the underflow check. Input:
+        // ram[0] = 1_000_000 (from), ram[1] = 0 (to). 20 transfers, 1
+        // skipped (i = 16), each moving 7: from = 1_000_000 − 7·19.
+        let sub = |rs2: u32, rs1: u32, rd: u32| {
+            (0x20u32 << 25) | (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0x33
+        };
+        let add = |rs2: u32, rs1: u32, rd: u32| (rs2 << 20) | (rs1 << 15) | (rd << 7) | 0x33;
+        let sd = |imm: u32, rs2: u32, rs1: u32| {
+            (((imm >> 5) & 0x7f) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (3 << 12)
+                | ((imm & 0x1f) << 7)
+                | 0x23
+        };
+        let ld = |imm: u32, rd: u32| (imm << 20) | (3 << 12) | (rd << 7) | 0x03;
+        let program = vec![
+            enc_i(20, 0, 0, 1, 0x13),           // x1 = 20
+            enc_i(7, 0, 0, 2, 0x13),            // x2 = 7
+            ld(0, 4),                           // x4 = ram[0]
+            ld(8, 5),                           // x5 = ram[1]
+            enc_i(15, 1, 7, 6, 0x13),           // x6 = x1 & 15
+            enc_i(15, 0, 0, 7, 0x13),           // x7 = 15
+            enc_b(24, 7, 6, 0),                 // beq x6, x7, skip
+            enc_b(20, 2, 4, 6),                 // bltu x4, x2, skip
+            sub(2, 4, 4),                       // x4 -= x2
+            add(2, 5, 5),                       // x5 += x2
+            sd(0, 4, 0),                        // ram[0] = x4
+            sd(8, 5, 0),                        // ram[1] = x5
+            enc_i(-1i32 as u32, 1, 0, 1, 0x13), // skip: x1 -= 1
+            enc_b(-44, 0, 1, 1),                // bne x1, x0, loop
+            ld(0, 10),                          // x10 = ram[0]
+            0x0000_0073,                        // ecall
+        ];
+        let input = vec![1_000_000u64, 0u64];
+        let (pk, vk) = keygen_with(program.clone(), 256, 2, PcsParams::default());
+        let pub_in = PublicInput {
+            input: input.clone(),
+            output: 1_000_000 - 7 * 19,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert!(
+            verify(&vk, &pub_in, &proof).is_ok(),
+            "honest erc20 mixed-block proof must verify"
+        );
+        // Tamper: claim the wrong final balance.
+        let bad = PublicInput {
+            input: input.clone(),
+            output: 1_000_000 - 7 * 18,
+        };
+        assert!(
+            verify(&vk, &bad, &proof).is_err(),
+            "a wrong public output must be rejected"
         );
     }
 

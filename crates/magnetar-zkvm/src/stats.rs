@@ -228,13 +228,22 @@ fn count_fields_proof(proof: &Proof) -> (usize, Vec<(String, usize)>) {
             .unwrap_or(0)
     };
     add("final-state", fs_n(&p.final_reg) + fs_n(&p.final_ram));
-    // Mosaic.
+    // Mosaic: the hierarchical body (per-instance local rounds +
+    // terminals + the segment stage) + the ring switch.
     let mosaic_n = proof
         .mosaic
-        .batch_rounds
+        .local_rounds
         .iter()
+        .flatten()
         .map(|m| m.len())
         .sum::<usize>()
+        + proof.mosaic.terminals.len()
+        + proof
+            .mosaic
+            .seg_rounds
+            .iter()
+            .map(|m| m.len())
+            .sum::<usize>()
         + 1
         + proof.mosaic.ring.as_ref().map(ring_fields).unwrap_or(0);
     add("mosaic+pcs-eval", mosaic_n);

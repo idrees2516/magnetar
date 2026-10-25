@@ -42,7 +42,7 @@ use magnetar_cpu::{expand_program, Word};
 use magnetar_hash::{MerkleTree, Transcript};
 use magnetar_pcs::code::CodeParams;
 use magnetar_pcs::PcsStatement;
-use magnetar_zkvm::mosaic::{pack_tables_slice, prove_mosaic, MosaicClaim};
+use magnetar_zkvm::mosaic::{pack_tables_slice_split, prove_mosaic_hier, MosaicClaim};
 use magnetar_zkvm::{
     build_segment, keygen_with, prove_inner, Boundary, InnerProof, PublicInput, SegmentStatement,
     AMOUNT_BITS,
@@ -164,6 +164,7 @@ pub fn prove_ivc_streaming(
 
     // ---- The shared proving key + the combined layout. ----
     let (pk, _vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone());
+    let per = crate::per_segment_layout(&pk);
     let combined = combined_layout(&pk, segments);
     let n_comp = pk.mosaic.components.len();
     let n = combined.ell - 7;
@@ -253,7 +254,13 @@ pub fn prove_ivc_streaming(
             // combined layout).
             {
                 let mut p = packed_lock.lock().expect("pack lock poisoned");
-                pack_tables_slice(&combined, s * n_comp, &seg_tables, p.as_mut_slice());
+                pack_tables_slice_split(
+                    &combined,
+                    per.ell - 7,
+                    s * n_comp,
+                    &seg_tables,
+                    p.as_mut_slice(),
+                );
             }
             // The claims remapped into the combined layout.
             let shift = s * n_comp;
@@ -329,7 +336,16 @@ pub fn prove_ivc_streaming(
         stmt,
         ell: combined.ell,
     };
-    let mosaic = prove_mosaic(pcs, &combined, &commitment, &claims, false, &mut t);
+    let mosaic = prove_mosaic_hier(
+        pcs,
+        &per,
+        segments,
+        &commitment,
+        &claims,
+        false,
+        None,
+        &mut t,
+    );
     let wall_root = t2.elapsed();
 
     let stats = StreamingStats {

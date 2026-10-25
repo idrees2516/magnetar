@@ -242,8 +242,9 @@ fn main() {
             .sum::<usize>();
         let tail_bytes = ivc_proof
             .mosaic
-            .batch_rounds
+            .local_rounds
             .iter()
+            .flatten()
             .map(|m| m.len())
             .sum::<usize>()
             * 16;

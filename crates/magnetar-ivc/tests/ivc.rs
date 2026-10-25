@@ -121,7 +121,7 @@ fn ivc_tamper_rejected() {
     // 9. A tampered Mosaic round.
     {
         let mut p = clone_of(&proof);
-        p.mosaic.batch_rounds[0][1] += magnetar_field::Gf128(1);
+        p.mosaic.local_rounds[0][0][1] += magnetar_field::Gf128(1);
         assert!(!ok(&p), "tampered mosaic must fail");
     }
     // 10. A tampered commitment root.

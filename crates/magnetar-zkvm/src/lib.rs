@@ -35,6 +35,7 @@
 #![allow(clippy::needless_range_loop)]
 #![allow(clippy::too_many_arguments)]
 
+pub mod discharge;
 pub mod mosaic;
 pub mod protocol;
 pub mod rom;
@@ -42,7 +43,8 @@ pub mod stats;
 pub mod wrap;
 
 pub use mosaic::{
-    pack_tables, pack_tables_slice, MosaicClaim, MosaicCommitment, MosaicLayout, MosaicProof,
+    pack_tables, pack_tables_slice, prove_mosaic_hier, verify_mosaic_hier, MosaicClaim,
+    MosaicCommitment, MosaicLayout, MosaicProof,
 };
 pub use protocol::{
     boundary_point_claims, build_segment, keygen, keygen_with, prove, prove_inner, verify,

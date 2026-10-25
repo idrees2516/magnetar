@@ -40,6 +40,10 @@ pub struct SumcheckProver {
     dense_bits: Vec<bool>,
     /// The eq-slab profile per public factor (`None` = generic fold).
     slab_profile: Vec<Option<SlabProfile>>,
+    /// The **small-value round window** (the sum-check papers' round
+    /// batching): while active (rounds `0..v`), the messages come from the
+    /// monomial state and the tables stay un-folded. See `window.rs`.
+    window: Option<crate::window::WindowState>,
     coeffs: Vec<Gf128>,
     running: Gf128,
     order: BindOrder,
@@ -72,9 +76,33 @@ impl SumcheckProver {
     /// witness); the engine clears a flag as soon as its table is folded
     /// with a challenge (the result is field-valued).
     pub fn with_dense_bits(spec: &SumcheckSpec, order: BindOrder, bits: Vec<bool>) -> Self {
+        Self::with_dense_bits_opt_window(spec, order, bits, false)
+    }
+
+    /// Construct with the **small-value round window** enabled when the
+    /// spec matches the windowable shape (the binary relation's outer
+    /// sum-check `eq·(D0·D1 + D2)` over bit tables, bound
+    /// high-bits-first): the first `min(v, high)` rounds' messages are
+    /// computed in one pass over the un-folded tables (587 §5.1/C.5).
+    /// Messages stay bit-identical to the generic engine's; non-matching
+    /// specs fall back to the plain engine.
+    pub fn with_dense_bits_auto_window(
+        spec: &SumcheckSpec,
+        order: BindOrder,
+        bits: Vec<bool>,
+    ) -> Self {
+        Self::with_dense_bits_opt_window(spec, order, bits, true)
+    }
+
+    fn with_dense_bits_opt_window(
+        spec: &SumcheckSpec,
+        order: BindOrder,
+        bits: Vec<bool>,
+        auto_window: bool,
+    ) -> Self {
         spec.validate().expect("invalid sumcheck spec");
         assert_eq!(bits.len(), spec.dense.len(), "dense bit flags arity");
-        let public_tables = spec.public.iter().map(|f| f.materialize()).collect();
+        let public_tables: Vec<Vec<Gf128>> = spec.public.iter().map(|f| f.materialize()).collect();
         let slab_profile: Vec<Option<SlabProfile>> = spec
             .public
             .iter()
@@ -86,12 +114,19 @@ impl SumcheckProver {
                 }
             })
             .collect();
+        // The window: shape-checked, then the one-pass state build.
+        let window = if auto_window {
+            Self::try_window(spec, order, &bits, &public_tables)
+        } else {
+            None
+        };
         SumcheckProver {
             spec_terms: spec.terms.clone(),
             dense: spec.dense.clone(),
             public_tables,
             dense_bits: bits,
             slab_profile,
+            window,
             coeffs: spec.terms.iter().map(|t| t.coeff).collect(),
             running: spec.claim,
             order,
@@ -99,6 +134,50 @@ impl SumcheckProver {
             round: 0,
             challenges: Vec::new(),
         }
+    }
+
+    /// The windowable shape: `eq(τ,·) · (D0·D1 + D2)` with all three
+    /// dense tables bit-flagged, bound high-bits-first. The window covers
+    /// the first `min(v, high)` rounds (the top joint variables — the
+    /// strided sub-cube structure).
+    fn try_window(
+        spec: &SumcheckSpec,
+        order: BindOrder,
+        bits: &[bool],
+        public_tables: &[Vec<Gf128>],
+    ) -> Option<crate::window::WindowState> {
+        let high = match order {
+            BindOrder::HighBitsFirst { high } => high,
+            _ => return None,
+        };
+        let v = crate::window::window_size(high);
+        if v == 0 || spec.num_vars < 2 {
+            return None;
+        }
+        let shape = spec.dense.len() == 3
+            && bits.len() == 3
+            && bits.iter().all(|&b| b)
+            && spec.terms.len() == 2
+            && spec.terms[0].dense == vec![0, 1]
+            && spec.terms[0].public == vec![0]
+            && spec.terms[1].dense == vec![2]
+            && spec.terms[1].public == vec![0]
+            && spec.public.len() == 1
+            && spec.public[0].num_vars() == spec.num_vars;
+        if !shape {
+            return None;
+        }
+        let tau = spec.public[0].eq_point()?;
+        debug_assert_eq!(tau.len(), spec.num_vars);
+        let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
+        w.run_pass(
+            &spec.dense[0],
+            &spec.dense[1],
+            &spec.dense[2],
+            &public_tables[0],
+            &tau,
+        );
+        Some(w)
     }
 
     /// Number of remaining variables.
@@ -122,6 +201,9 @@ impl SumcheckProver {
     /// clears the flags (field-valued results), after which the generic
     /// kernel takes over. Bit-identical messages to the generic engine.
     pub fn message(&self) -> RoundMsg {
+        if let Some(w) = &self.window {
+            return w.message(&self.coeffs);
+        }
         let degree = self
             .spec_terms
             .iter()
@@ -504,6 +586,21 @@ impl SumcheckProver {
             xp = mul(xp, r);
         }
         self.running = mr;
+        // The round window path: bind the monomial state; the tables stay
+        // un-folded until the window ends (then the one-shot
+        // fast-forward).
+        if self.window.is_some() {
+            let v = self.window.as_ref().expect("checked").v;
+            {
+                let w = self.window.as_mut().expect("checked");
+                w.bind(r);
+            }
+            if self.window.as_ref().expect("checked").round == v {
+                self.finish_window();
+            }
+            self.round += 1;
+            return;
+        }
         let bit = self.order.current_bit(self.num_vars, self.round);
         // The slab profile is indexed by ORIGINAL variable; the round binds
         // `round_var` (the layout bit `bit` corresponds to it).
@@ -521,10 +618,14 @@ impl SumcheckProver {
                     par_bind_var(&mut self.public_tables[pi], bit, r);
                 }
                 Some(crate::EqSlabInfo::Covered(tau_v)) => {
-                    // Choose the slice s with eq(τ_v, s) ≠ 0: s = 0 gives
-                    // 1+τ_v, zero only at τ_v = 1; fall back to s = 1
-                    // (scale τ_v = 1 there).
-                    let slice = tau_v != ONE;
+                    // Choose the slice s with eq(τ_v, s) ≠ 0: s = 1 when
+                    // τ_v = ONE (eq(1,1) = 1); otherwise s = 0, where
+                    // eq(τ_v, 0) = 1 + τ_v ≠ 0 exactly because τ_v ≠ 1.
+                    // (The previous `τ_v != ONE` choice panicked on
+                    // bit-valued τ — a latent edge case never hit by
+                    // random challenges, exposed by the window's
+                    // cross-check tests.)
+                    let slice = tau_v == ONE;
                     par_gather_bit_at(&mut self.public_tables[pi], bit, slice);
                     // delta = eq(τ_v, r) / eq(τ_v, s).
                     let eq_r = ONE + tau_v + r; // eq(τ_v, r) in char 2
@@ -557,6 +658,50 @@ impl SumcheckProver {
             }
         }
         self.round += 1;
+    }
+
+    /// The window's fast-forward (587 §C.5.6): reach, in one shot, the
+    /// table state `v` generic rounds would have produced — the dense
+    /// tables contracted at the window challenges with selects (the
+    /// un-folded entries are bits), the eq factor's slab gathers applied
+    /// with the combined coefficient delta.
+    fn finish_window(&mut self) {
+        let w = self.window.take().expect("window active");
+        let eq_r: Vec<Gf128> = w.eq_r().to_vec();
+        // 1. The dense tables: bound[x'] = Σ_m eq(r_<v, m)·f[m·stride + x']
+        //    — a select per (m, x') since the entries are bits.
+        for k in 0..self.dense.len() {
+            let old = std::mem::take(&mut self.dense[k]);
+            self.dense[k] = crate::window::contract_bit_table(&old, &eq_r, w.stride, w.v);
+            self.dense_bits[k] = false;
+        }
+        // 2. The eq factor: v slab gathers + the combined delta
+        //    (exactly what v rounds of fold_msg's slab path do).
+        let mut delta_total = ONE;
+        for i in 0..w.v {
+            let orig_var = self.order.round_var(self.num_vars, i);
+            let bit = self.order.current_bit(self.num_vars, i);
+            let r_i = self.challenges[i];
+            match self.slab_profile[0].as_ref().map(|p| p[orig_var].clone()) {
+                Some(EqSlabInfo::Covered(tau_v)) => {
+                    let slice = tau_v == ONE; // eq(τ, s) ≠ 0 at s = 1 iff τ = 1
+                    par_gather_bit_at(&mut self.public_tables[0], bit, slice);
+                    let eq_r_v = ONE + tau_v + r_i;
+                    let eq_s = if slice { tau_v } else { ONE + tau_v };
+                    delta_total = mul(delta_total, mul(eq_r_v, inv(eq_s)));
+                }
+                _ => {
+                    par_gather_bit_at(&mut self.public_tables[0], bit, false);
+                }
+            }
+        }
+        if delta_total != ONE {
+            for (ti, t) in self.spec_terms.iter().enumerate() {
+                if t.public.contains(&0) {
+                    self.coeffs[ti] = mul(self.coeffs[ti], delta_total);
+                }
+            }
+        }
     }
 
     /// After all rounds: the dense factors' claimed evaluations at the

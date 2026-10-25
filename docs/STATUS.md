@@ -24,6 +24,9 @@ The reference is the Magnetar paper (eprint 2026-2423). Sections marked
 | **Final-state binding** (the Remark-4 initial/final memory binding: the zero-check + the evolution reduction) | Rmk 4 | `magnetar-memory::final_state` | roundtrip + 4 tampers |
 | End-to-end benchmarks with the paper comparison | §6 | `magnetar-cli::magnetar-bench`, `docs/BENCHMARKS.md` | the CLI harness |
 | MosaicPCS (aligned subcubes, Equation-4 lift, α-batching, ring switch, single PCS evaluation argument) | §5.2 | `magnetar-zkvm::mosaic` | roundtrip + tamper |
+| **The hierarchical Mosaic discharge** (per-segment lockstep local stages + the segment stage; the 611-paper's bounded-memory root) | §5.2 / 611 | `magnetar-zkvm::discharge` | per-instance byte-identity vs the generic engine; seq/streaming identity; 2^15–2^16 e2e |
+| **The small-value round window** (char-2 monomial window + eq-weighted pack + select fast-forward) | 1117 §5.1 / 587 §5.1+C.5 | `magnetar-sumcheck::window` | byte-identity vs the generic engine (shapes × orders); real-verifier roundtrips |
+| **The ERC-20 mixed-block load test** (the paper's Table-6 workload shape, proven and verified through 2^16) | §6 | `magnetar-cli::magnetar-bench-erc20` | `end_to_end_erc20_mixed_block` + the harness asserts |
 | RV64I decoder, microcode expansion (register-shift stages), interpreter with the full memory-access log | §5.1 | `magnetar-cpu` | decode/expansion/interp tests |
 | Dual SIMD R1CS circuit (bit + packed-field relations, carry chain, byte-lane muxes, halt-latch I/O) | §5.1 | `magnetar-cpu::circuit` | circuit-satisfaction tests |
 | Construction 3, all seven steps, end-to-end | §5.5 | `magnetar-zkvm::protocol` | fibonacci, load/store, sub-word, shift, hot-cell; 15+ tamper classes |

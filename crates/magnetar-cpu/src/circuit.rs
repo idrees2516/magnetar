@@ -31,7 +31,7 @@
 //!
 //! ## The relations
 //!
-//! *F₂ relation*: booleanity for every used column; the adder carry
+//! *F₂ relation*: the adder carry
 //! recurrence; the copy bindings (`shift_src = rs1`, `store_old =
 //! load_val`, `store_src = rs2`, `ram_addr = alu[3..11]`); the eq-column
 //! product chains; the sub-word zero-extension.
@@ -386,17 +386,16 @@ pub fn build_circuit() -> CircuitSpec {
         }
         rows += 1;
     };
-    // 1. Booleanity for every used column.
-    for col in 0..WITNESS_LAYOUT::USED {
-        add(
-            &mut a1,
-            &mut b1,
-            &mut c1,
-            &[(col, ONE)],
-            &[(col, ONE)],
-            &[(col, ONE)],
-        );
-    }
+    // 1. Booleanity rows are DELIBERATELY ABSENT (the circuit-density
+    //    item, 2048 -> 512 rows/cycle): the committed witness is the bit
+    //    matrix — MosaicPCS packs the components' coordinate bits into
+    //    GF(2^128) elements, and any committed element's coordinates are
+    //    bits by construction. The constraint x_c^2 = x_c therefore holds
+    //    for EVERY commitment (honest and malicious alike): it binds
+    //    nothing and its 1127 rows were pure padding. The real soundness
+    //    of the bit datapath lives in the value-carrying rows below (the
+    //    adder recurrence, the eq chains, the copy bindings) plus the
+    //    memory-checking and routing arguments.
     // 2. The adder carry recurrence: (t1_i + c_i)(t2_i + c_i) = c_{i+1} + c_i.
     for i in 0..63 {
         let t1i = WITNESS_LAYOUT::T1 + i;

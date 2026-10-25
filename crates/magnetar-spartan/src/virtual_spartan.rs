@@ -315,8 +315,17 @@ pub fn prove_virtual_spartan(
     // high s instance variables first), row rounds separate.
     let order = BindOrder::HighBitsFirst { high: s };
     let _pt_r = _PtR::new("vs-outer-rounds");
-    let mut p_bin =
-        SumcheckProver::with_dense_bits(&spec_bin, order, vec![az_bits, bz_bits, cz_bits]);
+    // The bin outer takes the **small-value round window** (the
+    // sum-check papers' round batching): its `az/bz/cz` are bit-valued and
+    // its shape is `eq·(az·bz + cz)`, so the first `min(v, s)` shared
+    // rounds come from ONE pass over the un-folded tables (selects, not
+    // CLMUL) — messages bit-identical to the generic engine's. The fld
+    // prover's tables are field-valued: generic engine.
+    let mut p_bin = SumcheckProver::with_dense_bits_auto_window(
+        &spec_bin,
+        order,
+        vec![az_bits, bz_bits, cz_bits],
+    );
     let mut p_fld = SumcheckProver::with_dense_bits(&spec_fld, order, vec![false; 3]);
     let mut outer_shared = Vec::with_capacity(s);
     let mut r_inst_ch = Vec::with_capacity(s);

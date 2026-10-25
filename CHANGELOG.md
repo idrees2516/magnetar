@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.7.0] — the streaming-scale release
+
+### Added
+- **The hierarchical Mosaic discharge** (`magnetar-zkvm::discharge`): the
+  streaming root's batching sum-check factors per segment (the combined
+  cube is `(segment bits) ∥ (local cube)` and cross-segment eq terms
+  vanish on each segment's block), so the root now runs **per-segment
+  local stages in lockstep** — each proving its own batching sum-check
+  against its packed slice, with the round window reading G straight
+  from the commitment's 128-bit words — plus a `log2(segments)`-round
+  segment stage that eq-batches the per-segment terminals into one
+  claim. The root's peak memory drops from `O(2^ell_combined)` (two
+  `2^ell · 16 B` tables — 2×1 GiB at 2^16, the 2^15 gate) to
+  `O(one segment)`, and no cross-segment "prefix adaptation" pass ever
+  touches the segment tables. **2^15 and 2^16 now prove end-to-end in
+  bounded memory** (1.36 / 2.60 GiB peak on a 4 GiB container).
+- **The small-value round window** (`magnetar-sumcheck::window`, ePrint
+  2025/1117 §5.1 + 2026/587 §5.1/C.5 in characteristic two): the first
+  `min(6, s)` rounds of the binary relation's outer sum-check are
+  computed in **one pass** over the un-folded bit tables — the char-2
+  monomial-basis window with the eq-weighted pack (the window state is
+  `3^v + 2^v` field accumulators, *independent of the trace length*) and
+  a select-only fast-forward. Messages byte-identical to the generic
+  engine's (cross-validated per shape); measured `vs-outer-rounds`
+  collapsed from the dominant phase to 13 ms at 2^8.
+- **The ERC-20 mixed-block load test** (`magnetar-bench-erc20`): the
+  paper's Table-6 workload shape — checked-balance transfers with every
+  16th transfer failing — proven and verified end-to-end through 2^16
+  (1,447 cycles/s, 121 tx/s at 2^16 on this container), plus the
+  `end_to_end_erc20_mixed_block` protocol test with a public-output
+  tamper class.
+- The window cross-validation tests (`window_check.rs`: full-proof
+  byte-identity vs the generic engine and a real-verifier roundtrip)
+  and the discharge regression test (per-instance messages vs the
+  generic engine + the full hierarchical body verify).
+
+### Changed
+- **Circuit density 2048 → 512 rows/cycle**: the 1,127 booleanity rows
+  (`x² = x` per witness column) were **vacuous** — the committed witness
+  is the bit matrix (any GF(2^128) element's coordinates are bits), so
+  the constraint holds for every possible commitment and binds nothing.
+  Deleted; the binary relation's real rows drop 1610 → 483 (padded 512)
+  and nnz 5,116 → 1,735. The full 15-class tamper suite passes
+  unchanged — the datapath's soundness lives in the value-carrying rows
+  and the memory/routing arguments.
+- **The block-aligned streaming layout + split packing**: the combined
+  Mosaic layout places segment `s`'s components at `s·2^{ell_seg} +
+  off_c` (the combined cube is the clean product), and the packing is
+  split-aware — the word index is `segment ∥ block`, the 7 word bits
+  are the local planes — so every segment's packed words stay
+  contiguous (the window's one-word-per-suffix read depends on it).
+- **The eq-slab slice choice fixed** (`fold_msg` and the window's
+  fast-forward): the previous `slice = τ ≠ 1` gather panicked on
+  bit-valued τ coordinates (`inv(0)`); the correct choice is `s = 1`
+  iff `τ = 1`, else `s = 0` (eq(τ,0) = 1+τ ≠ 0 exactly because τ ≠ 1).
+  A latent edge case never hit by random challenges, exposed by the
+  window's bit-τ cross-check tests.
+- **The SIMD-detection probes use wrapping sinks**: the timing-only
+  accumulators previously `sum()`-panicked on debug-build overflow (a
+  latent 5-test debug failure, now fixed).
+
+### Measured (2 cloud Xeon cores, 4 GiB)
+- Monolithic: 1,727–1,801 cycles/s at 2^8–2^10 (session start 1,065),
+  1,558 at 2^13 (session start 821).
+- Streaming: 1,920 at 2^14 / 1,833 at 2^15 / **1,707 at 2^16** — the
+  2^15/2^16 scales were **not provable** at session start (the root's
+  combined-cube tables exhausted the envelope).
+- The ERC-20 mixed-block load test: verified end-to-end through 2^16.
+
 ## [0.6.0] — the linear-in-T release
 
 ### Added

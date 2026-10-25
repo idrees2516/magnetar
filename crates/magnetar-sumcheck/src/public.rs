@@ -44,6 +44,12 @@ pub trait PublicFactor: std::fmt::Debug {
     fn eq_slab_info(&self, _var: usize) -> EqSlabInfo {
         EqSlabInfo::NotSlab
     }
+
+    /// For a pure `eq(τ, ·)` factor: the point `τ` (needed by the
+    /// round-window's suffix/window decomposition). Default: not an eq.
+    fn eq_point(&self) -> Option<Vec<Gf128>> {
+        None
+    }
 }
 
 /// `eq(r, ·)` — the multilinear equality factor (paper §3.1).
@@ -79,6 +85,9 @@ impl PublicFactor for EqFactor {
         } else {
             EqSlabInfo::Uncovered
         }
+    }
+    fn eq_point(&self) -> Option<Vec<Gf128>> {
+        Some(self.point.clone())
     }
 }
 

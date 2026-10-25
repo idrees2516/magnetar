@@ -11,7 +11,7 @@ fn rg(rng: &mut impl rand::Rng) -> Gf128 {
 }
 
 fn bit(rng: &mut impl rand::Rng) -> Gf128 {
-    Gf128((rand::RngExt::random::<u128>(rng) & 1) as u128)
+    Gf128(rand::RngExt::random::<u128>(rng) & 1)
 }
 
 /// Drive a full sum-check and collect all messages.
@@ -251,8 +251,8 @@ fn profile_sumeq_materialize() {
     for i in 0..22usize {
         let mut p = vec![Gf128(0); ell];
         // 16 free coords + 1 pinned bit.
-        for c in 0..16 {
-            p[c] = rg(&mut rng);
+        for pc in p.iter_mut().take(16) {
+            *pc = rg(&mut rng);
         }
         p[16] = Gf128((i % 2) as u128);
         items.push((rg(&mut rng), p));

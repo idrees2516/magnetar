@@ -37,6 +37,7 @@
 pub mod engine;
 pub mod public;
 pub mod sparse;
+pub mod window;
 pub mod zk;
 
 pub use engine::{SumcheckProver, SumcheckVerifier};

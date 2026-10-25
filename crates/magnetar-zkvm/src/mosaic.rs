@@ -19,7 +19,7 @@
 //! anchored to the main commitment with exact `φ_{c*}` bit-extraction
 //! checks at random `(x, ε=0)` positions.
 
-use magnetar_field::{mul, Gf128, ONE, ZERO};
+use magnetar_field::{Gf128, ZERO};
 use magnetar_hash::MerkleTree;
 use magnetar_hash::Transcript;
 use magnetar_pcs::code::{CodeParams, Codeword};
@@ -27,11 +27,7 @@ use magnetar_pcs::{
     ring::{prove_ring_switch, verify_ring_switch, RingProof},
     PcsParams, PcsStatement,
 };
-use magnetar_sumcheck::{
-    engine::{SumcheckProver, SumcheckVerifier},
-    public::SumEqFactor,
-    BindOrder, SumcheckSpec, Term,
-};
+
 use rayon::prelude::*;
 
 /// One committed component's placement.
@@ -150,10 +146,12 @@ fn assemble_g(layout: &MosaicLayout, tables: &[Vec<bool>]) -> Vec<bool> {
 }
 
 /// One rectangular placement of a component inside the packed leaf
-/// vector: the component's bit range `[off, off + 2^vars)` intersected
-/// with a single bit-plane `p` — leaves `[leaf_lo, leaf_hi)` map to table
-/// entries `[j_lo, …)` (the g-index is `leaf + p·2^n`, the plane is the
-/// high 7 bits).
+/// vector: a contiguous leaf range written into one bit-plane `p`. Under
+/// the **split packing convention** the g-index's bits decompose as
+/// `[high | plane (7) | low (split)]` and map to
+/// `leaf = [high | low]`, `plane` — the leaf vector is indexed
+/// `[instance | low]` when the layout stacks instances (the streaming
+/// root's per-segment word ranges stay contiguous).
 #[derive(Clone, Copy, Debug)]
 struct PackPiece {
     table: usize,
@@ -164,30 +162,53 @@ struct PackPiece {
     j_lo: usize,
 }
 
-/// The pack geometry: the disjoint pieces covering the components' bit
-/// ranges, clipped per plane (each component spans at most a few planes).
-/// `tables` are the components `[first, first + tables.len())` of
-/// `layout`; the piece table indices are local to `tables`.
-fn pack_pieces(layout: &MosaicLayout, first: usize, tables: &[Vec<bool>]) -> Vec<PackPiece> {
-    let n = layout.ell - 7;
-    let mask = (1usize << n) - 1;
+/// The pack geometry under the split convention. `split` = the low-bit
+/// count of the leaf index below the 7 plane bits (the monolithic path:
+/// `layout.ell - 7`; the block-aligned streaming layout: the per-segment
+/// `ell_seg - 7`).
+fn pack_pieces_split(
+    layout: &MosaicLayout,
+    first: usize,
+    tables: &[Vec<bool>],
+    split: usize,
+) -> Vec<PackPiece> {
     let mut pieces = Vec::with_capacity(tables.len() + 128);
     for (i, t) in tables.iter().enumerate() {
         let off = layout.offsets[first + i];
         let size = 1usize << layout.vars(first + i);
+        let vars = layout.vars(first + i);
         debug_assert_eq!(t.len(), size);
-        let g_lo = off;
-        let g_hi = off + size;
-        for p in (g_lo >> n)..=((g_hi - 1) >> n) {
-            let lo = g_lo.max(p << n);
-            let hi = g_hi.min((p + 1) << n);
+        // The offset is aligned to the component's size, so the g-range's
+        // bits above `vars` are fixed. Components never span a
+        // `split + 7` boundary (vars < split + 7 always holds: the largest
+        // component is far smaller than the per-instance union).
+        debug_assert!(vars <= split + 7);
+        if vars <= split {
+            // One plane; a single contiguous leaf range.
+            let plane = (off >> split) & 127;
+            let leaf_lo = ((off >> (split + 7)) << split) | (off & ((1usize << split) - 1));
             pieces.push(PackPiece {
                 table: i,
-                plane: p,
-                leaf_lo: lo & mask,
-                leaf_hi: (hi - 1) & mask,
-                j_lo: lo - g_lo,
+                plane,
+                leaf_lo,
+                leaf_hi: leaf_lo + size - 1,
+                j_lo: 0,
             });
+        } else {
+            // The component spans `vars - split` planes; each covers the
+            // full low range of `2^split` leaves.
+            let p_lo = (off >> split) & 127;
+            let p_count = 1usize << (vars - split);
+            let leaf_base = (off >> (split + 7)) << split; // the low bits start at 0
+            for (k, p) in (p_lo..p_lo + p_count).enumerate() {
+                pieces.push(PackPiece {
+                    table: i,
+                    plane: p,
+                    leaf_lo: leaf_base,
+                    leaf_hi: leaf_base + (1usize << split) - 1,
+                    j_lo: k << split,
+                });
+            }
         }
     }
     pieces
@@ -214,9 +235,26 @@ pub fn pack_tables_slice(
     tables: &[Vec<bool>],
     packed: &mut [Gf128],
 ) {
+    pack_tables_slice_split(layout, layout.ell - 7, first, tables, packed)
+}
+
+/// The split-convention pack: `split` bits below the 7 plane bits (the
+/// block-aligned streaming layout packs per-segment word ranges).
+pub fn pack_tables_slice_split(
+    layout: &MosaicLayout,
+    split: usize,
+    first: usize,
+    tables: &[Vec<bool>],
+    packed: &mut [Gf128],
+) {
     let n = layout.ell - 7;
     assert_eq!(packed.len(), 1usize << n);
-    let pieces = pack_pieces(layout, first, tables);
+    let pieces = pack_pieces_split(layout, first, tables, split);
+    pack_by_pieces(&pieces, tables, packed);
+}
+
+/// The parallel piece write: OR the pieces' planes into the leaves.
+fn pack_by_pieces(pieces: &[PackPiece], tables: &[Vec<bool>], packed: &mut [Gf128]) {
     // R2: below the threshold one chunk (sequential); above, multiple
     // tasks per core, never smaller than the threshold.
     let chunk = if packed.len() < magnetar_field::PAR_THRESHOLD {
@@ -252,14 +290,28 @@ pub fn commit_mosaic(
     layout: &MosaicLayout,
     tables: &[Vec<bool>],
 ) -> MosaicCommitment {
+    commit_mosaic_split(params, layout, layout.ell - 7, tables)
+}
+
+/// Commit under the split packing convention (the block-aligned streaming
+/// layout: `split` = the per-segment `ell_seg − 7`).
+pub fn commit_mosaic_split(
+    params: &PcsParams,
+    layout: &MosaicLayout,
+    split: usize,
+    tables: &[Vec<bool>],
+) -> MosaicCommitment {
     assert_eq!(tables.len(), layout.components.len());
     let ell = layout.ell;
     assert!(ell >= 7, "witness must have at least 7 variables");
-    // Pack over the top 7 bits: P(u) = Σ_b β_b G(u, b) with u the low
-    // ℓ−7 bits (streaming: the boolean union is never materialized).
+    // P packs the 7 plane bits into the word bits: P(word) = Σ_b β_b
+    // G(word, b) — the boolean union is never materialized.
     let n = ell - 7;
     let mut packed = vec![ZERO; 1usize << n];
-    pack_tables(layout, tables, &mut packed);
+    {
+        let pieces = pack_pieces_split(layout, 0, tables, split);
+        pack_by_pieces(&pieces, tables, &mut packed);
+    }
     let code_params = CodeParams::derive(n, params.k, &params.domain);
     let codeword = Codeword::encode(&code_params, &packed);
     let tree = MerkleTree::build(&format!("{}/level/0", params.domain), &codeword.values);
@@ -278,11 +330,18 @@ pub fn commit_mosaic(
     }
 }
 
-/// The Mosaic discharge proof: the batching sum-check + the ring switch.
+/// The Mosaic discharge proof: the hierarchical batching sum-checks (the
+/// per-instance local stages + the segment stage) + the ring switch.
 #[derive(Clone, Debug)]
 pub struct MosaicProof {
-    /// Batching sum-check rounds (degree 2) — masked when ZK is enabled.
-    pub batch_rounds: Vec<Vec<Gf128>>,
+    /// The per-instance local rounds (degree 2, 3 coefficients each) —
+    /// masked when ZK is enabled (single-instance proofs only).
+    pub local_rounds: Vec<Vec<Vec<Gf128>>>,
+    /// The per-instance terminals `Ĝ_s(r_local) = v_s`.
+    pub terminals: Vec<Gf128>,
+    /// The segment-stage rounds (`log2(segments)`; empty for one
+    /// instance).
+    pub seg_rounds: Vec<Vec<Gf128>>,
     /// The terminal claim `Ĝ(r*) = v''`.
     pub terminal: Gf128,
     /// The ZK finish offset (ZERO for plain proofs): the residual of the
@@ -298,7 +357,8 @@ pub struct MosaicProof {
     pub wrap: Option<crate::wrap::WrapProof>,
 }
 
-/// Prove the Mosaic discharge for a set of component claims.
+/// Prove the Mosaic discharge for a set of component claims (the
+/// monolithic path: ONE instance).
 pub fn prove_mosaic(
     params: &PcsParams,
     layout: &MosaicLayout,
@@ -323,108 +383,40 @@ pub fn prove_mosaic_opt(
     deep: Option<&PcsParams>,
     t: &mut Transcript,
 ) -> MosaicProof {
-    let ell = cm.ell;
-    // α-batching of the (lifted) claims.
+    prove_mosaic_hier(params, layout, 1, cm, claims, zk, deep, t)
+}
+
+/// Prove the **hierarchical** Mosaic discharge: `segments` instances
+/// (tree-IVC segments sharing one block-aligned commitment) discharged in
+/// lockstep plus a `log2(segments)`-round segment stage. See
+/// [`crate::discharge`] for the design and the memory bound.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_mosaic_hier(
+    params: &PcsParams,
+    per: &MosaicLayout,
+    segments: usize,
+    cm: &MosaicCommitment,
+    claims: &[MosaicClaim],
+    zk: bool,
+    deep: Option<&PcsParams>,
+    t: &mut Transcript,
+) -> MosaicProof {
+    // α-batching of the (combined-layout) claims.
     let alphas = t.challenge_field_vec("mosaic-alpha", claims.len());
-    let mut lhs = ZERO;
-    let mut items = Vec::with_capacity(claims.len());
-    for (c, &a) in claims.iter().zip(alphas.iter()) {
-        lhs += mul(a, c.value);
-        items.push((a, c.lifted_point(layout)));
-    }
-    // Batching sum-check: Σ_x [Σ_i α_i eq(p_i, x)]·G(x) = lhs over the ℓ
-    // variables, binding the top 7 first.
-    //
-    // The bit-table build is **cache-blocked** (R7): iterating the packed
-    // bit b in the outer loop makes every write run contiguous — 128
-    // passes over the (fully cached) packed vector instead of one pass of
-    // 128-strided streams. Same layout, same values, ~20× faster.
-    let g_table: Vec<Gf128> = {
-        let k = ell - 7;
-        let mut g = vec![ZERO; 1usize << ell];
-        g.par_chunks_mut(1usize << k)
-            .enumerate()
-            .for_each(|(b, chunk)| {
-                let mask = 1u128 << b;
-                for (u, slot) in chunk.iter_mut().enumerate() {
-                    *slot = Gf128((cm.packed[u].0 & mask) >> b);
-                }
-            });
-        g
-    };
-    let spec = SumcheckSpec {
-        num_vars: ell,
-        dense: vec![g_table],
-        public: vec![Box::new(SumEqFactor::new(items))],
-        terms: vec![Term {
-            coeff: ONE,
-            dense: vec![0],
-            public: vec![0],
-        }],
-        claim: lhs,
-    };
-    let order = BindOrder::HighBitsFirst { high: 7 };
-    let _pt_g = crate::protocol::PhaseTimer::new("7a-mosaic-gtable");
-    // The G-table is bit-valued: the first round takes the small-value
-    // select path (the papers' bit-valued setting).
-    let mut prover = SumcheckProver::with_dense_bits(&spec, order, vec![true]);
-    drop(_pt_g);
-    let _pt_batch = crate::protocol::PhaseTimer::new("7b-mosaic-batch");
-    let mut batch_rounds = Vec::with_capacity(ell);
-    // The ZK masking of the batching sum-check (roadmap H1): per-round
-    // mask polynomials hide the (witness-derived) round messages; the
-    // finish offset below closes the verifier's terminal identity. The
-    // masks never touch the prover's tables, so the terminal claim is
-    // the honest evaluation.
-    let mut masker = magnetar_sumcheck::zk::ZkMasker::new();
-    let mut zk_offset = magnetar_field::ZERO;
-    for _ in 0..ell {
-        if zk {
-            let msg = prover.message();
-            let mut masked = magnetar_sumcheck::RoundMsg(msg.0.clone());
-            masker.mask(&mut masked);
-            batch_rounds.push(masked.0.clone());
-            let mut buf = Vec::with_capacity(masked.0.len() * 16);
-            for c in &masked.0 {
-                buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
-            }
-            t.absorb_bytes("mosaic-batch", &buf);
-            let r = t.challenge_field("mosaic-batch");
-            masker.commit(r);
-            prover.fold_msg(&msg, r);
-        } else {
-            let msg = prover.message();
-            batch_rounds.push(msg.0.clone());
-            let mut buf = Vec::with_capacity(msg.0.len() * 16);
-            for c in &msg.0 {
-                buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
-            }
-            t.absorb_bytes("mosaic-batch", &buf);
-            let r = t.challenge_field("mosaic-batch");
-            prover.fold_msg(&msg, r);
-        }
-    }
-    drop(_pt_batch);
-    if zk {
-        zk_offset = masker.offset();
-    }
-    let challenges = prover.challenges();
-    let (dense_claims, _) = prover.finish();
-    let terminal = dense_claims[0];
+    let (body, r_star) =
+        crate::discharge::prove_hier_body(per, segments, &cm.packed, claims, &alphas, zk, t);
+    let terminal = body.terminal;
     t.absorb_field("mosaic-terminal", &[terminal]);
-    t.absorb_field("mosaic-zk-offset", &[zk_offset]);
-    let r_star = order.point(ell, &challenges);
-    // Split: r_block (low ℓ−7), r_bit (top 7, in variable order 7..ℓ).
-    let r_block: Vec<Gf128> = r_star[..ell - 7].to_vec();
-    let r_bit_arr: [Gf128; 7] = {
-        let mut a = [ZERO; 7];
-        for j in 0..7 {
-            a[j] = r_star[ell - 7 + j];
-        }
-        a
-    };
-    // Ring switch: the claim Ĝ(r*) = terminal with the packing over the
-    // top 7 bits.
+    t.absorb_field("mosaic-zk-offset", &[body.zk_offset]);
+    // The split packing: the word dimension is [local u coords] ∥
+    // [segment coords], the 7 word bits are the LOCAL plane coords.
+    let ell_s = per.ell;
+    let mut r_block: Vec<Gf128> = r_star[..ell_s - 7].to_vec();
+    r_block.extend_from_slice(&r_star[ell_s..]);
+    let mut r_bit_arr = [ZERO; 7];
+    for j in 0..7 {
+        r_bit_arr[j] = r_star[ell_s - 7 + j];
+    }
     let _pt_ring = crate::protocol::PhaseTimer::new("7c-ring-switch");
     let (ring, wrap) = match deep {
         Some(deep_params) => {
@@ -454,17 +446,18 @@ pub fn prove_mosaic_opt(
             None,
         ),
     };
-    drop(_pt_ring);
     MosaicProof {
-        batch_rounds,
+        local_rounds: body.local_rounds,
+        terminals: body.terminals,
+        seg_rounds: body.seg_rounds,
         terminal,
-        zk_offset,
+        zk_offset: body.zk_offset,
         ring,
         wrap,
     }
 }
 
-/// Verify the Mosaic discharge.
+/// Verify the Mosaic discharge (the monolithic path: ONE instance).
 pub fn verify_mosaic(
     params: &PcsParams,
     cm_stmt: &PcsStatement,
@@ -474,46 +467,44 @@ pub fn verify_mosaic(
     proof: &MosaicProof,
     t: &mut Transcript,
 ) -> Result<(), &'static str> {
+    verify_mosaic_hier(params, cm_stmt, ell, layout, 1, claims, proof, t)
+}
+
+/// Verify the **hierarchical** Mosaic discharge.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_mosaic_hier(
+    params: &PcsParams,
+    cm_stmt: &PcsStatement,
+    ell_combined: usize,
+    per: &MosaicLayout,
+    segments: usize,
+    claims: &[MosaicClaim],
+    proof: &MosaicProof,
+    t: &mut Transcript,
+) -> Result<(), &'static str> {
+    let ell_c = per.ell + segments.trailing_zeros() as usize;
+    if ell_c != ell_combined {
+        return Err("mosaic: combined cube mismatch");
+    }
     let alphas = t.challenge_field_vec("mosaic-alpha", claims.len());
-    let mut lhs = ZERO;
-    let mut items = Vec::with_capacity(claims.len());
-    for (c, &a) in claims.iter().zip(alphas.iter()) {
-        lhs += mul(a, c.value);
-        items.push((a, c.lifted_point(layout)));
-    }
-    if proof.batch_rounds.len() != ell {
-        return Err("mosaic: round count mismatch");
-    }
-    let public: Vec<Box<dyn magnetar_sumcheck::public::PublicFactor + Send + Sync>> =
-        vec![Box::new(SumEqFactor::new(items))];
-    let terms = vec![Term {
-        coeff: ONE,
-        dense: vec![0],
-        public: vec![0],
-    }];
-    let order = BindOrder::HighBitsFirst { high: 7 };
-    let mut v = SumcheckVerifier::new(ell, lhs, &public, terms, order);
-    let mut challenges = Vec::with_capacity(ell);
-    for msg in &proof.batch_rounds {
-        challenges.push(v.round_capturing(
-            &magnetar_sumcheck::RoundMsg(msg.clone()),
-            t,
-            "mosaic-batch",
-        )?);
-    }
-    v.finish_offset(&[proof.terminal], proof.zk_offset)
-        .map_err(|_| "mosaic: batching terminal failed")?;
+    let body = crate::discharge::HierBody {
+        local_rounds: proof.local_rounds.clone(),
+        terminals: proof.terminals.clone(),
+        seg_rounds: proof.seg_rounds.clone(),
+        terminal: proof.terminal,
+        zk_offset: proof.zk_offset,
+    };
+    let r_star = crate::discharge::verify_hier_body(per, segments, claims, &alphas, &body, t)?;
     t.absorb_field("mosaic-terminal", &[proof.terminal]);
     t.absorb_field("mosaic-zk-offset", &[proof.zk_offset]);
-    let r_star = order.point(ell, &challenges);
-    let r_block: Vec<Gf128> = r_star[..ell - 7].to_vec();
-    let r_bit_arr: [Gf128; 7] = {
-        let mut a = [ZERO; 7];
-        for j in 0..7 {
-            a[j] = r_star[ell - 7 + j];
-        }
-        a
-    };
+    // The split packing (see prove_mosaic_hier).
+    let ell_s = per.ell;
+    let mut r_block: Vec<Gf128> = r_star[..ell_s - 7].to_vec();
+    r_block.extend_from_slice(&r_star[ell_s..]);
+    let mut r_bit_arr = [ZERO; 7];
+    for j in 0..7 {
+        r_bit_arr[j] = r_star[ell_s - 7 + j];
+    }
     match (&proof.ring, &proof.wrap) {
         (Some(ring), None) => verify_ring_switch(
             cm_stmt,

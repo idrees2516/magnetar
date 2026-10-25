@@ -335,7 +335,7 @@ mod tests {
     fn gather_is_bit_zero_slice() {
         let mut rng = rand::rng();
         let vars = 7;
-        let mut table: Vec<Gf128> = (0..(1usize << vars))
+        let table: Vec<Gf128> = (0..(1usize << vars))
             .map(|i| Gf128(i as u128 * 3 + 1))
             .collect();
         for var in 0..vars {

@@ -53,7 +53,7 @@ use magnetar_cpu::interp::{execute, pad_records, Trace};
 use magnetar_cpu::Word;
 use magnetar_hash::Transcript;
 use magnetar_pcs::PcsParams;
-use magnetar_zkvm::mosaic::{commit_mosaic, prove_mosaic, verify_mosaic};
+use magnetar_zkvm::mosaic::{commit_mosaic_split, prove_mosaic_hier, verify_mosaic_hier};
 use magnetar_zkvm::{
     build_segment, keygen_with, prove_inner, verify_inner, Boundary, InnerProof, KeyGen,
     MosaicClaim, MosaicLayout, MosaicProof, PublicInput, SegmentStatement, AMOUNT_BITS,
@@ -275,9 +275,12 @@ pub fn prove_ivc(
         let _ = a_rom;
     }
 
-    // The root: one commitment over the union, one discharge.
+    // The root: one commitment over the union, one hierarchical
+    // discharge (the per-segment local stages in lockstep + the segment
+    // stage — the bounded-memory root).
+    let per = per_segment_layout(&pk);
     let combined = combined_layout(&pk, segments);
-    let commitment = commit_mosaic(pcs, &combined, &tables);
+    let commitment = commit_mosaic_split(pcs, &combined, per.ell - 7, &tables);
     let mut t = Transcript::new(
         "magnetar-ivc",
         &[
@@ -298,7 +301,16 @@ pub fn prove_ivc(
         t.absorb_digest(&format!("seg-digest-{s}"), d);
     }
     t.absorb_digest("cm-g", &commitment.stmt.root);
-    let mosaic = prove_mosaic(pcs, &combined, &commitment, &claims, false, &mut t);
+    let mosaic = prove_mosaic_hier(
+        pcs,
+        &per,
+        segments,
+        &commitment,
+        &claims,
+        false,
+        None,
+        &mut t,
+    );
     IvcProof {
         statements,
         inners,
@@ -399,7 +411,7 @@ pub fn verify_ivc(
     }
     let _ = tables_len;
     // ---- The shared discharge.
-    let combined = combined_layout(&pk, segments);
+    let per = per_segment_layout(&pk);
     let cm_stmt = magnetar_pcs::PcsStatement {
         root: proof.commitment_root,
         n: proof.pcs_n,
@@ -426,33 +438,57 @@ pub fn verify_ivc(
         t.absorb_digest(&format!("seg-digest-{s}"), d);
     }
     t.absorb_digest("cm-g", &proof.commitment_root);
-    verify_mosaic(
+    verify_mosaic_hier(
         pcs,
         &cm_stmt,
         proof.ell,
-        &combined,
+        &per,
+        segments,
         &claims,
         &proof.mosaic,
         &mut t,
     )
 }
 
-/// The combined Mosaic layout: `segments` copies of the per-segment
-/// component list, tagged by the segment index (placed on disjoint
-/// aligned subcubes by the alignment rule).
-pub(crate) fn combined_layout(pk: &KeyGen, segments: usize) -> MosaicLayout {
+/// The per-segment Mosaic layout (the canonical component placement).
+pub(crate) fn per_segment_layout(pk: &KeyGen) -> MosaicLayout {
     let n = pk.trace_len.trailing_zeros() as usize;
     let a_rom = pk.rom.a_rom;
-    let mut comps = Vec::new();
+    MosaicLayout::build(crate_mosaic_components(n, a_rom))
+}
+
+/// The combined Mosaic layout: `segments` copies of the per-segment
+/// component list, **block-aligned** — segment `s`'s components sit at
+/// `s·2^{ell_seg} + off_c`, so the combined cube is the clean product
+/// `(segment bits) ∥ (local cube)`. That product structure is what the
+/// hierarchical discharge's per-segment local stages and the packed-word
+/// window read depend on (the per-segment word range is contiguous).
+pub(crate) fn combined_layout(pk: &KeyGen, segments: usize) -> MosaicLayout {
+    let per = per_segment_layout(pk);
+    block_align(&per, segments)
+}
+
+/// Build the block-aligned combined layout from the per-segment one.
+pub(crate) fn block_align(per: &MosaicLayout, segments: usize) -> MosaicLayout {
+    let sigma = segments.trailing_zeros() as usize;
+    let ell = per.ell + sigma;
+    let mut components = Vec::with_capacity(per.components.len() * segments);
+    let mut offsets = Vec::with_capacity(per.components.len() * segments);
     for s in 0..segments {
-        for c in crate_mosaic_components(n, a_rom) {
-            comps.push(magnetar_zkvm::mosaic::ComponentSpec {
+        let base = s << per.ell;
+        for (i, c) in per.components.iter().enumerate() {
+            components.push(magnetar_zkvm::mosaic::ComponentSpec {
                 name: format!("s{s}-{}", c.name),
                 vars: c.vars,
             });
+            offsets.push(base + per.offsets[i]);
         }
     }
-    MosaicLayout::build(comps)
+    MosaicLayout {
+        components,
+        ell,
+        offsets,
+    }
 }
 
 /// The per-segment component list (mirrors protocol::mosaic_components,

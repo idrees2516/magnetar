@@ -51,7 +51,7 @@ fn profile_outer_rounds() {
         let m = p.message();
         msg_total += t0.elapsed();
         let t1 = std::time::Instant::now();
-        let r = Gf128(0x9E3779B97F4A7C150000_0000_0000_0001u128 >> i);
+        let r = Gf128(0x9E37_79B9_7F4A_7C15_0000_0000_0000_0001u128 >> i);
         p.fold_msg(&m, r);
         fold_total += t1.elapsed();
         let _ = i;

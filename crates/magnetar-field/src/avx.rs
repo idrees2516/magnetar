@@ -89,10 +89,14 @@ fn timed_probe_scalar() -> u128 {
     let t0 = std::time::Instant::now();
     // Parallel, like the real kernels: sustained multi-threaded use is
     // where virtualized hosts throttle or emulate.
+    // The sink only keeps the multiplications from being optimized away;
+    // wrapping accumulation avoids debug-build overflow panics (the
+    // values are meaningless — only the timing matters).
     let sink: u128 = (0..16_384u64)
         .into_par_iter()
         .map(|i| crate::gf128::mul(a[(i & 3) as usize], b[(i & 1) as usize]).0)
-        .sum();
+        .fold(|| 0u128, |x, y| x.wrapping_add(y))
+        .reduce(|| 0u128, |x, y| x.wrapping_add(y));
     let _ = sink;
     t0.elapsed().as_nanos()
 }
@@ -113,7 +117,8 @@ fn timed_probe_avx2() -> u128 {
             let r = unsafe { mul2_avx2(x, b) };
             r[(i & 1) as usize].0
         })
-        .sum();
+        .fold(|| 0u128, |x, y| x.wrapping_add(y))
+        .reduce(|| 0u128, |x, y| x.wrapping_add(y));
     let _ = sink;
     t0.elapsed().as_nanos()
 }
@@ -134,7 +139,8 @@ fn timed_probe_avx512() -> u128 {
             let r = unsafe { avx512().mul4(x, b) };
             r[(i & 3) as usize].0
         })
-        .sum();
+        .fold(|| 0u128, |x, y| x.wrapping_add(y))
+        .reduce(|| 0u128, |x, y| x.wrapping_add(y));
     let _ = sink;
     t0.elapsed().as_nanos()
 }
@@ -898,6 +904,37 @@ mod imp256_mul_run {
     }
 }
 
+/// 2-lane broadcast multiply for strided callers: `[r·t0, r·t1]` through
+/// the measured backend (scalar on non-x86 hosts).
+pub fn mul2_inline(r: Gf128, t: [Gf128; 2]) -> [Gf128; 2] {
+    #[cfg(target_arch = "x86_64")]
+    {
+        match detect() {
+            SimdKind::Avx512 => {
+                let mut b4 = [Gf128(0); 4];
+                b4[0] = t[0];
+                b4[1] = t[1];
+                let rb = [r; 4];
+                // SAFETY: the measured dispatch confirmed avx512f + vpclmulqdq.
+                let got = unsafe { avx512().mul4(rb, b4) };
+                [got[0], got[1]]
+            }
+            SimdKind::Avx2 => {
+                #[allow(unsafe_code)]
+                // SAFETY: the measured dispatch confirmed the target features.
+                unsafe {
+                    avx2().mul2([r, r], t)
+                }
+            }
+            _ => [crate::gf128::mul(r, t[0]), crate::gf128::mul(r, t[1])],
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        [crate::gf128::mul(r, t[0]), crate::gf128::mul(r, t[1])]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,41 +1088,13 @@ mod tests {
         for _ in 0..256 {
             let a = [Gf128(rng.random::<u128>()), Gf128(rng.random::<u128>())];
             let b = [Gf128(rng.random::<u128>()), Gf128(rng.random::<u128>())];
+            // SAFETY: the test probes the AVX2 kernel directly; the
+            // target feature is enabled by the caller's build (this test
+            // module gates on the compiled feature set).
             #[allow(unsafe_code)]
             let got = unsafe { mul2_avx2(a, b) };
             assert_eq!(got[0], crate::gf128::mul(a[0], b[0]));
             assert_eq!(got[1], crate::gf128::mul(a[1], b[1]));
         }
-    }
-}
-
-/// 2-lane broadcast multiply for strided callers: `[r·t0, r·t1]` through
-/// the measured backend (scalar on non-x86 hosts).
-pub fn mul2_inline(r: Gf128, t: [Gf128; 2]) -> [Gf128; 2] {
-    #[cfg(target_arch = "x86_64")]
-    {
-        match detect() {
-            SimdKind::Avx512 => {
-                let mut b4 = [Gf128(0); 4];
-                b4[0] = t[0];
-                b4[1] = t[1];
-                let rb = [r; 4];
-                // SAFETY: the measured dispatch confirmed avx512f + vpclmulqdq.
-                let got = unsafe { avx512().mul4(rb, b4) };
-                [got[0], got[1]]
-            }
-            SimdKind::Avx2 => {
-                #[allow(unsafe_code)]
-                // SAFETY: the measured dispatch confirmed the target features.
-                unsafe {
-                    avx2().mul2([r, r], t)
-                }
-            }
-            _ => [crate::gf128::mul(r, t[0]), crate::gf128::mul(r, t[1])],
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        [crate::gf128::mul(r, t[0]), crate::gf128::mul(r, t[1])]
     }
 }
