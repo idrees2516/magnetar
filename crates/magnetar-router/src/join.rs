@@ -155,6 +155,28 @@ const MAXC: usize = 12;
 
 type Coeffs = [Gf128; MAXC];
 
+/// A tiny `MAGNETAR_TIME`-gated phase timer (the same pattern as the
+/// zkvm crate's `PhaseTimer`, local to this crate to keep the dependency
+/// direction one-way).
+pub(crate) struct JoinTimer(Option<(std::time::Instant, &'static str)>);
+
+impl JoinTimer {
+    pub(crate) fn new(label: &'static str) -> Self {
+        JoinTimer(
+            std::env::var_os("MAGNETAR_TIME")
+                .map(|_| (std::time::Instant::now(), label)),
+        )
+    }
+}
+
+impl Drop for JoinTimer {
+    fn drop(&mut self) {
+        if let Some((t0, label)) = self.0.take() {
+            eprintln!("[time] {label:<24} {:7.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+}
+
 #[inline]
 fn zero_coeffs() -> Coeffs {
     [ZERO; MAXC]
@@ -263,6 +285,7 @@ pub fn prove_routing_join(
     let tensor_binary = tensor.values.iter().all(|&v| v == ZERO || v == ONE);
 
     // ---- Per-column extraction (one pass). ----
+    let _tj_extract = JoinTimer::new("jr-extract");
     let words_per_col = (1usize << u_v).div_ceil(64); // 2^u_v slots per column
     let col_len = 1usize << u_v;
     let mut cols: Vec<Column> = Vec::with_capacity(cycles);
@@ -345,9 +368,11 @@ pub fn prove_routing_join(
             });
         }
     }
+    drop(_tj_extract);
     let mut x_work = witness.x.clone();
 
     // ---- a-rounds: τ algebraic folding (stores only). ----
+    let _tj_a = JoinTimer::new("jr-a");
     for k in 0..a_v {
         let obits = &witness.offset_bits[k];
         let coeffs = cols
@@ -400,6 +425,8 @@ pub fn prove_routing_join(
             }
         });
     }
+    drop(_tj_a);
+    let _tj_xo2 = JoinTimer::new("jr-xo2");
     // The a-folded support per h (the o-phase pairs).
     let support_a: Vec<Vec<(usize, usize, Gf128)>> = if a_v > 0 {
         let ca = &challenges[..a_v];
@@ -499,6 +526,8 @@ pub fn prove_routing_join(
     }
 
     // ---- o-rounds: the o-dimension of R against the eq claim point. ----
+    drop(_tj_xo2);
+    let _tj_o = JoinTimer::new("jr-o");
     // The high-bit suffix `Π_{i>k} eq(r_o[i], o_i)` depends only on
     // `o >> (k+1)` and the FIXED claim point `r_o` — one table per round
     // (≈ 2^{o_v} entries total) instead of a product per pair per round.
@@ -645,6 +674,8 @@ pub fn prove_routing_join(
     };
 
     // ---- h-rounds: the one-hot kill. ----
+    drop(_tj_o);
+    let _tj_h = JoinTimer::new("jr-h");
     for k in 0..h_v {
         let coeffs = {
             let rtab = &r_uh;
@@ -705,6 +736,8 @@ pub fn prove_routing_join(
     }
 
     // ---- u-rounds: the R vector × per-column X slices. ----
+    drop(_tj_h);
+    let _tj_u = JoinTimer::new("jr-u");
     let mut r_u = r_uh; // h fully folded: a vector over u.
     for k in 0..u_v {
         let half = 1usize << (u_v - k - 1);
@@ -759,6 +792,8 @@ pub fn prove_routing_join(
     }
 
     // ---- j-rounds: per-cycle factor vectors, pair-folded. ----
+    drop(_tj_u);
+    let _tj_j = JoinTimer::new("jr-j");
     // The fully folded R and eq_o constants scale every j-round message
     // (they depend on no j variable).
     let s_fin = mul(e_o, r_u[0]);

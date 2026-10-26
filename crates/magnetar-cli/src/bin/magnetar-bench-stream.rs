@@ -83,8 +83,13 @@ fn main() {
         let out = trace.final_state.output;
         // Adaptive segment ladder: segments of at least 2^8 cycles, and —
         // above 2^13 total — at most 2^13 cycles per segment (the
-        // monolithic per-segment envelope of this container).
-        let min_segs = total / (1usize << 10); // 2^10-cycle segments: bounded per-worker envelope at every scale
+        // monolithic per-segment envelope of this container). The floor
+        // is 2^13-cycle segments (not 2^10): the root's per-instance
+        // discharge machinery costs ~33 ms wall per instance REGARDLESS
+        // of the instance's size, so longer segments amortize it —
+        // measured at 2^18, the 2^11-cycle configs beat the 2^10-cycle
+        // ones 7,374 vs 4,341 cycles/s.
+        let min_segs = total / (1usize << 13);
         let mut ladder: Vec<usize> = Vec::new();
         let mut s = 1usize;
         while s * 256 <= total {

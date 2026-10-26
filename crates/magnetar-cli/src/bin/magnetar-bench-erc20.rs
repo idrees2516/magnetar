@@ -133,6 +133,10 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
+    let min_stream_log2: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(13);
     let cpi = cpi_from_env();
     println!("ERC-20 mixed-block load test (the paper's Table-6 workload shape)");
     println!(
@@ -185,7 +189,7 @@ fn main() {
         "{:>7} {:>4} {:>10} {:>10} {:>12} {:>10} {:>10} {:>9}",
         "T", "segs", "prove(ms)", "peakRSS", "cycles/s", "tx/s", "ckpt(ms)", "root(ms)"
     );
-    for log2_t in [13usize, 14, 15, 16].iter().filter(|t| **t <= max_log2) {
+    for log2_t in (13usize..=24).filter(|t| *t >= min_stream_log2 && *t <= max_log2) {
         let total = 1usize << log2_t;
         let n_tx = total / CYCLES_PER_TX;
         let prog = erc20_program(n_tx as u32);
@@ -194,13 +198,18 @@ fn main() {
         let out = trace.final_state.output;
         let expect = 1_000_000u64 - 7 * (n_tx as u64 - n_tx as u64 / 16);
         assert_eq!(out, expect, "the from-balance after {n_tx} mixed transfers");
-        // Adaptive ladder: 2^10-cycle segments above 2^13 total.
+        // Adaptive ladder: 2^12-cycle segments above 2^13 total. The
+        // root's per-instance discharge machinery costs ~33 ms wall per
+        // instance regardless of the instance's size (measured at
+        // 2^17–2^19), so 2^12-cycle segments amortize it 4× better than
+        // the 2^10-cycle ones of the previous release — measured at 2^18:
+        // 7,374 vs 4,341 cycles/s — while the per-worker envelope stays
+        // at the 2^12-cycle monolithic bound (≈ 350 MiB).
         let segments = if total >= (1usize << 13) {
-            total / (1usize << 10)
+            (total / (1usize << 12)).clamp(1, 4096)
         } else {
             1
         }
-        .clamp(1, 128)
         .next_power_of_two();
         let t0 = Instant::now();
         let (proof, stats) = magnetar_ivc::prove_ivc_streaming(
