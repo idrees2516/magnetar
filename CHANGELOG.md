@@ -1,5 +1,40 @@
 # Changelog
 
+## [0.9.0] — the split-ring release (the per-segment commitment trees)
+
+### Added
+- **The split ring switch** (`ring_split`): the streaming root's
+  per-segment commitment trees — segment-local codeword vectors, merged
+  `(P, C)` pair leaves, per-level root layers, and the shared upper
+  levels. Peak root memory `O(one segment's chain)`; 2^20 proves in
+  2.38 GiB on a 3-GiB container (2^17 was the previous ceiling).
+- **`AccumTimer`** — the `MAGNETAR_TIME` split at scale: aggregated
+  per-phase totals + fire counts + per-fire averages; a CPU-ms axis per
+  root phase (`magnetar_ivc::cpu_ms`).
+- `magnetar_ivc::streaming::segment_count` — the adaptive segment
+  ladder (2^13-cycle segments at scale; `MAGNETAR_SEG_LOG2` override).
+- `MAGNETAR_RSS` — per-phase RSS traces on the streaming path.
+
+### Changed
+- The hierarchical discharge's per-group eq tables are transient
+  per-phase arenas (the stored tables were the measured per-instance
+  O(T) spike at 2^17+).
+- The split ring's queries and anchors share one per-segment derivation
+  in bounded waves.
+- `MosaicCommitment.codeword`/`tree` are `Option` (the multi-segment
+  root never materializes the combined codeword or tree).
+- The streaming root's transcript binds the commitment through the
+  split ring's `ring-root-0` (no separate `cm-g` absorb on the
+  multi-segment path); the sequential and streaming provers remain
+  byte-identical.
+
+### Fixed
+- A latent debug-only `debug_assert` in the cross-step S1 prover fired
+  on the tamper tests' deliberately inconsistent inputs (removed — the
+  verifier's rejection is the test).
+- The newer toolchain's clippy lints (div_ceil, needless late init,
+  items-after-test-module, type complexity).
+
 ## [0.8.0] — the production-throughput release
 
 ### Added

@@ -205,7 +205,14 @@ fn streaming_matches_sequential() {
         // The stats are populated (R10).
         assert!(stats.wall_total >= stats.wall_checkpoints + stats.wall_root);
         assert!(stats.packed_bytes > 0);
-        assert!(stats.codeword_bytes >= stats.packed_bytes);
+        // The single-segment root materializes the combined codeword;
+        // the multi-segment (split-ring) root never does — its
+        // per-segment commitment trees live inside the discharge.
+        if segments == 1 {
+            assert!(stats.codeword_bytes >= stats.packed_bytes);
+        } else {
+            assert_eq!(stats.codeword_bytes, 0);
+        }
         assert!(stats.segment_table_bytes > 0);
         assert!(stats.checkpoint_bytes > 0);
         assert!(stats.threads >= 1);

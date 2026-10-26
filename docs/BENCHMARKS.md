@@ -13,7 +13,7 @@ Run with:
 cargo run --release -p magnetar-cli --bin magnetar-bench          # end-to-end
 cargo run --release -p magnetar-cli --bin magnetar-bench-big -- 13 # beyond 2^10
 cargo run --release -p magnetar-cli --bin magnetar-bench-stream -- 16 stream
-cargo run --release -p magnetar-cli --bin magnetar-bench-erc20 -- 16
+cargo run --release -p magnetar-cli --bin magnetar-bench-erc20 -- 20
                                                                    # the paper's Table-6 workload
 MAGNETAR_TIME=1 cargo run --release -p magnetar-cli --bin magnetar-bench-big -- 8
                                                                    # per-phase wall clock
@@ -46,32 +46,48 @@ balance transfers between two accounts with checked subtraction, every
 16th transfer failing the underflow check — 12 cycles per executed
 transfer at the 64-bit balance width of this RV64I reference CPU:
 
+The **split-ring release** (the per-segment commitment trees, the
+streamed-eq discharge, the merged openings, and the 2^13-cycle segment
+ladder) — measured on the 2-vCPU / 3-GiB development container:
+
 | T | segments | tx | prove (ms) | cycles/s | tx/s | peak RSS |
 |---|---|---|---|---|---|---|
-| 2^12 (monolithic) | — | 341 | 614 | 6,668 | 555 | 165 MiB |
-| 2^13 | 8 | 682 | 672 | 12,186 | 1,014 | 259 MiB |
-| 2^14 | 16 | 1,365 | 1,321 | 12,398 | 1,033 | 344 MiB |
-| 2^15 | 32 | 2,730 | 2,799 | 11,707 | 975 | 590 MiB |
-| 2^16 | 64 | 5,461 | 6,300 | 10,402 | 867 | 1.37 GiB |
+| 2^12 (monolithic) | — | 341 | 986 | 4,153 | 346 | 197 MiB |
+| 2^13 | 8 | 682 | 2,265 | 3,617 | 301 | 229 MiB |
+| 2^16 | 8 | 5,461 | 19,187 | 3,416 | 285 | 708 MiB |
+| 2^18 | 32 | 174,762 | 76,250 | 3,438 | 286 | 795 MiB |
+| 2^19 | 64 | 349,525 | 157,132 | 3,337 | 278 | 1.37 GiB |
+| 2^20 | 128 | 699,050 | 343,551 | 3,052 | 254 | 2.38 GiB |
+
+The memory is now **flat in the segment count and O(segment) in the
+worker envelope**: 2^17 through 2^20 prove on a 3-GiB container where
+the previous release's practical ceiling was 2^17 (the combined
+codeword + tree + the stored per-group eq tables — the projected
+~8–45 GiB at 2^19–2^21). A 2^21 proof projects to ≈4.5 GiB (an 8-GiB
+host's envelope; the InstaBox-class machine). The production ladder's
+per-machine throughput on real AVX-512 hardware is unchanged in shape
+(~3.2× this container's rate per the last release's ratio).
 
 **The pooled proving-pool run** (5 × 4-vCPU instances proving
 independent 2^16 batches concurrently): ≈3,880 tx/s aggregate (the
 per-machine rate drops ~12% under cross-VM contention). The production
 50k-tx/s target therefore needs ~13× more per-core efficiency; the
-measured remaining levers, in order of impact:
+`MAGNETAR_TIME` split at scale (the aggregated per-phase table — every
+per-instance and per-segment phase now accumulates its total, fire
+count, and per-fire average, plus a CPU-ms axis per root phase)
+measures the remaining levers, in order of impact:
 
-1. **The ring switch's FRI chain** (~35% of the streaming root): the
-   per-level Merkle trees are Ligerito-inherent, but the c-chain still
-   materializes the derived c-table + a second encode; the paper's
-   commitment-free ring switch reduces to the packed-PCS claim and
-   reuses the main codeword's argument (est. −0.3–0.5 s/root).
-2. **The per-segment transcript/claims glue** (~20–30% of each
-   segment): hundreds of small Fiat–Shamir absorbs per proof; batching
-   the absorbs and the claim serializations (est. −15–20% per segment).
-3. **The twists' o-rounds** (the inc-table folds + the eq-sum passes):
-   the packed-inc refactor (u64 words per cycle instead of the
-   `2^{6+n}` bit table) mirrors the witness packing (est. −5–8%).
-4. **The paper's per-instance amortization**: the circuit still pads
+1. **The store-router join pass** (24% of the segments phase at 2^16):
+   the join prover's per-segment work — the next packed refactor.
+2. **Virtual Spartan's outers** (20% of the segments phase): the
+   row-cube window passes at the 512-row density.
+3. **The twists' o-rounds** (16% combined): the packed-inc refactor
+   (u64 words per cycle instead of the `2^{6+n}` bit table) mirrors the
+   witness packing.
+4. **The discharge's `fw-bound-se` walk** (12% of the root): the group
+   word-walk's mul chains (the eq arena is now transient; the walk
+   itself is the residual cost).
+5. **The paper's per-instance amortization**: the circuit still pads
    the rows to 512/cycle against the paper's several-cycles-per-
    instance operating point — the single largest structural constant
    left (4–8× at the paper's density).
@@ -81,7 +97,44 @@ harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,
 0.2 GiB — on 12 M4 performance cores whose per-core CLMUL rate is
 ~5× this Xeon's measured 11.5 ns/mul.
 
-## The four optimizations of this pass
+## The optimizations of the split-ring release
+
+1. **The split ring switch** (`magnetar-pcs/src/ring_split.rs`): the
+   streaming root's per-segment commitment trees. The codeword uses
+   **segment-local** substitution vectors (the combined codeword IS the
+   `[ε][s][x_loc]` concatenation of per-segment codewords — the direct
+   sum of the per-segment codes, same relative distance), so every fold
+   level `i ≤ n_s` decomposes into `(s, ε)` cells whose digests form a
+   tiny **root layer** per level. The chains are built streaming, one
+   segment at a time; each cell tree commits **merged `(P, C)` pairs**
+   (the witness codeword and the c-folded codeword in ONE tree — the
+   monolithic ring's two-path anchor collapsed into one); the anchors
+   check `φ_c(P) = C` exactly. The Fiat–Shamir order binds the merged
+   commitment after the hierarchical body's challenges but before any
+   opening. Peak root memory: `O(one segment's chain + one wave)`.
+2. **The streamed-eq discharge**: the hierarchical discharge's
+   per-group eq tables moved from **stored** (through the whole
+   lockstep — the measured per-instance O(T) spike: ~53 groups × ~2^17
+   entries ≈ 130 MB/instance at 2^13-cycle segments) to **transient
+   per-phase arenas** (one contiguous allocation per fold/walk, dropped
+   at the phase end). This was the single largest memory term at
+   2^17+.
+3. **The merged openings pass**: the ring's queries and anchors draw
+   all positions up front (the transcript's draw order preserved) and
+   answer from ONE per-segment derivation in bounded waves — the
+   previous shape re-derived the touched segments twice (the kept-tree
+   variant also held every digest level of every cell).
+4. **The 2^13-cycle segment ladder**: `segment_count` picks
+   `2^13`-cycle segments at scale (8 segments at 2^16, 128 at 2^20),
+   amortizing the per-segment fixed costs; `MAGNETAR_SEG_LOG2` overrides
+   for the amortization study.
+5. **The MAGNETAR_TIME split at scale**: `AccumTimer` accumulates every
+   per-instance/per-segment phase's total + fire count + per-fire
+   average into one sorted table (the CPU-ms axis per root phase rides
+   alongside) — the "~825 CPU-ms/instance" class of fixed costs is now
+   measured directly rather than inferred.
+
+## The four optimizations of the previous pass
 
 1. **Circuit density (2048 → 512 rows/cycle)**: the binary relation's
    per-cycle row count was dominated by 1,127 *booleanity* rows
@@ -193,11 +246,15 @@ prove 2^15 at all. The remaining measured levers: the twists'
 select-folds (32% of the monolithic profile), and the ring switch's
 evaluation tail.
 
-**Memory.** The 2^15/2^16 gate is gone: the streaming root's peak is
-`O(one segment's suffix tables + packed + codeword + tree)` — 1.36 GiB
-at 2^15 and 2.60 GiB at 2^16 on this 4 GiB container, with the
-per-worker envelope constant across the ladder. The monolithic path
-proves through 2^13 in 619 MiB.
+**Memory.** The 2^17 wall is gone: the split ring's root holds only
+the packed vector + the transient c-table + the per-instance tail
+engines + one wave of per-segment chain derivations — 708 MiB at 2^16,
+795 MiB at 2^18, 1.37 GiB at 2^19, and **2.38 GiB at 2^20** on this
+3 GiB container (the previous release needed ≈1.4 GiB at 2^16 and
+projected ≈8+ GiB at 2^19). 2^21 projects to ≈4.5 GiB (the 8-GiB
+production host's envelope); 2^23+ needs the documented follow-ups (the
+lazy `bound_g` dense factor, the one-hot components' sparse
+commitment).
 
 ## What the benchmarks DO establish
 

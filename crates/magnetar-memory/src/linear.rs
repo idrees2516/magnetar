@@ -999,13 +999,11 @@ pub fn prove_cross_step_s1_linear(
             coeffs[1] += mul(a_j, mul(gamma, t0 + t1)) + mul(b_j, alpha0 + mul(gamma, t0));
             coeffs[2] += mul(b_j, mul(gamma, t0 + t1));
         }
-        if rounds.is_empty() {
-            debug_assert_eq!(
-                coeffs[1..].iter().copied().sum::<Gf128>(),
-                alpha0 + gamma,
-                "cs-s1 round 0 must sum to the claim"
-            );
-        }
+        // NOTE: no round-0 self-check here — the tamper tests call this
+        // prover with deliberately inconsistent inputs (the corrupted
+        // one-hot), where the round sum legitimately misses the claim;
+        // the verifier's rejection is the test. (A debug_assert here
+        // fired on `cross_step_tamper` inputs — fixed by removal.)
         let c = absorb(&mut *t, &coeffs, label);
         rounds.push(coeffs);
         challenges.push(c);

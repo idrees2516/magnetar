@@ -126,7 +126,7 @@ impl SparseMatrix {
         q: usize,
         w_cols: usize,
     ) -> (Vec<Gf128>, bool) {
-        let w128 = (w_cols + 127) / 128;
+        let w128 = w_cols.div_ceil(128);
         debug_assert_eq!(w_packed.len(), q * w128);
         let one_col = w_cols; // z = (w, 1, x): the constant-1 column
         let mut out = vec![ZERO; q * self.rows];
@@ -271,6 +271,7 @@ pub fn fold_instances(per_instance: &[Gf128], r_inst: &[Gf128]) -> Gf128 {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use rand::RngExt;
@@ -394,7 +395,7 @@ impl SparseMatrix {
         if !self.is_binary() || self.entries.iter().any(|&(_, c, _)| c > w_cols) {
             return None;
         }
-        let w128 = (w_cols + 127) / 128;
+        let w128 = w_cols.div_ceil(128);
         let rows_log2 = self.rows.trailing_zeros() as usize;
         let stride = 1usize << (rows_log2 + s - v);
         let low_mask = (1usize << (s - v)) - 1;
@@ -403,7 +404,7 @@ impl SparseMatrix {
             let row_words = &w_packed[u * w128..(u + 1) * w128];
             // The row-parity bitset: one XOR per entry with a set witness
             // bit (a word op, not a 16-byte accumulate).
-            let mut parity = vec![0u64; (self.rows + 63) / 64];
+            let mut parity = vec![0u64; self.rows.div_ceil(64)];
             for &(r, c, val) in &self.entries {
                 if val.0 & 1 == 0 {
                     continue;

@@ -853,6 +853,7 @@ pub fn fold_pairs(out: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> u
 /// the bound_se outer-product's inner op (the same fused-lane pipelines
 /// as [`mul_run`] plus the accumulate). Returns the entries consumed.
 /// Unit-tested against the scalar reference (`axpy_matches_scalar`).
+#[allow(clippy::needless_late_init)] // the match arms' unsafe bodies assign per-backend
 pub fn axpy_run(dst: &mut [Gf128], src: &[Gf128], r: Gf128, count: usize) -> usize {
     debug_assert_eq!(dst.len(), src.len());
     let done;

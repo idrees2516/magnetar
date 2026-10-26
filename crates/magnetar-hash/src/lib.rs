@@ -334,6 +334,116 @@ impl MerkleTree {
         }
         Ok(acc)
     }
+
+    /// Build a tree over **32-byte pair leaves** — each leaf is two field
+    /// elements (the split-ring's merged `(P, C)` codeword entries, the
+    /// per-segment commitment trees' leaves). The leaf digest binds the
+    /// pair's 32 bytes (the parts-length prefix keeps it distinct from
+    /// the 16-byte single-element leaf).
+    pub fn build_pairs(
+        domain: &str,
+        pairs: &[(magnetar_field::Gf128, magnetar_field::Gf128)],
+    ) -> Self {
+        let n = pairs.len();
+        assert!(
+            n.is_power_of_two() || n == 1,
+            "Merkle leaves must be a power of two"
+        );
+        let dom = domain.as_bytes().to_vec();
+        let leaf = |(i, &(a, b)): (usize, &(magnetar_field::Gf128, magnetar_field::Gf128))| {
+            leaf_digest_of_pair(domain, n, i, (a, b))
+        };
+        let level: Vec<[u8; DIGEST]> = if n >= PAR_TREE_THRESHOLD {
+            pairs.par_iter().enumerate().map(leaf).collect()
+        } else {
+            pairs.iter().enumerate().map(leaf).collect()
+        };
+        Self::build_from_levels(dom, level, n)
+    }
+
+    /// Build a tree whose leaves are **raw digests** (the root layer over
+    /// the per-cell subtree roots of the split ring).
+    pub fn build_from_digests(domain: &str, leaves: &[[u8; DIGEST]]) -> Self {
+        let n = leaves.len();
+        assert!(
+            n.is_power_of_two() || n == 1,
+            "Merkle leaves must be a power of two"
+        );
+        let dom = domain.as_bytes().to_vec();
+        let leaf = |(i, &d): (usize, &[u8; DIGEST])| leaf_digest_of_raw(domain, n, i, d);
+        let level: Vec<[u8; DIGEST]> = if n >= PAR_TREE_THRESHOLD {
+            leaves.par_iter().enumerate().map(leaf).collect()
+        } else {
+            leaves.iter().enumerate().map(leaf).collect()
+        };
+        Self::build_from_levels(dom, level, n)
+    }
+
+    /// The shared level-by-level construction from a precomputed leaf
+    /// digest level.
+    fn build_from_levels(dom: Vec<u8>, level: Vec<[u8; DIGEST]>, n_leaves: usize) -> Self {
+        let mut levels = vec![level];
+        while levels.last().unwrap().len() > 1 {
+            let cur = levels.last().unwrap();
+            let lvl = levels.len() - 1;
+            let half = cur.len() / 2;
+            let node = |j: usize| {
+                blake3_domain(&[
+                    b"magnetar/node/v1",
+                    &dom,
+                    &(lvl as u64).to_le_bytes(),
+                    &cur[2 * j],
+                    &cur[2 * j + 1],
+                ])
+            };
+            let next: Vec<[u8; DIGEST]> = if half >= PAR_TREE_THRESHOLD {
+                (0..half).into_par_iter().map(node).collect()
+            } else {
+                (0..half).map(node).collect()
+            };
+            levels.push(next);
+        }
+        MerkleTree {
+            levels,
+            domain: dom,
+            n_leaves,
+        }
+    }
+}
+
+/// The leaf digest of a 32-byte **pair** value (two field elements — the
+/// split ring's merged `(P, C)` leaves).
+pub fn leaf_digest_of_pair(
+    domain: &str,
+    n_leaves: usize,
+    index: usize,
+    value: (magnetar_field::Gf128, magnetar_field::Gf128),
+) -> [u8; DIGEST] {
+    blake3_domain(&[
+        b"magnetar/leaf/v1",
+        domain.as_bytes(),
+        &(n_leaves as u64).to_le_bytes(),
+        &(index as u64).to_le_bytes(),
+        &fe_to_bytes(value.0),
+        &fe_to_bytes(value.1),
+    ])
+}
+
+/// The leaf digest of a raw 32-byte value (the root layer's digest
+/// leaves).
+pub fn leaf_digest_of_raw(
+    domain: &str,
+    n_leaves: usize,
+    index: usize,
+    value: [u8; DIGEST],
+) -> [u8; DIGEST] {
+    blake3_domain(&[
+        b"magnetar/leaf/v1",
+        domain.as_bytes(),
+        &(n_leaves as u64).to_le_bytes(),
+        &(index as u64).to_le_bytes(),
+        &value,
+    ])
 }
 
 /// Verify a full leaf opening (value level): recomputes the leaf digest for

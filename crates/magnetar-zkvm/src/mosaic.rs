@@ -23,10 +23,11 @@ use magnetar_field::{Gf128, ZERO};
 use magnetar_hash::MerkleTree;
 use magnetar_hash::Transcript;
 use magnetar_pcs::code::{CodeParams, Codeword};
-use magnetar_pcs::{
-    ring::{prove_ring_switch, verify_ring_switch, RingProof},
-    PcsParams, PcsStatement,
+use magnetar_pcs::ring::{prove_ring_switch, verify_ring_switch, RingProof};
+use magnetar_pcs::ring_split::{
+    prove_ring_switch_split, verify_ring_switch_split, SplitGeometry, SplitRingProof,
 };
+use magnetar_pcs::{PcsParams, PcsStatement};
 
 use rayon::prelude::*;
 
@@ -117,12 +118,17 @@ impl MosaicClaim {
     }
 }
 
-/// A Mosaic commitment: the packed codeword, its tree, and the statement.
+/// A Mosaic commitment: the packed table (always), plus — for the
+/// monolithic path — its combined codeword and tree. The **split**
+/// path (segments > 1) never materializes the combined codeword or tree:
+/// the per-segment commitment trees live inside the split ring switch.
 #[derive(Clone, Debug)]
 pub struct MosaicCommitment {
     pub packed: Vec<Gf128>,
-    pub codeword: Codeword,
-    pub tree: MerkleTree,
+    /// The combined codeword (the monolithic / segments == 1 path).
+    pub codeword: Option<Codeword>,
+    /// The combined Merkle tree (the monolithic / segments == 1 path).
+    pub tree: Option<MerkleTree>,
     pub stmt: PcsStatement,
     /// ℓ (total bit-witness variables).
     pub ell: usize,
@@ -284,6 +290,41 @@ fn pack_by_pieces(pieces: &[PackPiece], tables: &[Vec<bool>], packed: &mut [Gf12
         });
 }
 
+/// Pack the component tables under the split convention WITHOUT the
+/// combined codeword or tree — the multi-segment (split-ring) root's
+/// commitment path: the per-segment commitment trees live inside the
+/// split ring switch, so the combined codeword and tree are never
+/// materialized.
+pub fn pack_mosaic_split(
+    params: &PcsParams,
+    layout: &MosaicLayout,
+    split: usize,
+    tables: &[Vec<bool>],
+) -> MosaicCommitment {
+    assert_eq!(tables.len(), layout.components.len());
+    let ell = layout.ell;
+    assert!(ell >= 7, "witness must have at least 7 variables");
+    let n = ell - 7;
+    let mut packed = vec![ZERO; 1usize << n];
+    {
+        let pieces = pack_pieces_split(layout, 0, tables, split);
+        pack_by_pieces(&pieces, tables, &mut packed);
+    }
+    let stmt = PcsStatement {
+        root: [0u8; 32],
+        n,
+        k: params.k,
+        domain: params.domain.clone(),
+    };
+    MosaicCommitment {
+        packed,
+        codeword: None,
+        tree: None,
+        stmt,
+        ell,
+    }
+}
+
 /// Commit the Mosaic: `tables[i]` is component `i`'s bit table.
 pub fn commit_mosaic(
     params: &PcsParams,
@@ -323,8 +364,8 @@ pub fn commit_mosaic_split(
     };
     MosaicCommitment {
         packed,
-        codeword,
-        tree,
+        codeword: Some(codeword),
+        tree: Some(tree),
         stmt,
         ell,
     }
@@ -351,6 +392,11 @@ pub struct MosaicProof {
     pub zk_offset: Gf128,
     /// The ring-switch discharge at the chunk rate (plain proofs).
     pub ring: Option<RingProof>,
+    /// The **split** ring switch (segments > 1): the per-segment
+    /// commitment trees — the merged `(P, C)` cells, the root layers,
+    /// and the shared upper levels. Replaces `ring` whenever the
+    /// discharge spans multiple tree-IVC segments.
+    pub split_ring: Option<SplitRingProof>,
     /// The dual-rate wrap (roadmap H2): when present, the deep-rate
     /// discharge REPLACES the chunk-rate ring switch — the public
     /// artifact's evaluation tail carries the deep rate's 14 queries.
@@ -418,11 +464,15 @@ pub fn prove_mosaic_hier(
         r_bit_arr[j] = r_star[ell_s - 7 + j];
     }
     let _pt_ring = crate::protocol::PhaseTimer::new("7c-ring-switch");
-    let (ring, wrap) = match deep {
+    let (ring, split_ring, wrap) = match deep {
         Some(deep_params) => {
+            assert!(
+                segments == 1,
+                "the dual-rate wrap requires a single instance (the split path is the streaming discharge)"
+            );
             let w = crate::wrap::prove_wrap(
                 deep_params,
-                &cm.tree,
+                cm.tree.as_ref().expect("monolithic commitment"),
                 &cm.stmt.domain,
                 &cm.packed,
                 &r_block,
@@ -430,21 +480,35 @@ pub fn prove_mosaic_hier(
                 terminal,
                 t,
             );
-            (None, Some(w))
+            (None, None, Some(w))
         }
-        None => (
-            Some(prove_ring_switch(
-                params,
-                &cm.codeword,
-                &cm.tree,
-                &cm.packed,
-                &r_block,
-                &r_bit_arr,
-                terminal,
-                t,
-            )),
-            None,
-        ),
+        None => {
+            if segments > 1 {
+                // The split ring: the per-segment commitment trees.
+                let n_s = per.ell - 7;
+                let sigma = segments.trailing_zeros() as usize;
+                let geo = SplitGeometry::new(n_s, sigma, params.k);
+                let sp = prove_ring_switch_split(
+                    params, geo, &cm.packed, &r_block, &r_bit_arr, terminal, t,
+                );
+                (None, Some(sp), None)
+            } else {
+                (
+                    Some(prove_ring_switch(
+                        params,
+                        cm.codeword.as_ref().expect("monolithic codeword"),
+                        cm.tree.as_ref().expect("monolithic tree"),
+                        &cm.packed,
+                        &r_block,
+                        &r_bit_arr,
+                        terminal,
+                        t,
+                    )),
+                    None,
+                    None,
+                )
+            }
+        }
     };
     MosaicProof {
         local_rounds: body.local_rounds,
@@ -453,6 +517,7 @@ pub fn prove_mosaic_hier(
         terminal,
         zk_offset: body.zk_offset,
         ring,
+        split_ring,
         wrap,
     }
 }
@@ -505,8 +570,8 @@ pub fn verify_mosaic_hier(
     for j in 0..7 {
         r_bit_arr[j] = r_star[ell_s - 7 + j];
     }
-    match (&proof.ring, &proof.wrap) {
-        (Some(ring), None) => verify_ring_switch(
+    match (&proof.ring, &proof.split_ring, &proof.wrap) {
+        (Some(ring), None, None) => verify_ring_switch(
             cm_stmt,
             params,
             &r_block,
@@ -515,10 +580,19 @@ pub fn verify_mosaic_hier(
             ring,
             t,
         ),
-        (None, Some(wrap)) => {
+        (None, Some(split), None) => {
+            if segments == 1 {
+                return Err("mosaic: split ring requires multiple segments");
+            }
+            let n_s = per.ell - 7;
+            let sigma = segments.trailing_zeros() as usize;
+            let geo = SplitGeometry::new(n_s, sigma, params.k);
+            verify_ring_switch_split(params, geo, &r_block, &r_bit_arr, proof.terminal, split, t)
+        }
+        (None, None, Some(wrap)) => {
             crate::wrap::verify_wrap(cm_stmt, &r_block, &r_bit_arr, proof.terminal, wrap, t)
         }
-        _ => Err("mosaic: exactly one of ring/wrap must be present"),
+        _ => Err("mosaic: exactly one of ring/split-ring/wrap must be present"),
     }
 }
 

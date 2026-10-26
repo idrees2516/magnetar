@@ -409,7 +409,7 @@ impl WitnessData {
     /// Witness bit `(u, col)` of the w-half as a field element.
     pub fn wbit(&self, u: usize, col: usize) -> Gf128 {
         let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
-        Gf128(((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1) as u128)
+        Gf128((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1)
     }
 
     pub fn w_packed(&self) -> &[u128] {
@@ -636,7 +636,7 @@ pub fn prove_inner(
         b_fld: pk.circuit.b_fld.clone(),
         c_fld: pk.circuit.c_fld.clone(),
     };
-    let _pt = PhaseTimer::new("3a-virtual-spartan");
+    let _pt = AccumTimer::new("3a-virtual-spartan");
     // Column bit-ness of `z = (w, 1, x)`: the w-half and the 1-column are
     // bits; the public x columns hold packed words (output + inputs) and
     // stay generic. This is what makes the select-based application and
@@ -668,7 +668,7 @@ pub fn prove_inner(
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
-    let _pt = PhaseTimer::new("3b-reg-twist");
+    let _pt = AccumTimer::new("3b-reg-twist");
     let (reg_proof, reg_twist_claims) = prove_twist(&reg_inst, &wd.reg_wit, t);
     drop(_pt);
     // The register-index Ψ-sum-checks (read 1, read 2, write).
@@ -751,7 +751,7 @@ pub fn prove_inner(
         r_val: r_val.clone(),
         r_cycle: r_inst.clone(),
     };
-    let _pt = PhaseTimer::new("3c-ram-twist");
+    let _pt = AccumTimer::new("3c-ram-twist");
     let (ram_proof, ram_twist_claims) = prove_twist(&ram_inst, &wd.ram_wit, t);
     drop(_pt);
     // The RAM address Ψ-sum-checks (read, write) — checked against the
@@ -813,7 +813,7 @@ pub fn prove_inner(
         offset_bits: Vec::new(),
     };
     let shift_claim = seg("shift-out").value;
-    let _pt = PhaseTimer::new("4a-shift-router");
+    let _pt = AccumTimer::new("4a-shift-router");
     let shift_router = prove_routing_join(
         &shift_layout,
         shift_claim,
@@ -882,7 +882,7 @@ pub fn prove_inner(
     };
     // The output claim: the Inc claim at the verifier-sampled point.
     let (r_inc_o, r_inc_j) = inc_point.split_at(6);
-    let _pt = PhaseTimer::new("4b-store-router");
+    let _pt = AccumTimer::new("4b-store-router");
     let store_router = prove_routing_join(
         &store_layout,
         inc_claim,
@@ -944,7 +944,7 @@ pub fn prove_inner(
         pc_r_local: r_local3.clone(),
         pc_claim: seg("pc").value,
     };
-    let _pt = PhaseTimer::new("5-bus-shout");
+    let _pt = AccumTimer::new("5-bus-shout");
     let (bus_shout, bus_shout_claims) =
         prove_bus_shout(&bus_spec, std::slice::from_ref(&wd.fetch_comp), t);
     drop(_pt);
@@ -1244,6 +1244,84 @@ impl Drop for PhaseTimer {
                 self.start.elapsed().as_secs_f64() * 1e3
             );
         }
+    }
+}
+
+/// The **aggregating** phase timer — the `MAGNETAR_TIME` split at scale.
+///
+/// The per-instance phases (a streaming run's `segments` hierarchical
+/// discharges, every segment's `prove_inner` phases) fire once per
+/// instance; printing each drop is spam at 64+ segments and hides the
+/// totals. `AccumTimer` accumulates `(total wall ms, count)` per label in
+/// a process-global registry; the harness prints the table once per run
+/// with [`print_phase_totals`] and clears it with [`reset_phase_totals`].
+pub struct AccumTimer {
+    label: &'static str,
+    start: std::time::Instant,
+}
+
+impl AccumTimer {
+    pub fn new(label: &'static str) -> Self {
+        AccumTimer {
+            label,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for AccumTimer {
+    fn drop(&mut self) {
+        let ms = self.start.elapsed().as_secs_f64() * 1e3;
+        accum_add(self.label, ms);
+    }
+}
+
+type AccumEntry = (&'static str, f64, u64);
+
+fn accum_registry() -> &'static std::sync::Mutex<Vec<AccumEntry>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<Vec<AccumEntry>>> = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn accum_add(label: &'static str, ms: f64) {
+    let mut reg = accum_registry().lock().expect("phase registry");
+    for e in reg.iter_mut() {
+        if e.0 == label {
+            e.1 += ms;
+            e.2 += 1;
+            return;
+        }
+    }
+    reg.push((label, ms, 1));
+}
+
+/// Clear the accumulated phase totals (call at the start of a measured
+/// run so consecutive runs in one process don't mix).
+pub fn reset_phase_totals() {
+    accum_registry().lock().expect("phase registry").clear();
+}
+
+/// Print the accumulated per-label totals (wall ms + fire count), sorted
+/// by descending total. No-op without `MAGNETAR_TIME`.
+pub fn print_phase_totals(header: &str) {
+    if std::env::var_os("MAGNETAR_TIME").is_none() {
+        return;
+    }
+    let reg = accum_registry().lock().expect("phase registry");
+    if reg.is_empty() {
+        return;
+    }
+    let mut rows: Vec<AccumEntry> = reg.clone();
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    eprintln!("[time] ==== accumulated phases: {header} ====");
+    for (label, ms, count) in rows {
+        eprintln!(
+            "[time] {:<24} {:>10.1} ms total  {:>6} fires  {:>8.2} ms/fire",
+            label,
+            ms,
+            count,
+            ms / count as f64
+        );
     }
 }
 

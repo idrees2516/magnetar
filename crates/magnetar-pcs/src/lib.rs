@@ -58,6 +58,7 @@
 pub mod code;
 pub mod eval;
 pub mod ring;
+pub mod ring_split;
 
 pub use code::{CodeParams, Codeword};
 pub use eval::{
@@ -65,6 +66,9 @@ pub use eval::{
     PcsStatement,
 };
 pub use ring::{prove_ring_switch, verify_ring_switch, RingProof};
+pub use ring_split::{
+    prove_ring_switch_split, verify_ring_switch_split, SplitGeometry, SplitRingProof,
+};
 
 use magnetar_field::Gf128;
 

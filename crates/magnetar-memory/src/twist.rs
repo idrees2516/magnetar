@@ -16,6 +16,7 @@
 use crate::claims::{PcsPoint, TwistPcsClaims};
 use crate::linear::{addr_bits, prove_port_linear, suffix_sums, TwistShared};
 use crate::{AddressComponent, OneHotProof};
+#[allow(unused_imports)] // ZERO: used by the cfg(test) helpers below
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
 use magnetar_sumcheck::{

@@ -171,10 +171,29 @@ fn main() {
     // ---- The streaming prover (the large scales). ----
     println!("\nStreaming parallel prover (checkpoints -> rayon segments -> shared root):");
     println!(
-        "{:>7} {:>4} {:>10} {:>10} {:>12} {:>10} {:>10} {:>9}",
-        "T", "segs", "prove(ms)", "peakRSS", "cycles/s", "tx/s", "ckpt(ms)", "root(ms)"
+        "{:>7} {:>4} {:>10} {:>10} {:>12} {:>10} {:>9} | {:>9} {:>9} {:>9}",
+        "T",
+        "segs",
+        "prove(ms)",
+        "peakRSS",
+        "cycles/s",
+        "tx/s",
+        "ckpt(ms)",
+        "root(ms)",
+        "cpuRoot",
+        "cpu/seg"
     );
-    for log2_t in [13usize, 14, 15, 16].iter().filter(|t| **t <= max_log2) {
+    for log2_t in [13usize, 14, 15, 16, 17, 18, 19, 20, 21]
+        .iter()
+        .filter(|t| {
+            **t <= max_log2
+                && **t
+                    >= std::env::var("MAGNETAR_MIN_LOG2")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(13)
+        })
+    {
         let total = 1usize << log2_t;
         let n_tx = total / CYCLES_PER_TX;
         let prog = erc20_program(n_tx as u32);
@@ -183,14 +202,9 @@ fn main() {
         let out = trace.final_state.output;
         let expect = 1_000_000u64 - 7 * (n_tx as u64 - n_tx as u64 / 16);
         assert_eq!(out, expect, "the from-balance after {n_tx} mixed transfers");
-        // Adaptive ladder: 2^10-cycle segments above 2^13 total.
-        let segments = if total >= (1usize << 13) {
-            total / (1usize << 10)
-        } else {
-            1
-        }
-        .clamp(1, 128)
-        .next_power_of_two();
+        // Adaptive ladder: bigger segments at scale (the per-segment
+        // fixed-cost amortization), overridable with MAGNETAR_SEG_LOG2.
+        let segments = magnetar_ivc::streaming::segment_count(total);
         let t0 = Instant::now();
         let (proof, stats) = magnetar_ivc::prove_ivc_streaming(
             &prog,
@@ -201,10 +215,22 @@ fn main() {
             &PcsParams::default(),
         );
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("MAGNETAR_RSS").is_some() {
+            eprintln!(
+                "[rss] before-verify      {:>8.0} MiB",
+                magnetar_ivc::peak_rss_bytes() as f64 / 1048576.0
+            );
+        }
         let ok = magnetar_ivc::verify_ivc(&prog, &input, out, total, &proof, &PcsParams::default());
+        if std::env::var_os("MAGNETAR_RSS").is_some() {
+            eprintln!(
+                "[rss] after-verify       {:>8.0} MiB",
+                magnetar_ivc::peak_rss_bytes() as f64 / 1048576.0
+            );
+        }
         assert!(ok.is_ok(), "erc20 streaming at T=2^{log2_t} must verify");
         println!(
-            "{:>7} {:>4} {:>10.0} {:>9.0}M {:>12.0} {:>10.0} {:>10.0} {:>9.0}",
+            "{:>7} {:>4} {:>10.0} {:>9.0}M {:>12.0} {:>10.0} {:>9.0} | {:>9.0} {:>9.0} {:>9.1}",
             format!("2^{log2_t}"),
             segments,
             prove_ms,
@@ -212,7 +238,9 @@ fn main() {
             total as f64 / (prove_ms / 1e3),
             n_tx as f64 / (prove_ms / 1e3),
             stats.wall_checkpoints.as_secs_f64() * 1e3,
-            stats.wall_root.as_secs_f64() * 1e3
+            stats.wall_root.as_secs_f64() * 1e3,
+            stats.cpu_root,
+            stats.cpu_segments / segments as f64,
         );
     }
 }

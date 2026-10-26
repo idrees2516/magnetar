@@ -53,7 +53,9 @@ use magnetar_cpu::interp::{execute, pad_records, Trace};
 use magnetar_cpu::Word;
 use magnetar_hash::Transcript;
 use magnetar_pcs::PcsParams;
-use magnetar_zkvm::mosaic::{commit_mosaic_split, prove_mosaic_hier, verify_mosaic_hier};
+use magnetar_zkvm::mosaic::{
+    commit_mosaic_split, pack_mosaic_split, prove_mosaic_hier, verify_mosaic_hier,
+};
 use magnetar_zkvm::{
     build_segment, keygen_with, prove_inner, verify_inner, Boundary, InnerProof, KeyGen,
     MosaicClaim, MosaicLayout, MosaicProof, PublicInput, SegmentStatement, AMOUNT_BITS,
@@ -280,7 +282,14 @@ pub fn prove_ivc(
     // stage — the bounded-memory root).
     let per = per_segment_layout(&pk);
     let combined = combined_layout(&pk, segments);
-    let commitment = commit_mosaic_split(pcs, &combined, per.ell - 7, &tables);
+    let commitment = if segments == 1 {
+        commit_mosaic_split(pcs, &combined, per.ell - 7, &tables)
+    } else {
+        // The split-ring root: the per-segment commitment trees live
+        // inside the discharge — the combined codeword/tree are never
+        // materialized.
+        pack_mosaic_split(pcs, &combined, per.ell - 7, &tables)
+    };
     let mut t = Transcript::new(
         "magnetar-ivc",
         &[
@@ -300,7 +309,11 @@ pub fn prove_ivc(
     for (s, d) in digests.iter().enumerate() {
         t.absorb_digest(&format!("seg-digest-{s}"), d);
     }
-    t.absorb_digest("cm-g", &commitment.stmt.root);
+    // The multi-segment root binds its commitment through the split
+    // ring's `ring-root-0` (inside the discharge).
+    if segments == 1 {
+        t.absorb_digest("cm-g", &commitment.stmt.root);
+    }
     let mosaic = prove_mosaic_hier(
         pcs,
         &per,
@@ -311,11 +324,20 @@ pub fn prove_ivc(
         None,
         &mut t,
     );
+    let commitment_root = if segments == 1 {
+        commitment.stmt.root
+    } else {
+        mosaic
+            .split_ring
+            .as_ref()
+            .expect("multi-segment roots carry the split ring")
+            .level_roots[0]
+    };
     IvcProof {
         statements,
         inners,
         segment_digests: digests,
-        commitment_root: commitment.stmt.root,
+        commitment_root,
         pcs_n: commitment.stmt.n,
         pcs_k: commitment.stmt.k,
         pcs_domain: commitment.stmt.domain,
@@ -437,7 +459,22 @@ pub fn verify_ivc(
     for (s, d) in proof.segment_digests.iter().enumerate() {
         t.absorb_digest(&format!("seg-digest-{s}"), d);
     }
-    t.absorb_digest("cm-g", &proof.commitment_root);
+    // The multi-segment root bound its commitment through the split
+    // ring's `ring-root-0` (no separate `cm-g` absorb).
+    if segments == 1 {
+        t.absorb_digest("cm-g", &proof.commitment_root);
+    } else {
+        // Cross-check the proof's commitment root against the split
+        // ring's merged level-0 root.
+        let split = proof
+            .mosaic
+            .split_ring
+            .as_ref()
+            .ok_or("ivc: multi-segment proofs carry the split ring")?;
+        if split.level_roots[0] != proof.commitment_root {
+            return Err("ivc: split commitment root mismatch");
+        }
+    }
     verify_mosaic_hier(
         pcs,
         &cm_stmt,

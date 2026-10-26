@@ -37,6 +37,35 @@ use magnetar_sumcheck::{
     BindOrder, SumcheckSpec, Term,
 };
 
+/// A one-shot phase timer (the crate-local copy of the zkvm `PhaseTimer` —
+/// the pcs crate cannot depend on zkvm). `MAGNETAR_TIME=1` prints the
+/// labeled wall time on drop.
+struct PcTimer {
+    enabled: bool,
+    label: &'static str,
+    start: std::time::Instant,
+}
+impl PcTimer {
+    fn new(label: &'static str) -> Self {
+        PcTimer {
+            enabled: std::env::var_os("MAGNETAR_TIME").is_some(),
+            label,
+            start: std::time::Instant::now(),
+        }
+    }
+}
+impl Drop for PcTimer {
+    fn drop(&mut self) {
+        if self.enabled {
+            eprintln!(
+                "[time] {:<24} {:>9.1} ms",
+                self.label,
+                self.start.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+}
+
 /// A ring-switch proof for one bit-vector claim.
 #[derive(Clone, Debug)]
 pub struct RingProof {
@@ -87,9 +116,12 @@ pub fn prove_ring_switch(
     let n = packed.len().trailing_zeros() as usize;
     debug_assert_eq!(r_a.len(), n);
     // 1–2. c coefficients and the c-folded table.
+    let _pt_cf = PcTimer::new("ring-cfold");
     let c = eq_coefficients(r_b);
     let c_table: Vec<Gf128> = packed.iter().map(|&p| phi_c(p, &c)).collect();
+    drop(_pt_cf);
     // 3. Sum-check over the block variables.
+    let _pt_sc = PcTimer::new("ring-sumcheck");
     let spec = SumcheckSpec {
         num_vars: n,
         dense: vec![c_table.clone()],
@@ -110,12 +142,16 @@ pub fn prove_ring_switch(
         challenges.push(prover.absorb_and_fold(t, "ring-eval"));
     }
     let (claims, _) = prover.finish();
+    drop(_pt_sc);
     let terminal_claim = claims[0];
     t.absorb_field("ring-terminal", &[terminal_claim]);
 
     // 4. The C-codeword chain at the same challenges.
+    let _pt_enc = PcTimer::new("ring-encode");
     let code_params = CodeParams::derive(n, params.k, &params.domain);
     let mut cw = Codeword::encode(&code_params, &c_table);
+    drop(_pt_enc);
+    let _pt_chain = PcTimer::new("ring-chain-trees");
     let c_domain = format!("{}/ring", params.domain);
     let mut trees = Vec::with_capacity(n + 1);
     let mut values = Vec::with_capacity(n + 1);
@@ -129,20 +165,24 @@ pub fn prove_ring_switch(
         ));
         values.push(cw.values.clone());
     }
+    drop(_pt_chain);
     let level_roots: Vec<[u8; DIGEST]> = trees.iter().map(|tr| tr.root()).collect();
     for (i, root) in level_roots.iter().enumerate() {
         t.absorb_digest(&format!("ring-root-{i}"), root);
     }
 
     // Correlated queries.
+    let _pt_q = PcTimer::new("ring-queries");
     let base_leaves = trees[0].n_leaves() as u64;
     let mut queries = Vec::with_capacity(params.queries);
     for qi in 0..params.queries {
         let pos = t.challenge_index(&format!("ring-query-{qi}"), base_leaves) as usize;
         queries.push(build_query(&trees, &values, pos));
     }
+    drop(_pt_q);
 
     // Tail.
+    let _pt_tail = PcTimer::new("ring-tail");
     let tail_tree = trees.last().unwrap();
     let tail_vals = values.last().unwrap();
     let tail: Vec<(Gf128, Vec<[u8; DIGEST]>)> = (0..tail_tree.n_leaves())
@@ -151,8 +191,10 @@ pub fn prove_ring_switch(
             (tail_vals[i], path)
         })
         .collect();
+    drop(_pt_tail);
 
     // Anchors: q random cube positions.
+    let _pt_a = PcTimer::new("ring-anchors");
     let mut anchors = Vec::with_capacity(params.queries);
     for ai in 0..params.queries {
         let x = t.challenge_index(&format!("ring-anchor-{ai}"), 1u64 << n) as usize;
@@ -167,6 +209,7 @@ pub fn prove_ring_switch(
             c_path,
         });
     }
+    drop(_pt_a);
 
     RingProof {
         rounds,

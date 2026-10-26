@@ -78,6 +78,12 @@ pub struct StreamingStats {
     pub checkpoint_bytes: usize,
     /// Number of rayon threads that ran the segment phase.
     pub threads: usize,
+    /// Process CPU time (user+sys, ms) spent in the checkpoint phase.
+    pub cpu_checkpoints: f64,
+    /// Process CPU time (ms) spent in the parallel segment phase.
+    pub cpu_segments: f64,
+    /// Process CPU time (ms) spent in the root phase.
+    pub cpu_root: f64,
 }
 
 /// The current peak RSS (Linux `VmHWM`; 0 where unavailable).
@@ -102,6 +108,60 @@ pub fn peak_rss_bytes() -> u64 {
     }
 }
 
+/// The process CPU time (user + sys) in milliseconds — the CPU-ms axis
+/// of the profile (`MAGNETAR_TIME`'s companion; 0 where unavailable).
+pub fn cpu_ms() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| {
+                // Field 14 = utime, 15 = stime (clock ticks after the comm
+                // field in parens — parse from the closing paren).
+                let rest = s.rsplit_once(')')?.1;
+                let mut it = rest.split_whitespace();
+                let _state = it.next()?;
+                let _ppid = it.next()?;
+                let _pgrp = it.next()?;
+                let _session = it.next()?;
+                let _tty = it.next()?;
+                let _tpgid = it.next()?;
+                let _flags = it.next()?;
+                let _minflt = it.next()?;
+                let _cminflt = it.next()?;
+                let _majflt = it.next()?;
+                let _cmajflt = it.next()?;
+                let utime: u64 = it.next()?.parse().ok()?;
+                let stime: u64 = it.next()?.parse().ok()?;
+                // CLK_TCK = 100 → ms = ticks × (1000 / 100).
+                Some((utime + stime) as f64 * 10.0)
+            })
+            .unwrap_or(0.0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0.0
+    }
+}
+
+/// The adaptive segment count for a streaming run of `total` cycles: at
+/// most `2^13` cycles per segment (the per-worker envelope on an 8-GiB
+/// AVX-512 host), at least `2^10`, chosen so small scales keep ~8
+/// segments. `MAGNETAR_SEG_LOG2=<log2>` overrides the per-segment cycle
+/// count (the benchmark knob for the per-segment fixed-cost amortization
+/// study).
+pub fn segment_count(total: usize) -> usize {
+    let log2_t = total.trailing_zeros() as usize;
+    let seg_log2 = match std::env::var("MAGNETAR_SEG_LOG2")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(v) => v.clamp(8, 20),
+        None => log2_t.saturating_sub(3).clamp(10, 13),
+    };
+    (total >> seg_log2).max(1)
+}
+
 /// The boundary state at checkpoint `s`, in the exact shape
 /// [`crate::prove_ivc`]'s `boundary_at` replay produces: registers, RAM
 /// and the halt latch evolve identically under `step`/`frozen_record`
@@ -114,6 +174,35 @@ fn boundary_of(cursor: &StreamCursor) -> Boundary {
         pc: cursor.st.micro_pc,
         halted: cursor.st.halted,
         ram: cursor.st.ram.clone(),
+    }
+}
+
+fn rss_now() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| {
+                s.split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse::<u64>().ok())
+            })
+            .map(|pages| pages * 4096)
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+fn trace_rss(tag: &str) {
+    if std::env::var_os("MAGNETAR_RSS").is_some() {
+        eprintln!(
+            "[rss] {:<24} {:>8.0} MiB",
+            tag,
+            rss_now() as f64 / 1048576.0
+        );
     }
 }
 
@@ -131,6 +220,8 @@ pub fn prove_ivc_streaming(
     pcs: &magnetar_pcs::PcsParams,
 ) -> (crate::IvcProof, StreamingStats) {
     let t_total = Instant::now();
+    magnetar_zkvm::reset_phase_totals();
+    let cpu_total0 = cpu_ms();
     assert!(segments.is_power_of_two() && segments >= 1);
     assert!(total_len.is_power_of_two());
     let seg_len = total_len / segments;
@@ -157,6 +248,7 @@ pub fn prove_ivc_streaming(
         "execution output mismatch"
     );
     let wall_checkpoints = t0.elapsed();
+    let cpu_checkpoints = cpu_ms() - cpu_total0;
     let checkpoint_bytes = checkpoints.len()
         * (std::mem::size_of::<Word>() * magnetar_cpu::REGS
             + std::mem::size_of::<Word>() * (1usize << magnetar_cpu::RAM_WORDS_LOG2)
@@ -171,6 +263,7 @@ pub fn prove_ivc_streaming(
 
     // ---- Phase 2: the parallel segment proofs + streaming pack. ----
     let t1 = Instant::now();
+    let cpu_phase1 = cpu_ms();
     let __phase0 = t1;
     let mut packed = vec![magnetar_field::ZERO; 1usize << n];
     // The pack OR-slices share leaf words across segments, so the slice
@@ -282,6 +375,8 @@ pub fn prove_ivc_streaming(
         })
         .collect();
     let wall_segments = t1.elapsed();
+    let cpu_segments = cpu_ms() - cpu_phase1;
+    trace_rss("after-segments");
 
     // Order the workers' results by segment (par_iter completion order).
     let mut ordered: Vec<_> = results;
@@ -300,15 +395,28 @@ pub fn prove_ivc_streaming(
 
     // ---- Phase 3: the root — one commitment, one discharge. ----
     let t2 = Instant::now();
-    let _pt_enc = magnetar_zkvm::PhaseTimer::new("root-encode");
-    let code_params = CodeParams::derive(n, pcs.k, &pcs.domain);
-    let codeword = magnetar_pcs::code::Codeword::encode(&code_params, &packed);
-    drop(_pt_enc);
-    let _pt_mkl = magnetar_zkvm::PhaseTimer::new("root-merkle");
-    let tree = MerkleTree::build(&format!("{}/level/0", pcs.domain), &codeword.values);
-    drop(_pt_mkl);
+    let cpu_phase2 = cpu_ms();
+    trace_rss("root-start");
+    // The combined codeword + tree exist only for the single-segment
+    // root (the monolithic-shaped small scales); the multi-segment
+    // root's commitment is the **split ring's** per-segment trees
+    // (`level_roots[0]`), built streaming inside the discharge — the
+    // `O(2^n)` codeword/tree materialization is gone.
+    let (codeword, tree, cm_root) = if segments == 1 {
+        let _pt_enc = magnetar_zkvm::PhaseTimer::new("root-encode");
+        let code_params = CodeParams::derive(n, pcs.k, &pcs.domain);
+        let cw = magnetar_pcs::code::Codeword::encode(&code_params, &packed);
+        drop(_pt_enc);
+        let _pt_mkl = magnetar_zkvm::PhaseTimer::new("root-merkle");
+        let tr = MerkleTree::build(&format!("{}/level/0", pcs.domain), &cw.values);
+        drop(_pt_mkl);
+        let root = tr.root();
+        (Some(cw), Some(tr), root)
+    } else {
+        (None, None, [0u8; 32])
+    };
     let stmt = PcsStatement {
-        root: tree.root(),
+        root: cm_root,
         n,
         k: pcs.k,
         domain: pcs.domain.clone(),
@@ -332,7 +440,12 @@ pub fn prove_ivc_streaming(
     for (s, d) in digests.iter().enumerate() {
         t.absorb_digest(&format!("seg-digest-{s}"), d);
     }
-    t.absorb_digest("cm-g", &stmt.root);
+    // The multi-segment root binds its commitment through the split
+    // ring's `ring-root-0` (absorbed inside the discharge, after the
+    // hierarchical body's challenges — before any opening).
+    if segments == 1 {
+        t.absorb_digest("cm-g", &stmt.root);
+    }
     let commitment = magnetar_zkvm::MosaicCommitment {
         packed,
         codeword,
@@ -341,6 +454,7 @@ pub fn prove_ivc_streaming(
         ell: combined.ell,
     };
     let _pt_mos = magnetar_zkvm::PhaseTimer::new("root-mosaic-hier");
+    trace_rss("before-hier");
     let mosaic = prove_mosaic_hier(
         pcs,
         &per,
@@ -352,8 +466,27 @@ pub fn prove_ivc_streaming(
         &mut t,
     );
     drop(_pt_mos);
+    trace_rss("after-hier-ring");
     let wall_root = t2.elapsed();
+    let cpu_root = cpu_ms() - cpu_phase2;
+    magnetar_zkvm::print_phase_totals(&format!(
+        "T=2^{} segs={} ({} x 2^{} cycles)",
+        total_len.trailing_zeros(),
+        segments,
+        segments,
+        seg_len.trailing_zeros()
+    ));
 
+    // The split root's commitment root = the merged level-0 root.
+    let commitment_root = if segments == 1 {
+        commitment.stmt.root
+    } else {
+        mosaic
+            .split_ring
+            .as_ref()
+            .expect("multi-segment roots carry the split ring")
+            .level_roots[0]
+    };
     let stats = StreamingStats {
         wall_checkpoints,
         wall_segments,
@@ -361,16 +494,23 @@ pub fn prove_ivc_streaming(
         wall_total: t_total.elapsed(),
         peak_rss_bytes: peak_rss_bytes(),
         packed_bytes: (1usize << n) * 16,
-        codeword_bytes: commitment.codeword.values.len() * 16,
+        codeword_bytes: commitment
+            .codeword
+            .as_ref()
+            .map(|cw| cw.values.len() * 16)
+            .unwrap_or(0),
         segment_table_bytes: max_tables.load(Ordering::Relaxed),
         checkpoint_bytes,
         threads: rayon::current_num_threads(),
+        cpu_checkpoints,
+        cpu_segments,
+        cpu_root,
     };
     let proof = crate::IvcProof {
         statements,
         inners,
         segment_digests: digests,
-        commitment_root: commitment.stmt.root,
+        commitment_root,
         pcs_n: commitment.stmt.n,
         pcs_k: commitment.stmt.k,
         pcs_domain: commitment.stmt.domain.clone(),
