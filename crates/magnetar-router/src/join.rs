@@ -162,17 +162,17 @@ pub(crate) struct JoinTimer(Option<(std::time::Instant, &'static str)>);
 
 impl JoinTimer {
     pub(crate) fn new(label: &'static str) -> Self {
-        JoinTimer(
-            std::env::var_os("MAGNETAR_TIME")
-                .map(|_| (std::time::Instant::now(), label)),
-        )
+        JoinTimer(std::env::var_os("MAGNETAR_TIME").map(|_| (std::time::Instant::now(), label)))
     }
 }
 
 impl Drop for JoinTimer {
     fn drop(&mut self) {
         if let Some((t0, label)) = self.0.take() {
-            eprintln!("[time] {label:<24} {:7.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "[time] {label:<24} {:7.1} ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
         }
     }
 }

@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.9.3 — the fw-bound-se group-fold attack + the transient-eq unlock + the 2^13-cycle operating point
+
+The biggest measured root lever of the 0.9.2 anatomy (the `fw-bound-se`
+group-fold, ~19 ms per segment, ~30% of the root's local stages) plus
+the lockstep-memory unlock that opened the single-machine 2^19–2^20
+range, plus the streaming operating point that amortizes the root's
+per-instance fixed costs.
+
+### The group-fold attack (magnetar-field `eq.rs` + magnetar-zkvm `discharge.rs`)
+- **`eq_build_fused`/`eq_build_fused_into`**: the transient fused
+  eq-table build — half the multiplications of the reference
+  `EqBits::build` (the broadcast-multiply + XOR doubling), two reusable
+  ping-pong buffers with the in-place DESCENDING interleaved doubling
+  (position `i` is read at iteration `i` and written at `i/2`, which
+  runs later — no clobber), zero per-level allocations. Unit-gated
+  byte-identical to the reference.
+- **Transient group eq tables**: rebuilt fused at the word fold and
+  again at the scatter, never resident on the lockstep state — the
+  per-instance steady memory drops from `O(Σ 2^{free_i})` (~12 MiB at
+  the 2^10-cycle shape) to `O(items)`. The lockstep holds every
+  instance simultaneously, so this is the single-machine 2^19+ unlock:
+  the 2^16 peak RSS fell 1.37 GiB → 838 MiB, and 2^19 (3.63 GiB) / 2^20
+  (7.06 GiB) now fit the 8-GiB production host.
+- **The bound-SumEq scatter rewrite**: per-(group,plane) HOISTED member
+  sums `S_p = Σ pe_m` (one broadcast multiply-accumulate instead of one
+  multiplication per member per word), the group's CONTIGUOUS support
+  `[base, base+2^fw)` walked directly by the fused VPCLMULQDQ `axpy_run`
+  (the first version scanned the whole `2^{word_bits}` plane block and
+  filtered), and the identity groups size-sorted across per-worker
+  `stride` accumulators that XOR-merge (GF(2^128) adds commute —
+  byte-identical output, verified by the generic-engine cross-check,
+  the brute-force monomial fold, and the streaming IVC roundtrip).
+- Measured: the whole discharge construction at 2^12 monolithic
+  ~102 ms (66.9 + ~35 hidden) → 62 ms; the per-instance shape
+  24.0 → 14.0 ms on the 2-vCPU dev container.
+
+### The 2^13-cycle operating point (magnetar-cli benches)
+- The streaming ladder only ever tested ≤ 2^10-cycle segments; the
+  root's per-instance discharge machinery costs ~33 ms wall per
+  instance REGARDLESS of the instance's size, so longer segments
+  amortize it — measured at 2^18: 17,719 vs 4,341 cycles/s. The
+  erc20 bench's old `clamp(1, 128)` would also have grown the
+  per-worker envelope to 2^17-cycle segments at 2^24 (dangerous); the
+  ladders now floor at 2^12/2^13-cycle segments and the erc20 ladder
+  extends to 2^24 (`<MAX_LOG2> <MIN_STREAM_LOG2>`).
+- The join prover gains `MAGNETAR_TIME` phase timers
+  (`jr-extract/a/xo2/o/h/u/j`); `jr-extract`'s strided selector scan
+  is the documented next lever.
+
+### The measured ladder (the InstaBox 4-vCPU AVX-512 host, every row proved AND verified)
+- `erc20-mixed-block`: 2^16 3.82 s = 17,153 cycles/s = **1,429 tx/s**
+  (the session start on this machine: 5.83 s, 936 tx/s, 1.37 GiB);
+  2^17 8.89 s = 14,743; 2^18 17.8 s = 14,719; 2^19 47.3 s = 11,079,
+  3.63 GiB. The alu ladder: 2^17 19,142; 2^18 17,719; 2^19 14,545;
+  **2^20 116.2 s = 9,021 cycles/s, 7.06 GiB** — the measured
+  single-machine streaming envelope (2^21+ needs the per-segment
+  commitment trees, the documented next structural lever; the pooled
+  2^23/2^24 demonstrations stand at 3,330/3,495 tx/s sustained).
+
 ## 0.9.2 — the three-lever pass + the pooled operating point
 
 The three measured levers of the 0.9.1 anatomy (the twists' packed-inc
