@@ -1,5 +1,174 @@
 # Changelog
 
+## 0.9.3 — the fw-bound-se group-fold attack + the transient-eq unlock + the 2^13-cycle operating point
+
+The biggest measured root lever of the 0.9.2 anatomy (the `fw-bound-se`
+group-fold, ~19 ms per segment, ~30% of the root's local stages) plus
+the lockstep-memory unlock that opened the single-machine 2^19–2^20
+range, plus the streaming operating point that amortizes the root's
+per-instance fixed costs.
+
+### The group-fold attack (magnetar-field `eq.rs` + magnetar-zkvm `discharge.rs`)
+- **`eq_build_fused`/`eq_build_fused_into`**: the transient fused
+  eq-table build — half the multiplications of the reference
+  `EqBits::build` (the broadcast-multiply + XOR doubling), two reusable
+  ping-pong buffers with the in-place DESCENDING interleaved doubling
+  (position `i` is read at iteration `i` and written at `i/2`, which
+  runs later — no clobber), zero per-level allocations. Unit-gated
+  byte-identical to the reference.
+- **Transient group eq tables**: rebuilt fused at the word fold and
+  again at the scatter, never resident on the lockstep state — the
+  per-instance steady memory drops from `O(Σ 2^{free_i})` (~12 MiB at
+  the 2^10-cycle shape) to `O(items)`. The lockstep holds every
+  instance simultaneously, so this is the single-machine 2^19+ unlock:
+  the 2^16 peak RSS fell 1.37 GiB → 838 MiB, and 2^19 (3.63 GiB) / 2^20
+  (7.06 GiB) now fit the 8-GiB production host.
+- **The bound-SumEq scatter rewrite**: per-(group,plane) HOISTED member
+  sums `S_p = Σ pe_m` (one broadcast multiply-accumulate instead of one
+  multiplication per member per word), the group's CONTIGUOUS support
+  `[base, base+2^fw)` walked directly by the fused VPCLMULQDQ `axpy_run`
+  (the first version scanned the whole `2^{word_bits}` plane block and
+  filtered), and the identity groups size-sorted across per-worker
+  `stride` accumulators that XOR-merge (GF(2^128) adds commute —
+  byte-identical output, verified by the generic-engine cross-check,
+  the brute-force monomial fold, and the streaming IVC roundtrip).
+- Measured: the whole discharge construction at 2^12 monolithic
+  ~102 ms (66.9 + ~35 hidden) → 62 ms; the per-instance shape
+  24.0 → 14.0 ms on the 2-vCPU dev container.
+
+### The 2^13-cycle operating point (magnetar-cli benches)
+- The streaming ladder only ever tested ≤ 2^10-cycle segments; the
+  root's per-instance discharge machinery costs ~33 ms wall per
+  instance REGARDLESS of the instance's size, so longer segments
+  amortize it — measured at 2^18: 17,719 vs 4,341 cycles/s. The
+  erc20 bench's old `clamp(1, 128)` would also have grown the
+  per-worker envelope to 2^17-cycle segments at 2^24 (dangerous); the
+  ladders now floor at 2^12/2^13-cycle segments and the erc20 ladder
+  extends to 2^24 (`<MAX_LOG2> <MIN_STREAM_LOG2>`).
+- The join prover gains `MAGNETAR_TIME` phase timers
+  (`jr-extract/a/xo2/o/h/u/j`); `jr-extract`'s strided selector scan
+  is the documented next lever.
+
+### The measured ladder (the InstaBox 4-vCPU AVX-512 host, every row proved AND verified)
+- `erc20-mixed-block`: 2^16 3.82 s = 17,153 cycles/s = **1,429 tx/s**
+  (the session start on this machine: 5.83 s, 936 tx/s, 1.37 GiB);
+  2^17 8.89 s = 14,743; 2^18 17.8 s = 14,719; 2^19 47.3 s = 11,079,
+  3.63 GiB. The alu ladder: 2^17 19,142; 2^18 17,719; 2^19 14,545;
+  **2^20 116.2 s = 9,021 cycles/s, 7.06 GiB** — the measured
+  single-machine streaming envelope (2^21+ needs the per-segment
+  commitment trees, the documented next structural lever; the pooled
+  2^23/2^24 demonstrations stand at 3,330/3,495 tx/s sustained).
+
+## 0.9.2 — the three-lever pass + the pooled operating point
+
+The three measured levers of the 0.9.1 anatomy (the twists' packed-inc
+o-rounds ~420 ms, the store-router join pass ~308 ms, the outer-rounds'
+window pass ~311 ms at 2^13), plus the cpi × pool matrix that flipped
+the default back to `cpi = 1`.
+
+### The levers
+- **The twists' packed-inc select-fold** (magnetar-memory): the port
+  sum-checks' o-rounds never touch the `T·2^ell` increment table — the
+  increments are bits, packed one `u128` per cycle in `TwistShared`;
+  one masked pass per port run builds the per-value-bit dots
+  `D_o = Σ_{u: inc bit o} (WFAEQ·LTW)[u]`, and every round is
+  `O(2^ell)` field ops (`port-o-rounds` 4 ms → 0.0 ms per port run).
+  The reconstruction's increment row is the eq(r_v,·) select over the
+  packed words.
+- **The store-router join select-dots** (magnetar-router): the 0/1
+  routing tensors make the extraction's `tau` XOR-selects of the global
+  `eq_o[o]`, and the o-rounds one-pass per-column `xo2[o]` dots against
+  GLOBAL round weights (the per-pair pref/suffix products are gone;
+  `4b-store-router` 45.4 → 4.4 ms per segment, ~10×). Non-binary
+  tensors keep the generic path — pinned byte-identical by the new
+  `join_matches_sparse_prover_generic_coefs` (every existing suite was
+  binary).
+- **The window's complement-convolution** (magnetar-sumcheck): the
+  small-value round window's one-pass build is GF(2)-bilinear in the
+  two Möbius masks — the sparser of `(m, ~m)` on each side plus three
+  precomputed correction vectors; dense sub-cubes cost ~a dozen word
+  XORs instead of up to 4,096 pair iterations, and the pass no longer
+  serializes strides below `PAR_THRESHOLD` (`vs-win-build` ~26 → 16 ms
+  per segment).
+- `MAGNETAR_TIME` sub-timers for the VS anatomy (`vs-win-build`,
+  `vs-shared-rounds`, `vs-row-rounds-*`) and `examples/window_bench`.
+
+### The measured effect (the same 4-vCPU EPYC host)
+| T | 0.9.1 (cpi 4) | 0.9.2 (cpi 1) | tx/s |
+|---|---|---|---|
+| 2^13 | 546 ms / 15,006 | **470 ms / 17,418** | **1,450** |
+| 2^14 | 1,088 ms / 15,061 | **933 ms / 17,568** | **1,464** |
+| 2^15 | 2,483 ms / 13,198 | **1,990 ms / 16,470** | **1,372** |
+| 2^16 | 4,954 ms / 13,228 | **4,254 ms / 15,405** | **1,284** |
+
+**The cpi × pool matrix** (5 × 4-vCPU instances, 2^16 batches,
+aggregate tx/s): cpi 1 **5,139** / cpi 4 4,585 / cpi 8 4,942 — the
+levers removed the per-instance amortization edge, and the lightest
+per-segment constants degrade least under cross-VM contention:
+`DEFAULT_CPI` returns to **1** with the measurement recorded in
+`WITNESS_LAYOUT`. The batch-shape × pool sweep: **2^13 batches pool
+best — 6,005 tx/s burst** (0.8.0's pool: 3,788). The large-scale pooled
+demonstrations (`magnetar-bench-erc20-pool`): **2^23** — 1,024 × 2^13
+batches = 699,050 transfers, every batch proved AND verified, 210 s
+(≈3,330 tx/s sustained); **2^24** — 2,048 batches = 1,398,100
+transfers, 400 s (≈3,495 tx/s). The single-machine envelope extended
+to 2^18 (the segments phase bounded at 261 MiB; the root's lockstep
+discharge + combined commitment measured as the 2^19+ gate, with the
+unlock path documented). Gate: 169 tests (debug + release), clippy
+clean, fmt clean.
+
+## 0.9.1 — the instance-batching release (the paper's §5.1 operating point)
+
+**`WITNESS_LAYOUT::DEFAULT_CPI = 4` cycles per SIMD instance** — the
+paper's "each SIMD instance covers a fixed number of consecutive
+cycles", as a runtime parameter through `keygen_with` (the benches
+sweep it via `MAGNETAR_CPI`; `cpi = 1` recovers the one-cycle layout
+byte-identically).
+
+### The restructure
+- `InstanceGeometry` (magnetar-cpu): the per-instance column map
+  `col' = cpi·col + δ` — the cycle-within-instance coordinate is the
+  LOW bits, **one variable shared by every segment** (a per-segment δ
+  placement breaks the pc-Ψ and the ram-addr-Ψ at cpi > 1: the
+  auxiliary arguments consume claims of *different* segments against
+  one cycle cube).
+- `build_circuit_batched(cpi)`: both relations' row indexing reshapes
+  over `(δ ‖ row-within-cycle)` blocks; the constraint set is the
+  per-cycle relation replicated — no new rows, the same soundness
+  surface (an assembled instance satisfies the batched circuit iff its
+  cycles satisfy the per-cycle circuit; tested at cpi 1/2/4/8).
+- The segment claims' local point is `[δ-vars ‖ col-vars]`; the cycle
+  point of cycle `u·cpi + δ` is `[δ-vars ‖ instance-vars]` — threaded
+  through the twists, the Ψs, the routers (the X claims reordered into
+  the components' `[δ ‖ bit-index ‖ instance]` convention), the shout,
+  the boundary claims, and the cross-step flags.
+- The Mosaic components keep their total cube (`len·T` bits at every
+  cpi); the direct tables' local index is `col·cpi + δ`.
+- The streaming ladder proves + verifies at cpi 2 and 4 end-to-end.
+
+### The measured effect (4-vCPU EPYC, AVX-512)
+| cpi | 2^13 | 2^14 | 2^15 | 2^16 | root(2^16) |
+|---|---|---|---|---|---|
+| 1 | 15,009 | 14,980 | 13,999 | 12,641 | 1,930 ms |
+| 2 | 14,907 | 14,972 | 14,002 | 12,656 | 1,814 ms |
+| **4** | **15,077** | **15,004** | **14,028** | **13,079** | **1,620 ms** |
+| 8 | 14,825 | 14,475 | 13,645 | 12,700 | 1,658 ms |
+
+The Spartan flop count is cpi-invariant (the joint cube, the applies,
+and the folds are the same total size) — the gain is the per-instance
+discharge work (the local `bound_se` walk) amortizing over 4 cycles;
+at cpi 8 the per-segment inner/m_combo constants already eat it.
+
+### Also in this release
+- The misplaced prover-side honesty debug-assert in the cross-step S1
+  (the tamper tests legitimately prove false claims; the verifier
+  rejects them — release builds compiled it out, which is why the
+  0.9.0 gate missed it on the debug side).
+- The newer toolchain's clippy lints (div_ceil, clamp, late-init,
+  cfg(test) helpers, items-after-test-module) — the gate is
+  `-D warnings` clean again.
+- The word-based witness loads (`wword_cycle`): the 64-bit word fast
+  path at cpi = 1, the strided gather at cpi > 1.
 ## [0.9.0] — the split-ring release (the per-segment commitment trees)
 
 ### Added
@@ -583,3 +752,39 @@ interpreter, the dual SIMD R1CS circuit, and MosaicPCS.
   the streaming Twist, parallelism), the verifier-guest/wrap recursion,
   zero-knowledge, QROM, ISA completeness (LB/LH sign extension, the
   workload suite), and the production-engineering backlog.
+
+## 0.9.0 — the commitment-free ring switch release
+
+- **The Diamond–Posen (ePrint 2024/504) ring switch**: the c-chain
+  redundancy eliminated. The prover sends the 128 per-plane partial
+  evaluations, the verifier checks the recombination and samples the row
+  batch, and the claim discharges through ONE sum-check with the packed
+  table itself as the dense factor and the transparent tensor-algebra
+  factor A — whose correct multilinear extension is the DP24 tensor
+  recursion (the *formula* φ_rb(eq(z,·)) agrees on the Boolean cube but
+  is not multilinear off it; cross-checked against the materialized
+  table's MLE). The main codeword's own fold chain carries the terminal:
+  no second encode, no level-0 C-tree, no c-table, no anchors (~60–90
+  KiB off every proof; the ring phase 1.1 s → ~0.39 s at 2^16).
+- **One-shot Merkle hashing**: every leaf/node digest is a single
+  BLAKE3 update over a pre-serialized buffer with per-tree/per-level
+  prefixes (bit-identity locked by a differential test) — ~2–3× on every
+  tree in the system.
+- **The join prover**: the o-round suffix tables (the per-pair-per-round
+  suffix product → one table per round) and the h-round packed-bit
+  selects (the X columns pack into u64 words once; the contraction is a
+  popcount-driven select) — the store router halved. A store-shape
+  regression (two-word columns + the a-rounds) is pinned in
+  join_seeded_regress.
+- **The per-segment glue**: whole-word witness reads (wword), the
+  store-X claims evaluated directly from the packed words via the
+  tabulated φ, the x/selector tables moved into the join witnesses.
+- **PhiTab**: the tabulated φ_c (32 nibble lookups vs the 128-iteration
+  branch loop) — ~100× on the ring's A-factor materialization.
+- Gate repairs for the current toolchain (the cs-s1 honest-data assert
+  that fired on the adversarial sub-proofs, the 1.99 clippy lints).
+- Measured on the 4-vCPU EPYC host: 2^16 erc20-mixed-block at
+  12,4–13,3k cycles/s = 1,034–1,109 tx/s per machine (was 936), the
+  root 2.34 s → 1.60 s; pooled ~3,788 tx/s across the 5 free-tier
+  instances (the workers are slower hosts with ~35–40% cross-VM
+  contention).

@@ -102,7 +102,13 @@ struct Row {
 
 fn bench_one(workload: &'static str, program: &[u32], log2_t: usize) -> Row {
     let t = 1usize << log2_t;
-    let (pk, vk) = keygen_with(program.to_vec(), t, 2, PcsParams::default());
+    let (pk, vk) = keygen_with(
+        program.to_vec(),
+        t,
+        2,
+        PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+    );
     // Execute once to learn the output.
     let trace = magnetar_cpu::interp::execute(&pk.program, &[], t);
     let out = trace.final_state.output;
@@ -179,7 +185,15 @@ fn main() {
         let ivc_proof = magnetar_ivc::prove_ivc(&prog, &[], out, 1024, 4, &PcsParams::default());
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
         let t1 = Instant::now();
-        let ok = magnetar_ivc::verify_ivc(&prog, &[], out, 1024, &ivc_proof, &PcsParams::default());
+        let ok = magnetar_ivc::verify_ivc(
+            &prog,
+            &[],
+            out,
+            1024,
+            &ivc_proof,
+            &PcsParams::default(),
+            magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+        );
         let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
         assert!(ok.is_ok());
         // The aggregate proof body: the 4 inner arguments + ONE PCS tail.
@@ -290,6 +304,7 @@ fn main() {
                     total,
                     segments,
                     &PcsParams::default(),
+                    magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
                 );
                 // Byte-identical proofs (the checkpoint pipeline is a pure
                 // memory-path change).
@@ -300,7 +315,8 @@ fn main() {
                     out,
                     total,
                     &stream,
-                    &PcsParams::default()
+                    &PcsParams::default(),
+                    magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
                 )
                 .is_ok());
                 let st_ms = stats.wall_total.as_secs_f64() * 1e3;

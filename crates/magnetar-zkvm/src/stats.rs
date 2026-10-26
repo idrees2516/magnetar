@@ -251,9 +251,9 @@ fn count_fields_proof(proof: &Proof) -> (usize, Vec<(String, usize)>) {
 }
 
 fn ring_fields(r: &magnetar_pcs::ring::RingProof) -> usize {
-    // Level roots, the terminal claim, the query levels, the tail with
-    // paths, and the anchors.
-    let mut n = r.level_roots.len() * (32 / 16) + 1;
+    // The partials, level roots, the terminal claim, the query levels,
+    // and the tail with paths.
+    let mut n = r.partials.len() + r.level_roots.len() * (32 / 16) + 1;
     for q in &r.queries {
         for lv in &q.levels {
             n += 2 + (lv.a_path.len() + lv.b_path.len()) * (32 / 16);
@@ -261,9 +261,6 @@ fn ring_fields(r: &magnetar_pcs::ring::RingProof) -> usize {
     }
     for (_v, path) in &r.tail {
         n += 1 + path.len() * (32 / 16);
-    }
-    for a in &r.anchors {
-        n += 1 + (a.main_path.len() + a.c_path.len()) * (32 / 16);
     }
     n
 }

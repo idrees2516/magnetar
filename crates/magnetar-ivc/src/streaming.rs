@@ -218,6 +218,7 @@ pub fn prove_ivc_streaming(
     total_len: usize,
     segments: usize,
     pcs: &magnetar_pcs::PcsParams,
+    cpi: usize,
 ) -> (crate::IvcProof, StreamingStats) {
     let t_total = Instant::now();
     magnetar_zkvm::reset_phase_totals();
@@ -255,7 +256,7 @@ pub fn prove_ivc_streaming(
             + 64);
 
     // ---- The shared proving key + the combined layout. ----
-    let (pk, _vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone());
+    let (pk, _vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone(), cpi);
     let per = crate::per_segment_layout(&pk);
     let combined = combined_layout(&pk, segments);
     let n_comp = pk.mosaic.components.len();
@@ -381,6 +382,12 @@ pub fn prove_ivc_streaming(
     // Order the workers' results by segment (par_iter completion order).
     let mut ordered: Vec<_> = results;
     ordered.sort_by_key(|(s, ..)| *s);
+    if std::env::var_os("MAGNETAR_TIME").is_some() {
+        eprintln!(
+            "[rss] segments-phase peak: {:.1} MiB",
+            peak_rss_bytes() as f64 / 1048576.0
+        );
+    }
     let mut statements = Vec::with_capacity(segments);
     let mut inners = Vec::with_capacity(segments);
     let mut digests = Vec::with_capacity(segments);
@@ -455,6 +462,12 @@ pub fn prove_ivc_streaming(
     };
     let _pt_mos = magnetar_zkvm::PhaseTimer::new("root-mosaic-hier");
     trace_rss("before-hier");
+    if std::env::var_os("MAGNETAR_TIME").is_some() {
+        eprintln!(
+            "[rss] root entry: {:.1} MiB",
+            peak_rss_bytes() as f64 / 1048576.0
+        );
+    }
     let mosaic = prove_mosaic_hier(
         pcs,
         &per,
@@ -476,6 +489,12 @@ pub fn prove_ivc_streaming(
         segments,
         seg_len.trailing_zeros()
     ));
+    if std::env::var_os("MAGNETAR_TIME").is_some() {
+        eprintln!(
+            "[rss] root exit: {:.1} MiB",
+            peak_rss_bytes() as f64 / 1048576.0
+        );
+    }
 
     // The split root's commitment root = the merged level-0 root.
     let commitment_root = if segments == 1 {

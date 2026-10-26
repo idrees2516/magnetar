@@ -44,45 +44,13 @@
 //! is what keeps the root's peak memory at `O(one instance)`.
 
 use crate::mosaic::{MosaicClaim, MosaicLayout};
-use magnetar_field::{mul, EqBits, Gf128, ONE, ZERO};
+use magnetar_field::avx::axpy_run;
+use magnetar_field::{eq_build_fused, eq_build_fused_into, mul, EqBits, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
 use magnetar_sumcheck::engine::{SumcheckProver, SumcheckVerifier};
 use magnetar_sumcheck::public::{EqFactor, SumEqFactor, TableFactor};
 use magnetar_sumcheck::{BindOrder, RoundMsg, SumcheckSpec, Term};
 use rayon::prelude::*;
-
-fn hier_rss(tag: &str) {
-    if std::env::var_os("MAGNETAR_RSS").is_some() {
-        #[cfg(target_os = "linux")]
-        {
-            let r = std::fs::read_to_string("/proc/self/statm")
-                .ok()
-                .and_then(|s| {
-                    s.split_whitespace()
-                        .nth(1)
-                        .and_then(|v| v.parse::<u64>().ok())
-                })
-                .map(|p| p * 4096)
-                .unwrap_or(0);
-            eprintln!("[rss] {:<24} {:>8.0} MiB", tag, r as f64 / 1048576.0);
-        }
-    }
-}
-
-/// The alternating SWAR masks for the in-place Möbius butterfly over a
-/// `u64` truth table (bit `t` = coordinate `t`, little-endian).
-#[inline]
-#[allow(dead_code)]
-fn swirl_mask(j: usize) -> u64 {
-    match j {
-        0 => 0xAAAA_AAAA_AAAA_AAAA,
-        1 => 0xCCCC_CCCC_CCCC_CCCC,
-        2 => 0xF0F0_F0F0_F0F0_F0F0,
-        3 => 0xFF00_FF00_FF00_FF00,
-        4 => 0xFFFF_0000_FFFF_0000,
-        _ => 0xFFFF_FFFF_0000_0000,
-    }
-}
 
 /// One instance's windowed local batching sum-check over its local cube.
 ///
@@ -159,9 +127,9 @@ impl Support {
         self.base >> word_bits
     }
 
-    /// Call `f(i, word)` for every free word pattern: `i` indexes
-    /// [`Self::word_eq`] and `word` is the concrete word index.
-    #[allow(dead_code)]
+    /// Call `f(i, word)` for every free word pattern: `i` indexes the
+    /// group's shared eq table and `word` is the concrete word index.
+    #[allow(dead_code)] // kept for the window's future word-enumeration passes
     pub(crate) fn enumerate_words(&self, word_bits: usize, mut f: impl FnMut(usize, usize)) {
         let base_word = self.base_word(word_bits);
         if self.word_pos.is_empty() {
@@ -178,40 +146,6 @@ impl Support {
             f(i, word);
         }
     }
-}
-
-/// Build the groups' free-word eq tables into ONE contiguous arena
-/// (`arena[offsets[gi]..offsets[gi] + 2^|Fw|]` = group `gi`'s table) —
-/// one allocation and one page-fault pass per phase, dropped when the
-/// phase ends (the per-group `Vec`s churned an mmap per table; the
-/// STORED variant was the per-instance O(T) spike alive through the
-/// whole lockstep).
-fn group_eq_arena(groups: &[(usize, Vec<usize>, Vec<Gf128>)]) -> (Vec<Gf128>, Vec<usize>) {
-    let mut offsets = Vec::with_capacity(groups.len());
-    let mut total = 0usize;
-    for g in groups {
-        offsets.push(total);
-        total += 1usize << g.1.len();
-    }
-    let mut arena = vec![ONE; total];
-    for (gi, (_, _, pts)) in groups.iter().enumerate() {
-        if pts.is_empty() {
-            continue; // arena[offsets[gi]] = ONE already
-        }
-        let sl = &mut arena[offsets[gi]..];
-        // The eq doubling over the free coordinates: index bit `j` ↔
-        // `pts[j]` (the same convention as `EqBits::build`).
-        let mut m = 1usize;
-        for &r in pts.iter() {
-            for j in 0..m {
-                let v = sl[j];
-                sl[j] = mul(v, ONE + r);
-                sl[j + m] = mul(v, r);
-            }
-            m *= 2;
-        }
-    }
-    (arena, offsets)
 }
 
 /// One instance's windowed local batching sum-check over its local cube.
@@ -242,7 +176,11 @@ pub(crate) struct LocalDischarge<'a> {
     /// plane coordinates).
     supports: Vec<Support>,
     /// The distinct free-word groups: (base_word, free word positions,
-    /// the shared eq table over the free word coordinates).
+    /// the point's word coordinates). The group's shared eq table is
+    /// rebuilt TRANSIENTLY where consumed (the word fold and the
+    /// bound-SumEq scatter) — it is never resident on the state, which
+    /// keeps a lockstep instance at `O(items)` memory instead of
+    /// `O(Σ 2^{free})` (the 2^19+ streaming gate).
     groups: Vec<(usize, Vec<usize>, Vec<Gf128>)>,
     /// Each item's group index.
     group_of: Vec<usize>,
@@ -337,19 +275,18 @@ impl<'a> LocalDischarge<'a> {
         }
         // The group folds: out1 = the eq-weighted fold of the packed
         // words over the group's free word coordinates, a 128-lane
-        // field table (one lane per plane pattern). The eq tables live
-        // in a TRANSIENT arena — one allocation for all groups, built
-        // for this fold and dropped at its end (the stored variant was
-        // the measured per-instance O(T) spike alive through the
-        // lockstep; the per-group transient `Vec`s churned an mmap per
-        // table).
+        // field table (one lane per plane pattern). The eq table is
+        // built FUSED and TRANSIENTLY per group (half the multiplications
+        // of the reference build; dropped immediately after the fold).
         let _pt_fold = crate::protocol::AccumTimer::new("ld-word-fold");
-        let (eq_arena, eq_offsets) = group_eq_arena(&groups);
         let folds: Vec<[Gf128; 128]> = groups
             .par_iter()
-            .enumerate()
-            .map(|(gi, (bw, wpos, _wpts))| {
-                let weq = &eq_arena[eq_offsets[gi]..];
+            .map(|(bw, wpos, word_pts)| {
+                let weq: Vec<Gf128> = if word_pts.is_empty() {
+                    vec![ONE]
+                } else {
+                    eq_build_fused(word_pts)
+                };
                 let mut out = [ZERO; 128];
                 let npat = 1usize << wpos.len();
                 // The free word positions are almost always the identity
@@ -383,7 +320,6 @@ impl<'a> LocalDischarge<'a> {
                 out
             })
             .collect();
-        drop(eq_arena);
         drop(_pt_fold);
         // Per claim: the plane folds + the window monomial butterfly.
         let _pt_local = crate::protocol::AccumTimer::new("ld-local-fold");
@@ -616,135 +552,137 @@ impl<'a> LocalDischarge<'a> {
         let _pt_bs = crate::protocol::AccumTimer::new("fw-bound-se");
         let word_bits = self.ell - 7;
         let mut bound_se = vec![ZERO; stride];
-        let (eq_walk_arena, eq_walk_offsets) = group_eq_arena(&self.groups);
         let groups = &self.groups;
         let group_of = &self.group_of;
         let supports = &self.supports;
         let alphas = &self.alphas;
         let c_eq = &self.c_eq;
-        // Parallel over groups (each group's scatter is disjoint in the
-        // words it touches? no — groups share the word range; keep the
-        // scatter sequential per group but the groups rayon-parallel via
-        // per-thread buffers is overkill — sequential here, the volume is
-        // `Σ_groups 2^{|Fw|} · Σ_members 2^{np}`).
-        for (gi, (base_word, wpos, wpts)) in groups.iter().enumerate() {
-            let members: Vec<usize> = (0..supports.len()).filter(|&c| group_of[c] == gi).collect();
-            // Precompute each member's plane contribution:
-            // (scalar α_c·C_c, plane support (pattern → weight)).
-            let plane_supp: Vec<(Gf128, Vec<(usize, Gf128)>)> = members
-                .iter()
-                .map(|&c| {
-                    let s = mul(alphas[c], c_eq[c]);
-                    let sup = &supports[c];
-                    let np = sup.plane_pts.len();
-                    let peq = if np == 0 {
-                        vec![ONE]
-                    } else {
-                        EqBits::build(&sup.plane_pts).values
-                    };
-                    let base_plane = sup.base_plane(word_bits);
-                    let mut pats = Vec::with_capacity(1usize << np);
-                    for (j, &e) in peq.iter().enumerate() {
-                        if e == ZERO {
-                            continue;
-                        }
-                        let mut p = base_plane;
-                        for (t, &pos) in sup.plane_pos.iter().enumerate() {
-                            if (j >> t) & 1 == 1 {
-                                p |= 1usize << pos;
-                            }
-                        }
-                        pats.push((p, mul(s, e)));
-                    }
-                    (s, pats)
-                })
-                .collect();
-            // The group's eq table: the TRANSIENT arena slice (one build
-            // for all of this instance's groups, dropped at the walk's
-            // end).
-            let _ = &wpts;
-            // The word walk (identity fast path — see the fold).
-            let npat = 1usize << wpos.len();
-            let identity = wpos.iter().enumerate().all(|(j, &p)| p == j);
-            // Split across threads by plane blocks then word ranges: the
-            // suffix cube factors as (word ‖ plane), so `bound_se`'s plane
-            // `p` occupies the contiguous block `[p·2^wb, (p+1)·2^wb)` and
-            // each block is walked independently (the group's eq table
-            // and the members' plane weights are read-only).
-            let n_planes = 1usize << (7 - v);
-            let wb = word_bits;
-            for p in 0..n_planes {
-                // The members contributing to this plane (their pattern
-                // list contains p with weight pe).
-                let contrib: Vec<(usize, Gf128)> = plane_supp
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(m, (_, pats))| {
-                        pats.iter()
-                            .find(|&&(pp, _)| pp == p)
-                            .map(|&(_, pe)| (m, pe))
-                    })
-                    .collect();
-                if contrib.is_empty() {
+        // The rewrite of the group outer product (the biggest remaining
+        // root cost, measured ~19 ms/segment at the streaming scales):
+        // * the members' plane weights are HOISTED per plane —
+        //   `S_p = Σ_m pe_m` — so each (group, plane) contributes ONE
+        //   broadcast multiply-accumulate instead of one multiplication
+        //   per member per word;
+        // * the group's word support in a plane block is the CONTIGUOUS
+        //   range `[base, base + 2^fw)` — the axpy walks it directly
+        //   through the fused VPCLMULQDQ lanes, where the first version
+        //   scanned the whole `2^{word_bits}` plane block and filtered;
+        // * the group's eq table is rebuilt FUSED and transiently here
+        //   (it is not resident on the state between the rounds).
+        // The cell sum is unchanged: `Σ_m pe_m · eq[i] = S_p · eq[i]` in
+        // GF(2^128), and the additions commute — byte-identical output.
+        let n_planes = 1usize << (7 - v);
+        let wb = word_bits;
+        // The transient eq tables + the scatter, run as ONE group-parallel
+        // pass with per-worker state: each rayon worker owns a REUSED eq
+        // scratch pair (the pages stay hot — a fresh table per group pays
+        // one cold-page fault set per group, measured 2x on this pass) and
+        // a PRIVATE `stride` accumulator, so the size-sorted groups split
+        // across workers with no intersection logic at all; the
+        // accumulators XOR-merge into `bound_se` (GF(2^128) adds commute —
+        // byte-identical output).
+        let _pt_eqs = crate::protocol::AccumTimer::new("fw-eqs");
+        // (1) The per-group plane sums S_p — the hoisted member fold.
+        let mut s_planes: Vec<Vec<Gf128>> = vec![vec![ZERO; n_planes]; groups.len()];
+        for (c, sup) in supports.iter().enumerate() {
+            let gi = group_of[c];
+            let s = mul(alphas[c], c_eq[c]);
+            let peq = if sup.plane_pts.is_empty() {
+                vec![ONE]
+            } else {
+                EqBits::build(&sup.plane_pts).values
+            };
+            let base_plane = sup.base_plane(word_bits);
+            for (j, &e) in peq.iter().enumerate() {
+                if e == ZERO {
                     continue;
                 }
-                let blk = 1usize << wb;
-                let base_idx = p * blk;
-                let (lo, hi) = (base_idx, base_idx + blk);
-                let slice = &mut bound_se[lo..hi];
-                let bw = *base_word;
-                let weq_c = &eq_walk_arena[eq_walk_offsets[gi]..];
-                let fw = wpos.len();
-                let supp_mask = (1usize << fw) - 1;
-                if identity {
-                    // The common production shape: the free word
-                    // positions are [0, fw). A plane-block offset is in
-                    // the support iff its HIGH bits match the base's —
-                    // the eq table indexes the low fw bits.
-                    slice
-                        .par_iter_mut()
-                        .enumerate()
-                        .chunks(1usize << 12)
-                        .for_each(|cells| {
-                            for (off, cell) in cells {
-                                if (off >> fw) != (bw >> fw) {
-                                    continue;
-                                }
-                                let i = off & supp_mask;
-                                let e = weq_c[i];
-                                if e == ZERO {
-                                    continue;
-                                }
-                                for (_m, pe) in contrib.iter() {
-                                    *cell += mul(*pe, e);
-                                }
-                            }
-                        });
-                } else {
-                    // The general walk (rare: a component offset reaches
-                    // into the word bits, or non-identity positions).
-                    for i in 0..npat {
-                        let e = weq_c[i];
-                        if e == ZERO {
-                            continue;
-                        }
-                        let mut w = bw;
-                        for (j, &pos) in wpos.iter().enumerate() {
-                            if (i >> j) & 1 == 1 {
-                                w |= 1usize << pos;
-                            }
-                        }
-                        if w >= blk {
-                            continue;
-                        }
-                        for (_m, pe) in contrib.iter() {
-                            slice[w] += mul(*pe, e);
+                let mut p = base_plane;
+                for (t, &pos) in sup.plane_pos.iter().enumerate() {
+                    if (j >> t) & 1 == 1 {
+                        p |= 1usize << pos;
+                    }
+                }
+                s_planes[gi][p] += mul(s, e);
+            }
+        }
+        // (2) The rare non-identity groups scatter directly (sequential).
+        for (gi, (base_word, wpos, word_pts)) in groups.iter().enumerate() {
+            let identity = wpos.iter().enumerate().all(|(j, &p)| p == j);
+            if identity {
+                continue;
+            }
+            let npat = 1usize << wpos.len();
+            let weq: Vec<Gf128> = eq_build_fused(word_pts);
+            let bw = *base_word;
+            for (p, &sp) in s_planes[gi].iter().enumerate() {
+                if sp == ZERO {
+                    continue;
+                }
+                for i in 0..npat {
+                    let e = weq[i];
+                    if e == ZERO {
+                        continue;
+                    }
+                    let mut word = bw;
+                    for (j, &pos) in wpos.iter().enumerate() {
+                        if (i >> j) & 1 == 1 {
+                            word |= 1usize << pos;
                         }
                     }
+                    bound_se[(p << wb) + word] += mul(sp, e);
                 }
             }
         }
-        drop(eq_walk_arena);
+        // (3) The identity groups: size-sorted, split across workers.
+        let mut ident: Vec<usize> = (0..groups.len())
+            .filter(|&gi| {
+                let wpos = &groups[gi].1;
+                wpos.iter().enumerate().all(|(j, &p)| p == j)
+            })
+            .collect();
+        ident.sort_by_key(|&gi| std::cmp::Reverse(1usize << groups[gi].1.len()));
+        let max_npat = ident
+            .first()
+            .map(|&gi| 1usize << groups[gi].1.len())
+            .unwrap_or(1);
+        let n_acc = rayon::current_num_threads().max(1).min(ident.len().max(1));
+        let mut accs: Vec<Vec<Gf128>> = (0..n_acc).map(|_| vec![ZERO; stride]).collect();
+        let per_acc = ident.len().div_ceil(n_acc);
+        accs.par_iter_mut().enumerate().for_each(|(ai, acc)| {
+            let lo = ai * per_acc;
+            if lo >= ident.len() {
+                return;
+            }
+            let hi = (lo + per_acc).min(ident.len());
+            let mut scratch_a = vec![ZERO; max_npat];
+            let mut scratch_b = vec![ZERO; max_npat];
+            for &gi in &ident[lo..hi] {
+                let (base_word, wpos, word_pts) = &groups[gi];
+                let fw = wpos.len();
+                let npat = 1usize << fw;
+                let n = eq_build_fused_into(word_pts, &mut scratch_a, &mut scratch_b);
+                let eq = &scratch_a[..n];
+                let bw = *base_word;
+                // One broadcast axpy per touched plane over the group's
+                // CONTIGUOUS support block: exactly the cells the first
+                // version's filter scan kept.
+                for (p, &sp) in s_planes[gi].iter().enumerate() {
+                    if sp == ZERO {
+                        continue;
+                    }
+                    let base = (p << wb) + ((bw >> fw) << fw);
+                    axpy_run(&mut acc[base..base + npat], eq, sp, npat);
+                }
+            }
+        });
+        // (4) The merge.
+        for acc in &accs {
+            for (d, &a) in bound_se.iter_mut().zip(acc.iter()) {
+                *d += a;
+            }
+        }
+        drop(_pt_eqs);
         drop(_pt_fw);
         let _pt_tail = crate::protocol::AccumTimer::new("ld-tail-rounds");
         drop(_pt_bs);
@@ -882,7 +820,6 @@ pub(crate) fn prove_hier_body(
         .map(|(s, (claim, items))| LocalDischarge::new(per, packed, s << n, items, *claim))
         .collect();
     drop(_pt_new);
-    hier_rss("hier-after-new");
     let mut masker = magnetar_sumcheck::zk::ZkMasker::new();
     let mut local_rounds: Vec<Vec<Vec<Gf128>>> = vec![Vec::with_capacity(ell_s); segments];
     // ---- The lockstep local rounds. ----
@@ -922,7 +859,6 @@ pub(crate) fn prove_hier_body(
             .for_each(|(d, m)| d.bind_msg(m, r));
     }
     drop(_pt_lock);
-    hier_rss("hier-after-lockstep");
     let mut terminals = Vec::with_capacity(segments);
     let mut r_local = Vec::new();
     for d in dis {
@@ -991,7 +927,6 @@ pub(crate) fn prove_hier_body(
         terminal = dc[0];
     }
     drop(_pt_seg);
-    hier_rss("hier-after-segstage");
     let zk_offset = if zk { masker.offset() } else { ZERO };
     // The combined point: [segment σ coords] ∥ [local ell_s coords].
     let mut r_star = r_local;
@@ -1160,6 +1095,21 @@ pub(crate) fn verify_hier_body(
 
 #[cfg(test)]
 mod tests {
+    /// The alternating SWAR masks for the in-place Möbius butterfly over
+    /// a `u64` truth table (bit `t` = coordinate `t`, little-endian) —
+    /// the tests' reference Möbius against the production machinery.
+    #[inline]
+    pub(super) fn swirl_mask(j: usize) -> u64 {
+        match j {
+            0 => 0xAAAA_AAAA_AAAA_AAAA,
+            1 => 0xCCCC_CCCC_CCCC_CCCC,
+            2 => 0xF0F0_F0F0_F0F0_F0F0,
+            3 => 0xFF00_FF00_FF00_FF00,
+            4 => 0xFFFF_0000_FFFF_0000,
+            _ => 0xFFFF_FFFF_0000_0000,
+        }
+    }
+
     use super::*;
 
     /// The LocalDischarge's messages must be byte-identical to the
@@ -1331,6 +1281,9 @@ mod tests {
 
 #[cfg(test)]
 mod fold_debug_tests {
+    use super::tests::swirl_mask;
+    use magnetar_field::ZERO;
+
     use super::*;
 
     /// Brute-force the per-item window monomial state `q[c][m] =

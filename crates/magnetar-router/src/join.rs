@@ -123,8 +123,21 @@ struct Column {
     /// a-phase: the eq-weighted, h-collapsed R contribution over the
     /// remaining a bits (empty for shifts).
     tau: Vec<Gf128>,
-    /// o-phase: the sparse pairs at this column's selector position.
+    /// o-phase: the sparse pairs at this column's selector position
+    /// (the generic path; the binary-tensor fast path replaces them
+    /// with the per-o `xo2` dots).
     pairs: Vec<Pair>,
+    /// The column's X slice packed as bits (`(u_v + 63) / 64` words) —
+    /// during the h-rounds the X table is still raw bits, so the row
+    /// contraction is a popcount-driven select, never a multiply.
+    x_bits: Vec<u64>,
+    /// The binary-tensor fast path's per-o X-selected sums:
+    /// `xo2[o] = Σ_{pairs at o} coef·X(u)` — one pass over the support
+    /// (the X entries are bits during the (a, o, h)-rounds), replacing
+    /// the per-pair per-round products of the generic path.
+    xo2: Vec<Gf128>,
+    /// The nonzero entries of `xo2` (the per-round dots skip zeros).
+    xo_nz: Vec<u32>,
 }
 
 struct Pair {
@@ -141,6 +154,28 @@ struct Pair {
 const MAXC: usize = 12;
 
 type Coeffs = [Gf128; MAXC];
+
+/// A tiny `MAGNETAR_TIME`-gated phase timer (the same pattern as the
+/// zkvm crate's `PhaseTimer`, local to this crate to keep the dependency
+/// direction one-way).
+pub(crate) struct JoinTimer(Option<(std::time::Instant, &'static str)>);
+
+impl JoinTimer {
+    pub(crate) fn new(label: &'static str) -> Self {
+        JoinTimer(std::env::var_os("MAGNETAR_TIME").map(|_| (std::time::Instant::now(), label)))
+    }
+}
+
+impl Drop for JoinTimer {
+    fn drop(&mut self) {
+        if let Some((t0, label)) = self.0.take() {
+            eprintln!(
+                "[time] {label:<24} {:7.1} ms",
+                t0.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+}
 
 #[inline]
 fn zero_coeffs() -> Coeffs {
@@ -240,8 +275,19 @@ pub fn prove_routing_join(
     let eq_o = magnetar_field::EqBits::build(r_o).values;
     let w: Vec<Gf128> = magnetar_field::EqBits::build(r_j).values;
     let support = tensor.support_by_ha();
+    // The binary-tensor fast path: the routing tensors of this stack are
+    // 0/1-valued, so every X entry select is a bit test — the extraction's
+    // tau sums become XOR-selects of the GLOBAL eq_o[o] (no CLMUL), and
+    // the o-rounds become per-o dots of the per-column `xo2` vectors
+    // against per-round GLOBAL weight vectors (the per-pair pref/suffix
+    // products collapse into the fold history). Non-binary tensors keep
+    // the generic per-pair path (byte-identical, cross-validated).
+    let tensor_binary = tensor.values.iter().all(|&v| v == ZERO || v == ONE);
 
     // ---- Per-column extraction (one pass). ----
+    let _tj_extract = JoinTimer::new("jr-extract");
+    let words_per_col = (1usize << u_v).div_ceil(64); // 2^u_v slots per column
+    let col_len = 1usize << u_v;
     let mut cols: Vec<Column> = Vec::with_capacity(cycles);
     {
         let x = &witness.x;
@@ -270,6 +316,19 @@ pub fn prove_routing_join(
                 }
             }
             let x_col = &x[(j << u_v)..((j + 1) << u_v)];
+            // Pack the column's X bits FIRST — the extraction's fast path
+            // and the h-rounds both read the words.
+            let mut x_bits = vec![0u64; words_per_col];
+            debug_assert!(x_col.iter().all(|&v| v == ZERO || v == ONE));
+            for (w, slot) in x_bits.iter_mut().enumerate() {
+                for b in 0..64usize {
+                    let in_col = (w << 6) + b;
+                    if in_col < col_len && x_col[in_col] == ONE {
+                        *slot |= 1u64 << b;
+                    }
+                }
+            }
+            let bit_at = |u: usize| -> bool { (x_bits[u >> 6] >> (u & 63)) & 1 == 1 };
             let mut tau = Vec::new();
             if a_v > 0 {
                 tau = vec![ZERO; 1usize << a_v];
@@ -277,26 +336,23 @@ pub fn prove_routing_join(
                     for a in 0..(1usize << a_v) {
                         let list = &support[h_pos | (a << h_v)];
                         let mut acc = ZERO;
-                        for &(po, pu, coef) in list {
-                            acc += mul(coef, mul(eq_o[po], x_col[pu]));
+                        if tensor_binary {
+                            // coef = 1: the pair's product is the bit
+                            // selecting the GLOBAL eq_o[o] — XOR only.
+                            for &(po, pu, _) in list {
+                                if bit_at(pu) {
+                                    acc += eq_o[po];
+                                }
+                            }
+                        } else {
+                            for &(po, pu, coef) in list {
+                                acc += mul(coef, mul(eq_o[po], x_col[pu]));
+                            }
                         }
                         tau[a] = acc;
                     }
                 }
             }
-            let pairs: Vec<Pair> = if a_v == 0 {
-                support[h_pos]
-                    .iter()
-                    .map(|&(po, pu, coef)| Pair {
-                        o: po,
-                        u: pu,
-                        coef,
-                        pref: ONE,
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
             cols.push(Column {
                 j,
                 active,
@@ -305,13 +361,18 @@ pub fn prove_routing_join(
                 lamh_f,
                 lamh: if active { ONE } else { ZERO },
                 tau,
-                pairs,
+                pairs: Vec::new(),
+                x_bits,
+                xo2: Vec::new(),
+                xo_nz: Vec::new(),
             });
         }
     }
+    drop(_tj_extract);
     let mut x_work = witness.x.clone();
 
     // ---- a-rounds: τ algebraic folding (stores only). ----
+    let _tj_a = JoinTimer::new("jr-a");
     for k in 0..a_v {
         let obits = &witness.offset_bits[k];
         let coeffs = cols
@@ -364,6 +425,8 @@ pub fn prove_routing_join(
             }
         });
     }
+    drop(_tj_a);
+    let _tj_xo2 = JoinTimer::new("jr-xo2");
     // The a-folded support per h (the o-phase pairs).
     let support_a: Vec<Vec<(usize, usize, Gf128)>> = if a_v > 0 {
         let ca = &challenges[..a_v];
@@ -391,73 +454,194 @@ pub fn prove_routing_join(
             })
             .collect()
     } else {
-        support
+        Vec::new()
     };
-    if a_v > 0 {
-        for col in cols.iter_mut() {
-            if col.active {
-                col.pairs = support_a[col.h_pos]
+    if tensor_binary {
+        // The per-o X-selected sums — ONE pass over each column's support
+        // (the X entries are still bits): `xo2[o] = Σ_{pairs at o} coef·bit`.
+        // The o-rounds below dot these against GLOBAL per-round weight
+        // vectors — the per-pair pref/suffix products are gone entirely.
+        let obits = 1usize << o_v;
+        cols.par_chunks_mut(chunk_size(cycles)).for_each(|chunk| {
+            for col in chunk.iter_mut() {
+                let mut xo2 = vec![ZERO; obits];
+                if col.active {
+                    let list: &[(usize, usize, Gf128)] = if a_v > 0 {
+                        &support_a[col.h_pos]
+                    } else {
+                        &support[col.h_pos]
+                    };
+                    for &(o, u, coef) in list {
+                        if (col.x_bits[u >> 6] >> (u & 63)) & 1 == 1 {
+                            xo2[o] += coef;
+                        }
+                    }
+                }
+                let xo_nz = xo2
                     .iter()
-                    .map(|&(o, u, coef)| Pair {
-                        o,
-                        u,
-                        coef,
-                        pref: ONE,
-                    })
+                    .enumerate()
+                    .filter(|(_, &v)| v != ZERO)
+                    .map(|(i, _)| i as u32)
                     .collect();
+                col.xo2 = xo2;
+                col.xo_nz = xo_nz;
+            }
+        });
+    } else {
+        // The generic path: per-pair state, initialized per column.
+        if a_v > 0 {
+            for col in cols.iter_mut() {
+                if col.active {
+                    col.pairs = support_a[col.h_pos]
+                        .iter()
+                        .map(|&(o, u, coef)| Pair {
+                            o,
+                            u,
+                            coef,
+                            pref: ONE,
+                        })
+                        .collect();
+                }
+            }
+        } else {
+            for col in cols.iter_mut() {
+                if col.active {
+                    col.pairs = support[col.h_pos]
+                        .iter()
+                        .map(|&(o, u, coef)| Pair {
+                            o,
+                            u,
+                            coef,
+                            pref: ONE,
+                        })
+                        .collect();
+                }
+            }
+        }
+        for col in cols.iter_mut() {
+            for p in col.pairs.iter_mut() {
+                p.pref = p.coef;
             }
         }
     }
 
-    // ---- o-rounds: sparse support pairs. ----
+    // ---- o-rounds: the o-dimension of R against the eq claim point. ----
+    drop(_tj_xo2);
+    let _tj_o = JoinTimer::new("jr-o");
+    // The high-bit suffix `Π_{i>k} eq(r_o[i], o_i)` depends only on
+    // `o >> (k+1)` and the FIXED claim point `r_o` — one table per round
+    // (≈ 2^{o_v} entries total) instead of a product per pair per round.
+    let suffix_tabs: Vec<Vec<Gf128>> = (0..o_v)
+        .map(|k| {
+            let width = 1usize << (o_v - k - 1);
+            (0..width)
+                .map(|hi| {
+                    let mut v = ONE;
+                    for i in (k + 1)..o_v {
+                        v = mul(v, eqb(r_o[i], (hi >> (i - k - 1)) & 1 == 1));
+                    }
+                    v
+                })
+                .collect()
+        })
+        .collect();
     let mut e_o = ONE; // eq(r_o, c_{o,<k}) — multiplies every later round.
-    for k in 0..o_v {
-        let rk = r_o[k];
-        let coeffs = cols
-            .par_chunks(chunk_size(cycles))
-            .map(|chunk| {
-                let mut local = zero_coeffs();
-                for col in chunk.iter() {
-                    if !col.active {
-                        continue;
-                    }
-                    let j = col.j;
-                    let base = j << u_v;
-                    let mut v = [ZERO; 2];
-                    for p in &col.pairs {
-                        let mut suff = ONE;
-                        for i in (k + 1)..o_v {
-                            suff = mul(suff, eqb(r_o[i], (p.o >> i) & 1 == 1));
+    if tensor_binary {
+        // The fast path: per column, the pre-computed per-o sums `xo2`
+        // dot against the GLOBAL round weight
+        // `g[o] = hist[o]·suffix_k[o >> (k+1)]` (the o-fold challenge
+        // history `hist` is global — it depends on no column data), one
+        // multiply per NONZERO o per round instead of two per PAIR.
+        let obits = 1usize << o_v;
+        let mut hist = vec![ONE; obits];
+        for k in 0..o_v {
+            let rk = r_o[k];
+            let suffix = &suffix_tabs[k];
+            let g: Vec<Gf128> = (0..obits)
+                .map(|o| mul(hist[o], suffix[o >> (k + 1)]))
+                .collect();
+            let gt = &g;
+            let coeffs = cols
+                .par_chunks(chunk_size(cycles))
+                .map(|chunk| {
+                    let mut local = zero_coeffs();
+                    for col in chunk.iter() {
+                        if !col.active {
+                            continue;
                         }
-                        let wgt = mul(mul(p.coef, p.pref), suff);
-                        let xv = x_work[base + p.u];
-                        if (p.o >> k) & 1 == 0 {
-                            v[0] += mul(wgt, xv);
-                        } else {
-                            v[1] += mul(wgt, xv);
+                        let mut v = [ZERO; 2];
+                        for &oi in &col.xo_nz {
+                            let o = oi as usize;
+                            v[(o >> k) & 1] += mul(col.xo2[o], gt[o]);
                         }
+                        let wlam = mul(w[col.j], col.lam);
+                        let q = quad_term(rk, v[0], v[1], wlam);
+                        local[0] += mul(e_o, q[0]);
+                        local[1] += mul(e_o, q[1]);
+                        local[2] += mul(e_o, q[2]);
                     }
-                    let q = quad_term(rk, v[0], v[1], mul(w[j], col.lam));
-                    local[0] += mul(e_o, q[0]);
-                    local[1] += mul(e_o, q[1]);
-                    local[2] += mul(e_o, q[2]);
-                }
-                local
-            })
-            .reduce(zero_coeffs, combine);
-        round0_check(&rounds, &coeffs, degree, claim);
-        let c = absorb_round(t, &coeffs, degree);
-        rounds.push(coeffs[..degree + 1].to_vec());
-        challenges.push(c);
-        e_o = mul(e_o, ONE + rk + c);
-        let ec = ONE + c;
-        cols.par_chunks_mut(chunk_size(cycles)).for_each(|chunk| {
-            for col in chunk.iter_mut() {
-                for p in col.pairs.iter_mut() {
-                    p.pref = mul(p.pref, if (p.o >> k) & 1 == 1 { c } else { ec });
-                }
+                    local
+                })
+                .reduce(zero_coeffs, combine);
+            round0_check(&rounds, &coeffs, degree, claim);
+            let c = absorb_round(t, &coeffs, degree);
+            rounds.push(coeffs[..degree + 1].to_vec());
+            challenges.push(c);
+            e_o = mul(e_o, ONE + rk + c);
+            let ec = ONE + c;
+            for o in 0..obits {
+                hist[o] = mul(hist[o], if (o >> k) & 1 == 1 { c } else { ec });
             }
-        });
+        }
+    } else {
+        // The generic path: per-pair eq-prefix products, folded per
+        // round (each round costs 2 muls + 1 lookup per pair).
+        for k in 0..o_v {
+            let rk = r_o[k];
+            let suffix = &suffix_tabs[k];
+            let coeffs = cols
+                .par_chunks(chunk_size(cycles))
+                .map(|chunk| {
+                    let mut local = zero_coeffs();
+                    for col in chunk.iter() {
+                        if !col.active {
+                            continue;
+                        }
+                        let j = col.j;
+                        let base = j << u_v;
+                        let wlam = mul(w[j], col.lam);
+                        let mut v = [ZERO; 2];
+                        for p in &col.pairs {
+                            let wgt = mul(p.pref, suffix[p.o >> (k + 1)]);
+                            let xv = x_work[base + p.u];
+                            if (p.o >> k) & 1 == 0 {
+                                v[0] += mul(wgt, xv);
+                            } else {
+                                v[1] += mul(wgt, xv);
+                            }
+                        }
+                        let q = quad_term(rk, v[0], v[1], wlam);
+                        local[0] += mul(e_o, q[0]);
+                        local[1] += mul(e_o, q[1]);
+                        local[2] += mul(e_o, q[2]);
+                    }
+                    local
+                })
+                .reduce(zero_coeffs, combine);
+            round0_check(&rounds, &coeffs, degree, claim);
+            let c = absorb_round(t, &coeffs, degree);
+            rounds.push(coeffs[..degree + 1].to_vec());
+            challenges.push(c);
+            e_o = mul(e_o, ONE + rk + c);
+            let ec = ONE + c;
+            cols.par_chunks_mut(chunk_size(cycles)).for_each(|chunk| {
+                for col in chunk.iter_mut() {
+                    for p in col.pairs.iter_mut() {
+                        p.pref = mul(p.pref, if (p.o >> k) & 1 == 1 { c } else { ec });
+                    }
+                }
+            });
+        }
     }
 
     // ---- The (o, a)-folded R over (u, h): one dense global table. ----
@@ -472,8 +656,9 @@ pub fn prove_routing_join(
         })
         .collect();
     let mut r_uh = vec![ZERO; (1usize << u_v) << h_v];
+    let support_oa: &Vec<Vec<(usize, usize, Gf128)>> = if a_v > 0 { &support_a } else { &support };
     for h in 0..(1usize << h_v) {
-        for &(o, u, coef) in &support_a[h] {
+        for &(o, u, coef) in &support_oa[h] {
             r_uh[u | (h << u_v)] += mul(coef, eq_co[o]);
         }
     }
@@ -489,6 +674,8 @@ pub fn prove_routing_join(
     };
 
     // ---- h-rounds: the one-hot kill. ----
+    drop(_tj_o);
+    let _tj_h = JoinTimer::new("jr-h");
     for k in 0..h_v {
         let coeffs = {
             let rtab = &r_uh;
@@ -501,12 +688,19 @@ pub fn prove_routing_join(
                         }
                         let j = col.j;
                         let h_lo = (col.h_pos >> (k + 1)) << 1;
-                        let base = j << u_v;
+                        let row0 = h_lo << u_v;
+                        let row1 = (h_lo | 1) << u_v;
                         let mut ab = [ZERO; 2];
-                        for u in 0..(1usize << u_v) {
-                            let xv = x_work[base + u];
-                            ab[0] += mul(xv, rtab[u | (h_lo << u_v)]);
-                            ab[1] += mul(xv, rtab[u | ((h_lo | 1) << u_v)]);
+                        // The X column is still bits: the contraction is
+                        // a select — one add per SET bit, no multiply.
+                        for (w, &word) in col.x_bits.iter().enumerate() {
+                            let mut bits = word;
+                            while bits != 0 {
+                                let u = bits.trailing_zeros() as usize;
+                                ab[0] += rtab[row0 + (w << 6) + u];
+                                ab[1] += rtab[row1 + (w << 6) + u];
+                                bits &= bits - 1;
+                            }
                         }
                         let s = mul(mul(mul(w[j], col.lam), col.lamh), e_o);
                         let hb = Gf128(((col.h_pos >> k) & 1) as u128);
@@ -542,6 +736,8 @@ pub fn prove_routing_join(
     }
 
     // ---- u-rounds: the R vector × per-column X slices. ----
+    drop(_tj_h);
+    let _tj_u = JoinTimer::new("jr-u");
     let mut r_u = r_uh; // h fully folded: a vector over u.
     for k in 0..u_v {
         let half = 1usize << (u_v - k - 1);
@@ -596,6 +792,8 @@ pub fn prove_routing_join(
     }
 
     // ---- j-rounds: per-cycle factor vectors, pair-folded. ----
+    drop(_tj_u);
+    let _tj_j = JoinTimer::new("jr-j");
     // The fully folded R and eq_o constants scale every j-round message
     // (they depend on no j variable).
     let s_fin = mul(e_o, r_u[0]);

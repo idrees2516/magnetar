@@ -62,6 +62,64 @@ impl EqBits {
     }
 }
 
+/// The **fused** eq-table build — byte-identical to [`EqBits::build`] at
+/// half the multiplications, for transient (build-consume-drop) callers.
+///
+/// The per-coordinate factor is `[1 + r, r]`; instead of two products per
+/// entry, the `x = 1` side is staged through the broadcast-multiply kernel
+/// [`crate::avx::mul_run`] (`t[i] = cur[i] · r`) and the `x = 0` side is
+/// the XOR `cur[i] + t[i]` — one fused multiply per entry per level. The
+/// table is built **transiently** (never stored on a long-lived struct),
+/// which is what keeps the hierarchical discharge's per-instance memory at
+/// `O(items)` instead of `O(Σ 2^{free})`.
+pub fn eq_build_fused(point: &[Gf128]) -> Vec<Gf128> {
+    if point.is_empty() {
+        return vec![ONE];
+    }
+    let total = 1usize << point.len();
+    let mut a = vec![crate::gf128::ZERO; total];
+    let mut b = vec![crate::gf128::ZERO; total];
+    let n = eq_build_fused_into(point, &mut a, &mut b);
+    debug_assert_eq!(n, total);
+    a
+}
+
+/// The buffer-reusing core of [`eq_build_fused`]: writes the table into
+/// `a[..2^point.len()]` using `b` as the product stage (both caller
+/// scratch, sized `2^point.len()`), returning the table length. The
+/// scratch is REUSED across builds — the pages stay hot, which is what
+/// keeps a whole finish-window pass from paying one cold-page fault per
+/// group (measured 2x on the discharge root).
+pub fn eq_build_fused_into(point: &[Gf128], a: &mut [Gf128], b: &mut [Gf128]) -> usize {
+    if point.is_empty() {
+        a[0] = ONE;
+        return 1;
+    }
+    debug_assert!(a.len() >= 1usize << point.len());
+    debug_assert!(b.len() >= 1usize << point.len());
+    a[0] = ONE;
+    let mut cur_len = 1usize;
+    for &r in point.iter().rev() {
+        let done = crate::avx::mul_run(&mut b[..cur_len], &a[..cur_len], r, cur_len);
+        for k in done..cur_len {
+            b[k] = mul(a[k], r);
+        }
+        // The in-place interleaved doubling, DESCENDING: position `i`
+        // is read at iteration `i` and written at iteration `i/2` —
+        // which runs later in descending order — so no value is
+        // clobbered ahead of its read.
+        for i in (0..cur_len).rev() {
+            // x = 0: cur·(1 + r) = cur + cur·r; x = 1: cur·r.
+            let t = b[i];
+            let c = a[i];
+            a[2 * i] = c + t;
+            a[2 * i + 1] = t;
+        }
+        cur_len *= 2;
+    }
+    cur_len
+}
+
 /// Evaluate `eq(r, b)` at a single Boolean point `b` (little-endian bits).
 pub fn eq_table(point: &[Gf128], b_bits: &[bool]) -> Gf128 {
     debug_assert_eq!(point.len(), b_bits.len());
@@ -104,6 +162,21 @@ mod tests {
             assert_eq!(eq_char2(x, false), ONE + x);
             // eq(x,0) + eq(x,1) = 1.
             assert_eq!(eq_char2(x, false) + eq_char2(x, true), ONE);
+        }
+    }
+
+    /// The fused transient build is byte-identical to the reference build
+    /// across every shape the discharge uses (including the empty point).
+    #[test]
+    fn fused_eq_build_matches_reference() {
+        let mut rng = rand::rng();
+        for nv in [0usize, 1, 2, 3, 5, 8, 13, 16] {
+            for _ in 0..4 {
+                let point: Vec<Gf128> = (0..nv).map(|_| rng.random()).collect();
+                let reference = EqBits::build(&point).values;
+                let fused = eq_build_fused(&point);
+                assert_eq!(reference, fused, "nv = {nv}");
+            }
         }
     }
 }

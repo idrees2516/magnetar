@@ -53,7 +53,13 @@ fn cmd_profiles() {
         PcsProfile::DeepWrap,
     ] {
         let params = profile.params();
-        let (pk, vk) = keygen_with(program.clone(), 8, 2, params.clone());
+        let (pk, vk) = keygen_with(
+            program.clone(),
+            8,
+            2,
+            params.clone(),
+            magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+        );
         let pub_in = PublicInput {
             input: vec![],
             output: 0,
@@ -64,15 +70,13 @@ fn cmd_profiles() {
         assert!(verify(&vk, &pub_in, &proof).is_ok());
         let ring = |r: &magnetar_pcs::RingProof| -> usize {
             let mut n = r.rounds.iter().map(|m| m.len() * 16).sum::<usize>();
+            n += r.partials.len() * 16;
             n += r.level_roots.len() * 32;
             for q in &r.queries {
                 n += q.levels.len() * 3 * (16 + 32);
             }
             for (_v, path) in &r.tail {
                 n += 16 + path.len() * 32;
-            }
-            for a in &r.anchors {
-                n += 16 + a.main_path.len() * 32 + 16 + a.c_path.len() * 32;
             }
             n
         };
@@ -88,7 +92,13 @@ fn cmd_profiles() {
     }
     // The wrap: the same statement with the public tail discharged at
     // DeepWrap via the consistency spot-checks.
-    let (pk, vk) = keygen_with(program, 8, 2, PcsProfile::Balanced.params());
+    let (pk, vk) = keygen_with(
+        program,
+        8,
+        2,
+        PcsProfile::Balanced.params(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+    );
     let pub_in = PublicInput {
         input: vec![],
         output: 0,
@@ -97,15 +107,13 @@ fn cmd_profiles() {
     assert!(verify(&vk, &pub_in, &wrapped).is_ok());
     let ring = |r: &magnetar_pcs::RingProof| -> usize {
         let mut n = r.rounds.iter().map(|m| m.len() * 16).sum::<usize>();
+        n += r.partials.len() * 16;
         n += r.level_roots.len() * 32;
         for q in &r.queries {
             n += q.levels.len() * 3 * (16 + 32);
         }
         for (_v, path) in &r.tail {
             n += 16 + path.len() * 32;
-        }
-        for a in &r.anchors {
-            n += 16 + a.main_path.len() * 32 + 16 + a.c_path.len() * 32;
         }
         n
     };

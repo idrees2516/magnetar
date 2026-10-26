@@ -34,12 +34,12 @@ mod multilinear;
 mod pack;
 pub mod parallel;
 
-pub use eq::{eq_char2, eq_table, EqBits};
+pub use eq::{eq_build_fused, eq_build_fused_into, eq_char2, eq_table, EqBits};
 pub use gf128::{inv, is_bit, mul, mul_bit, pow, square, Gf128, ONE, ZERO};
 pub use multilinear::{bind_var, eval_mle, fold_pairs, Multilinear};
 pub use pack::{
     c_fold_table, eq_coefficients, pack_bits, pack_bytes_le, pack_table, phi_c, unpack_bits,
-    PHIBITS,
+    PhiTab, PHIBITS,
 };
 pub use parallel::{
     par_bind_var, par_bind_var_bit, par_dot_bit_xor, par_dot_xor, par_gather_bit,

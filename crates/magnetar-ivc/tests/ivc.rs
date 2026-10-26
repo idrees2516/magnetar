@@ -31,7 +31,16 @@ fn ivc_four_segments_roundtrip() {
     for w in proof.statements.windows(2) {
         assert_eq!(w[0].final_, w[1].init);
     }
-    assert!(verify_ivc(&program, &input, output, 32, &proof, &PcsParams::default()).is_ok());
+    assert!(verify_ivc(
+        &program,
+        &input,
+        output,
+        32,
+        &proof,
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
+    )
+    .is_ok());
 }
 
 #[test]
@@ -40,7 +49,16 @@ fn ivc_single_segment_matches_shape() {
     let input = vec![3u64];
     let output = 21u64;
     let proof = prove_ivc(&program, &input, output, 16, 1, &PcsParams::default());
-    assert!(verify_ivc(&program, &input, output, 16, &proof, &PcsParams::default()).is_ok());
+    assert!(verify_ivc(
+        &program,
+        &input,
+        output,
+        16,
+        &proof,
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
+    )
+    .is_ok());
 }
 
 #[test]
@@ -49,7 +67,16 @@ fn ivc_eight_segments() {
     let input = vec![5u64];
     let output = 35u64;
     let proof = prove_ivc(&program, &input, output, 32, 8, &PcsParams::default());
-    assert!(verify_ivc(&program, &input, output, 32, &proof, &PcsParams::default()).is_ok());
+    assert!(verify_ivc(
+        &program,
+        &input,
+        output,
+        32,
+        &proof,
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
+    )
+    .is_ok());
 }
 
 #[test]
@@ -59,7 +86,16 @@ fn ivc_tamper_rejected() {
     let output = 49u64;
     let proof = prove_ivc(&program, &input, output, 32, 4, &PcsParams::default());
     let ok = |p: &magnetar_ivc::IvcProof| {
-        verify_ivc(&program, &input, output, 32, p, &PcsParams::default()).is_ok()
+        verify_ivc(
+            &program,
+            &input,
+            output,
+            32,
+            p,
+            &PcsParams::default(),
+            magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+        )
+        .is_ok()
     };
     assert!(ok(&proof));
 
@@ -70,7 +106,8 @@ fn ivc_tamper_rejected() {
         output + 1,
         32,
         &proof,
-        &PcsParams::default()
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
     )
     .is_err());
 
@@ -178,6 +215,7 @@ fn streaming_matches_sequential() {
             total,
             segments,
             &PcsParams::default(),
+            magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
         );
         // Identical commitment and transcript digests.
         assert_eq!(seq.commitment_root, stream.commitment_root);
@@ -199,7 +237,8 @@ fn streaming_matches_sequential() {
             output,
             total,
             &stream,
-            &PcsParams::default()
+            &PcsParams::default(),
+            magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
         )
         .is_ok());
         // The stats are populated (R10).
@@ -226,13 +265,38 @@ fn streaming_roundtrip_and_tamper() {
     let program = sum_program();
     let input = vec![5u64];
     let output = 35u64;
-    let (proof, _stats) =
-        magnetar_ivc::prove_ivc_streaming(&program, &input, output, 32, 4, &PcsParams::default());
-    assert!(verify_ivc(&program, &input, output, 32, &proof, &PcsParams::default()).is_ok());
+    let (proof, _stats) = magnetar_ivc::prove_ivc_streaming(
+        &program,
+        &input,
+        output,
+        32,
+        4,
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+    );
+    assert!(verify_ivc(
+        &program,
+        &input,
+        output,
+        32,
+        &proof,
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
+    )
+    .is_ok());
     // Tamper: a broken boundary chain.
     let mut p = clone_of(&proof);
     p.statements[2].init.regs[2] += 1;
-    assert!(verify_ivc(&program, &input, output, 32, &p, &PcsParams::default()).is_err());
+    assert!(verify_ivc(
+        &program,
+        &input,
+        output,
+        32,
+        &p,
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
+    )
+    .is_err());
     // Tamper: a wrong output.
     assert!(verify_ivc(
         &program,
@@ -240,7 +304,8 @@ fn streaming_roundtrip_and_tamper() {
         output + 1,
         32,
         &proof,
-        &PcsParams::default()
+        &PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI
     )
     .is_err());
 }
@@ -284,4 +349,42 @@ fn stream_cursor_matches_full_trace() {
     assert_eq!(cursor.st.ram, full.final_state.ram);
     assert_eq!(cursor.st.halted, full.final_state.halted);
     assert_eq!(cursor.st.output, full.final_state.output);
+}
+
+/// The instance-batched streaming ladder (paper §5.1): several cycles per
+/// SIMD instance through the full tree-IVC pipeline — the boundary chain,
+/// the per-segment claim plumbing (`[δ-vars ‖ instance-vars]` cycle
+/// points), and the shared Mosaic discharge all carry the batched shape.
+#[test]
+fn ivc_instance_batched_cpi() {
+    let program = sum_program();
+    let input = vec![7u64];
+    let output = 7u64 * 7;
+    for cpi in [2usize, 4] {
+        let (proof, stats) = magnetar_ivc::prove_ivc_streaming(
+            &program,
+            &input,
+            output,
+            32,
+            2,
+            &PcsParams::default(),
+            cpi,
+        );
+        assert!(stats.packed_bytes > 0);
+        assert!(
+            magnetar_ivc::verify_ivc(
+                &program,
+                &input,
+                output,
+                32,
+                &proof,
+                &PcsParams::default(),
+                cpi
+            )
+            .is_ok(),
+            "cpi={cpi}: the batched streaming proof must verify"
+        );
+        // The shape: 2 segments of 16 cycles each → 16/cpi instances.
+        assert_eq!(proof.statements.len(), 2);
+    }
 }

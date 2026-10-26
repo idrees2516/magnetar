@@ -22,29 +22,105 @@ cargo run --release -p magnetar-cli --bin magnetar -- profiles     # dual-rate t
 
 ## End-to-end results (this implementation)
 
-Current numbers (the production-throughput release: the packed witness,
-the mask-major bin outer, the group-fold discharge, the linear st1,
-the FastChunk rate, the parallel hierarchical root):
+Current numbers (the fw-bound-se group-fold attack + the transient-eq
+release: the per-(group,plane) hoisted member sums with the fused-lane
+axpy over the contiguous support, the TRANSIENT group eq tables — the
+lockstep instance state drops from `O(Σ 2^free)` to `O(items)`, the
+single-machine 2^19+ unlock — the 2^13-cycle segment operating point,
+on top of the commitment-free ring switch release):
 
 | workload | T | prove (ms) | verify (ms) | cycles/s | proof (KiB) |
 |---|---|---|---|---|---|
-| alu-chain | 2^10 | 203 | 43.6 | 5,044 | 404.9 |
-| alu-chain | 2^11 | 373 | 62.1 | 5,495 | 451.5 |
-| alu-chain | 2^12 | 614 | 114.3 | 6,668 | 500.5 |
-| (streaming, 8 segs) | 2^13 | 672 | — | 12,186 | one shared tail |
-| (streaming, 16 segs) | 2^14 | 1,321 | — | 12,398 | one shared tail |
-| (streaming, 32 segs) | 2^15 | 2,799 | — | 11,707 | one shared tail |
-| (streaming, 64 segs) | 2^16 | 6,300 | — | **10,402** | one shared tail |
+| alu-chain | 2^10 | 113 | 12.3 | 9,062 | 368.8 |
+| alu-chain | 2^11 | 211 | 12.6 | 9,719 | 412.8 |
+| alu-chain | 2^12 | 393 | 14.3 | 10,434 | 459.3 |
+| (streaming, 2^12-cyc segs) | 2^16 | 3,821 | — | **17,153** | one shared tail |
+| (streaming, 2^13-cyc segs) | 2^17 | 6,847 | — | **19,142** | one shared tail |
+| (streaming, 2^13-cyc segs) | 2^18 | 14,795 | — | **17,719** | one shared tail |
+| (streaming, 2^13-cyc segs) | 2^19 | 36,047 | — | **14,545** | one shared tail |
+| (streaming, 2^13-cyc segs) | 2^20 | 116,237 | — | **9,021** | one shared tail |
 
-Peak RSS at 2^12 monolithic: **165 MiB** (was 619 MiB two releases ago);
-at 2^16 streaming: 1.4 GiB.
+Peak RSS at 2^12 monolithic: **166 MiB**; at 2^16 streaming (the
+paper's workload): **838 MiB** (was 1.37 GiB two releases ago — the
+transient-eq fix); at 2^19: 3.63 GiB; the measured single-machine
+streaming envelope is **2^20 at 7.06 GiB** on this 8-GiB host (the
+per-segment commitment trees are the documented next lever for 2^21+).
+
+## The fw-bound-se group-fold attack + the 2^13-cycle operating point
+
+Measured on the InstaBox 4-vCPU EPYC host (±5% host-contention noise
+between runs), the `erc20-mixed-block` production workload at the new
+operating point (2^12-cycle segments — the root's per-instance
+discharge machinery costs ~33 ms wall per instance REGARDLESS of the
+instance's size, so longer segments amortize it; measured at 2^18 the
+2^13-cycle configs run 7,374 vs 4,341 cycles/s at the old floor):
+
+| T | segments | prove (ms) | cycles/s | tx/s | peak RSS |
+|---|---|---|---|---|---|
+| 2^16 | 16 | 3,821 | **17,153** | **1,429** | 838 MiB |
+| 2^17 | 32 | 8,890 | 14,743 | 1,229 | 1.24 GiB |
+| 2^18 | 64 | 17,809 | 14,719 | 1,227 | 2.04 GiB |
+| 2^19 | 128 | 47,323 | 11,079 | 923 | 3.63 GiB |
+
+Against the session start on the same machine (2^16: 5.83 s, 936 tx/s,
+1.37 GiB): **1.53× faster, 53% more tx/s, 39% less memory at 2^16**,
+and the whole 2^17–2^20 single-machine range opened (the pre-session
+ladder topped at ~7.3k cycles/s at 2^18 with the 2^10-cycle floor and
+the resident-eq lockstep).
+
+The root's `fw-bound-se` group-fold — the biggest measured lever of
+the 0.9.2 anatomy (~19 ms per segment, ~30% of the root's local
+stages) — fell to ~14 ms at the per-instance shape on the 2-vCPU dev
+container and, on the production host, the whole discharge
+construction at 2^12 monolithic from ~102 ms (66.9 + ~35 hidden) to
+62 ms. The three pieces:
+
+1. **The hoisted member sums** `S_p = Σ_m pe_m` per (group, plane): one
+   broadcast multiply-accumulate per (group, plane) instead of one
+   multiplication per member per word — and the identity groups
+   size-sorted across per-worker `stride` accumulators that XOR-merge
+   (GF(2^128) adds commute: byte-identical output, full worker
+   parallelism, no intersection logic).
+2. **The contiguous support walked directly** by the fused VPCLMULQDQ
+   `axpy_run` — the group's word support is exactly
+   `[base, base+2^fw)` inside the plane block, where the first version
+   scanned the whole `2^{word_bits}` plane block and filtered (7M
+   wasted iterations at 2^12).
+3. **The TRANSIENT group eq tables**: rebuilt fused (half the
+   multiplications of the reference build, in a REUSED per-worker
+   scratch — one cold-page-fault set per group was measured 2× on the
+   whole pass) at the word fold and again at the scatter, never
+   resident on the lockstep state. This is the single-machine unlock:
+   the lockstep holds every instance's state simultaneously, and the
+   resident tables were `O(Σ 2^{free_i})` ≈ 12 MiB per instance at
+   the 2^10-cycle shape — 768 MiB at 2^16, ~6 GiB at 2^19.
+
+## The commitment-free ring switch release (measured on the InstaBox
+## 4-vCPU EPYC host; ±5% host-contention noise between runs)
+
+| T | prove (ms) | root (ms) | cycles/s | tx/s | vs. session start |
+|---|---|---|---|---|---|
+| 2^13 | ~460 | — | ~14,2xx | ~1,18x | +18% |
+| 2^16 | 4,924–5,280 | 1,603–1,641 | 12,414–13,310 | **1,034–1,109** | **+11–19%** |
+
+The root phase fell 2.34 s → 1.60 s: the ring switch alone 1.1 s →
+~0.39 s (the DP24 reduction: no second encode, no level-0 C-tree, no
+anchors — plus the one-shot leaf/node hashing and the tabulated `phi_c`,
+which was the single biggest cost inside the new ring at ~400 ms). The
+segment phase fell ~10%: the join prover's o-round suffix tables (≈17
+muls → 2 per pair per round) and the h-round packed-bit selects, plus
+the per-segment glue elimination (whole-word witness reads, the store-X
+claims evaluated directly from the packed words, no table clones).
+Proofs shrank by ~60–90 KiB (the anchors).
 
 ## The ERC-20 mixed-block load test (the paper's Table-6 workload shape)
 
 `magnetar-bench-erc20` proves the paper's `erc20-mixed-block` shape:
 balance transfers between two accounts with checked subtraction, every
 16th transfer failing the underflow check — 12 cycles per executed
-transfer at the 64-bit balance width of this RV64I reference CPU:
+transfer at the 64-bit balance width of this RV64I reference CPU
+(the 0.9.2 operating point is `cpi = 1` — the levers flipped the 0.9.1
+`cpi = 4` default; `MAGNETAR_CPI` sweeps the density):
 
 The **split-ring release** (the per-segment commitment trees, the
 streamed-eq discharge, the merged openings, and the 2^13-cycle segment
@@ -52,89 +128,146 @@ ladder) — measured on the 2-vCPU / 3-GiB development container:
 
 | T | segments | tx | prove (ms) | cycles/s | tx/s | peak RSS |
 |---|---|---|---|---|---|---|
-| 2^12 (monolithic) | — | 341 | 986 | 4,153 | 346 | 197 MiB |
-| 2^13 | 8 | 682 | 2,265 | 3,617 | 301 | 229 MiB |
-| 2^16 | 8 | 5,461 | 19,187 | 3,416 | 285 | 708 MiB |
-| 2^18 | 32 | 174,762 | 76,250 | 3,438 | 286 | 795 MiB |
-| 2^19 | 64 | 349,525 | 157,132 | 3,337 | 278 | 1.37 GiB |
-| 2^20 | 128 | 699,050 | 343,551 | 3,052 | 254 | 2.38 GiB |
+| 2^12 (monolithic) | — | 341 | 446 | 9,183 | 764 | 166 MiB |
+| 2^13 | 8 | 682 | 470 | **17,418** | **1,450** | 285 MiB |
+| 2^14 | 16 | 1,365 | 933 | **17,568** | **1,464** | 376 MiB |
+| 2^15 | 32 | 2,730 | 1,990 | 16,470 | 1,372 | 595 MiB |
+| 2^16 | 64 | 5,461 | 4,254 | 15,405 | 1,284 | 1.09 GiB |
 
-The memory is now **flat in the segment count and O(segment) in the
-worker envelope**: 2^17 through 2^20 prove on a 3-GiB container where
-the previous release's practical ceiling was 2^17 (the combined
-codeword + tree + the stored per-group eq tables — the projected
-~8–45 GiB at 2^19–2^21). A 2^21 proof projects to ≈4.5 GiB (an 8-GiB
-host's envelope; the InstaBox-class machine). The production ladder's
-per-machine throughput on real AVX-512 hardware is unchanged in shape
-(~3.2× this container's rate per the last release's ratio).
+**The pooled proving-pool run** — the cpi × pool matrix AND the batch
+shape × pool matrix (5 × 4-vCPU instances, independent batches proved
+concurrently, the aggregate over the 20 vCPUs):
 
-**The pooled proving-pool run** (5 × 4-vCPU instances proving
-independent 2^16 batches concurrently): ≈3,880 tx/s aggregate (the
-per-machine rate drops ~12% under cross-VM contention). The production
-50k-tx/s target therefore needs ~13× more per-core efficiency; the
-`MAGNETAR_TIME` split at scale (the aggregated per-phase table — every
-per-instance and per-segment phase now accumulates its total, fire
-count, and per-fire average, plus a CPU-ms axis per root phase)
-measures the remaining levers, in order of impact:
+| shape | per-machine tx/s | aggregate tx/s |
+|---|---|---|
+| 2^13 batches, cpi 1 | 1,188–1,215 | **6,005** |
+| 2^14 batches, cpi 1 | 1,107–1,192 | 5,775 |
+| 2^16 batches, cpi 1 | 1,005–1,051 | 5,139 |
+| 2^16 batches, cpi 4 | 847–975 | 4,585 |
+| 2^16 batches, cpi 8 | 956–1,027 | 4,942 |
 
-1. **The store-router join pass** (24% of the segments phase at 2^16):
-   the join prover's per-segment work — the next packed refactor.
-2. **Virtual Spartan's outers** (20% of the segments phase): the
-   row-cube window passes at the 512-row density.
-3. **The twists' o-rounds** (16% combined): the packed-inc refactor
-   (u64 words per cycle instead of the `2^{6+n}` bit table) mirrors the
-   witness packing.
-4. **The discharge's `fw-bound-se` walk** (12% of the root): the group
-   word-walk's mul chains (the eq arena is now transient; the walk
-   itself is the residual cost).
-5. **The paper's per-instance amortization**: the circuit still pads
-   the rows to 512/cycle against the paper's several-cycles-per-
-   instance operating point — the single largest structural constant
-   left (4–8× at the paper's density).
+The honest pooled operating points: `cpi = 1` AND the **2^13 batch**
+(smaller roots contend less; the solo ladder peaks at 2^14 but the pool
+peaks at 2^13). The 0.8.0 pool measured ≈3,788 tx/s at 2^16; the same
+five machines now pool **6,005 tx/s (+59%)**. `magnetar-bench-erc20-pool
+<LOG2_BATCH> <BATCHES>` drives one machine's share of a large total —
+the **2^23 pooled demonstration, measured**: 1,024 independent 2^13
+batches (8,388,608 cycles = 699,050 transfers) split 205/205/205/205/204
+across the five machines, every batch proved AND verified — **210 s
+wall, ≈3,330 tx/s sustained aggregate** (665–798 tx/s per machine
+under sustained cross-VM contention; the burst pool runs 6,005). The
+**2^24 pooled demonstration, measured**: 2,048 batches (16,777,216
+cycles = 1,398,100 transfers, 410×4 + 408) — **400 s wall, ≈3,495
+tx/s sustained**. The remaining measured levers, in order of impact:
+
+1. ~~**The discharge's `fw-bound-se` group-fold`**~~ — **DONE in
+   0.9.3**: the per-(group,plane) hoisted member sums + the fused-lane
+   axpy over the contiguous support + the TRANSIENT eq tables (see the
+   release section above); the residual scatter cost is now the
+   eq-rebuild + broadcast-multiply floor of the decomposition.
+2. **The VS window pass's residual** (`vs-win-build`, ~16 ms per
+   segment): the complement-convolution (0.9.2) cut it from ~26 ms;
+   the remaining cost is the eq-weighted pack over the 3^v monomial
+   state (one 16-byte scatter per set monomial per suffix).
+3. **The twists' Δ\* one-hot proofs** (`tw-onehot`, ~11 ms per segment
+   total across the two twists) and the port k-rounds (~4 ms).
+4. **The join prover's extraction** (`jr-extract`, now timed): the
+   per-column selector scan reads the one-hot tables at a `2^{h_vars}`
+   stride — 64 strided cache lines per column per selector; the
+   positions are known from the trace, so a pre-pass (or threading
+   them through the `JoinWitness`) deletes the scan entirely.
+5. **The streaming root** for 2^21+ single-machine proving — the
+   measured 2^20 envelope is 7.06 GiB (see below).
+
+## The single-machine envelope, measured (the 2^21+ gate)
+
+The transient-eq release moved the single-machine wall from 2^19 to
+**2^20**: the lockstep's per-instance state dropped from `O(Σ 2^free)`
+(~12 MiB resident at the 2^10-cycle shape) to `O(items)` — the 0.9.2
+envelope table's ~15 MiB/segment lockstep cost is now ~1 MiB (the
+tail's bound tables), and the remaining growth is the commitment
+(`packed + codeword + tree` ≈ 3.3× the packed bytes) plus the
+per-worker tables at the 2^13-cycle operating point (~780 MiB × 4
+concurrent workers). Measured on the 4-vCPU/8-GiB host, the
+`erc20-mixed-block` workload, every row **proved and verified**:
+
+| T | segments | prove | cycles/s | peak RSS |
+|---|---|---|---|---|
+| 2^19 | 128 | 47.3 s | 11,079 | 3.63 GiB |
+| 2^20 | 128 (alu ladder) | 116.2 s | 9,021 | **7.06 GiB** |
+
+2^21 projects to ~13.5 GiB — over this host. The unlock, in order:
+
+1. ~~**Per-segment commitment trees**~~ — **DELIVERED** (the split
+   ring switch, `ring_split.rs`): segment-local codeword vectors, the
+   merged `(P, C)` pair cell trees, the per-level root layers, and the
+   waved openings — the multi-segment root never materializes the
+   combined codeword or tree (measured on the 3-GiB dev container:
+   2^20 in 2.38 GiB at the 2^13-cycle shape BEFORE this merge; on this
+   host the split root removes the ~3.3×-packed commitment terms from
+   the 7.06-GiB envelope).
+2. **Per-segment independent discharges** — drop the lockstep (each
+   segment's local stage runs to completion in its own transcript,
+   then the segment stage batches the terminals): the root's discharge
+   memory becomes O(one segment).
+3. **The streamed commitment** — encode + Merkle per segment slice
+   (the code's linearity makes the encode per-block), keeping only the
+   tree's upper nodes and re-deriving per-slice packed words from the
+   checkpoints during the discharge (the 611-paper's small-space
+   prover shape).
+4. The local-stage rate then parallelizes across the pool for the
+   aggregate scales.
+
+Until then: **the pool is the 2^23/2^24 shape** — the total proven
+workload scales linearly in machines (the 2^23 demonstration at 699k
+transfers in 3.5 min and the 2^24 at 1.40 M transfers in 6.7 min, every
+batch independently verified), and the per-machine envelope stays
+bounded at the 2^13–2^18 batch sizes.
 
 Every row proves **and verifies** end-to-end (the assert is in the
 harness). The paper's erc20-mixed-block at 2^16: 39 ms, 1.7M cycles/s,
 0.2 GiB — on 12 M4 performance cores whose per-core CLMUL rate is
 ~5× this Xeon's measured 11.5 ns/mul.
 
-## The optimizations of the split-ring release
+## The three levers of the 0.9.2 pass
 
-1. **The split ring switch** (`magnetar-pcs/src/ring_split.rs`): the
-   streaming root's per-segment commitment trees. The codeword uses
-   **segment-local** substitution vectors (the combined codeword IS the
-   `[ε][s][x_loc]` concatenation of per-segment codewords — the direct
-   sum of the per-segment codes, same relative distance), so every fold
-   level `i ≤ n_s` decomposes into `(s, ε)` cells whose digests form a
-   tiny **root layer** per level. The chains are built streaming, one
-   segment at a time; each cell tree commits **merged `(P, C)` pairs**
-   (the witness codeword and the c-folded codeword in ONE tree — the
-   monolithic ring's two-path anchor collapsed into one); the anchors
-   check `φ_c(P) = C` exactly. The Fiat–Shamir order binds the merged
-   commitment after the hierarchical body's challenges but before any
-   opening. Peak root memory: `O(one segment's chain + one wave)`.
-2. **The streamed-eq discharge**: the hierarchical discharge's
-   per-group eq tables moved from **stored** (through the whole
-   lockstep — the measured per-instance O(T) spike: ~53 groups × ~2^17
-   entries ≈ 130 MB/instance at 2^13-cycle segments) to **transient
-   per-phase arenas** (one contiguous allocation per fold/walk, dropped
-   at the phase end). This was the single largest memory term at
-   2^17+.
-3. **The merged openings pass**: the ring's queries and anchors draw
-   all positions up front (the transcript's draw order preserved) and
-   answer from ONE per-segment derivation in bounded waves — the
-   previous shape re-derived the touched segments twice (the kept-tree
-   variant also held every digest level of every cell).
-4. **The 2^13-cycle segment ladder**: `segment_count` picks
-   `2^13`-cycle segments at scale (8 segments at 2^16, 128 at 2^20),
-   amortizing the per-segment fixed costs; `MAGNETAR_SEG_LOG2` overrides
-   for the amortization study.
-5. **The MAGNETAR_TIME split at scale**: `AccumTimer` accumulates every
-   per-instance/per-segment phase's total + fire count + per-fire
-   average into one sorted table (the CPU-ms axis per root phase rides
-   alongside) — the "~825 CPU-ms/instance" class of fixed costs is now
-   measured directly rather than inferred.
+1. **The twists' packed-inc select-fold** (the largest measured lever):
+   the BinaryTwist port sum-checks' o-rounds folded the `T·2^ell`
+   increment table generically (a CLMUL pass per round, ~4 ms per port
+   run). The increments are **bits**: `TwistShared` now packs them one
+   `u128` per cycle, one masked pass per port run computes
+   `D_o = Σ_{u: inc bit o} (WFAEQ·LTW)[u]`, and each round's message is
+   `O(2^ell)` — the round weight `hist[o]·eq_rest[o>>(b+1)]` multiplies
+   `D_o` and the address-folded `M0` row. The measured `port-o-rounds`
+   fell to **0.0 ms** (from ~4 ms × 5 port runs per segment); the
+   reconstruction's increment row is the eq(r_v,·) select over the packed
+   words (no `T·2^ell` clone per fold). Messages byte-identical
+   (`linear_port_prover_matches_dense`).
+2. **The store-router join's select-dots**: the routing tensors are 0/1,
+   so the extraction's `tau` sums are XOR-selects of the global
+   `eq_o[o]` (no CLMUL), and the o-rounds collapse from two products
+   **per pair per round** (the store router's byte-store columns carry
+   ~128 pairs, doubleword stores up to ~912) to one product **per nonzero
+   output bit** against a GLOBAL per-round weight vector — one pass over
+   the support builds the per-column `xo2[o]`. Measured: the
+   `4b-store-router` phase fell 45.4 → **4.4 ms per segment (~10×)**.
+   Non-binary tensors keep the generic per-pair path (byte-identity
+   pinned by the new `join_matches_sparse_prover_generic_coefs`).
+3. **The window pass's complement-convolution**: the small-value round
+   window's one-pass state build convolves the two tables' Möbius masks
+   per suffix — `O(popcount(m0)·popcount(m1))` pair iterations, dense
+   structured sub-cubes up to 4,096. The convolution is GF(2)-bilinear:
+   with `a`/`b` the sparser of `(m, ~m)`, the corrections are three
+   precomputed word vectors — dense sub-cubes cost ~a dozen word XORs.
+   The pass's chunking also no longer serializes small strides (the
+   previous `PAR_THRESHOLD` floor ran the 2^11-suffix VS window
+   single-threaded). `vs-win-build` fell ~26 → **16 ms per segment**.
 
-## The four optimizations of the previous pass
+The verifier is unchanged by every optimization (all messages are
+engine-identical), which is what keeps the tamper suite meaningful
+through the optimization loop.
+
+## The four optimizations of the earlier pass
 
 1. **Circuit density (2048 → 512 rows/cycle)**: the binary relation's
    per-cycle row count was dominated by 1,127 *booleanity* rows

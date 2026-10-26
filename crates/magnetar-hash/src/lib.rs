@@ -22,7 +22,6 @@
 use blake3::Hasher as Blake3Hasher;
 use rayon::prelude::*;
 use sha3::{Digest, Sha3_256};
-use std::io::Write;
 
 /// Digest size used throughout (256-bit → 128-bit collision resistance,
 /// comfortably above the paper's 120-bit target).
@@ -35,27 +34,152 @@ pub fn fe_to_bytes(x: magnetar_field::Gf128) -> [u8; 16] {
 }
 
 /// Domain-separated one-shot SHA3-256 over labeled parts.
+///
+/// The parts are serialized into ONE contiguous buffer first (the exact
+/// byte stream the multi-update form would hash — one `update` call
+/// instead of two per part; the output is bit-identical).
 pub fn sha3_domain(parts: &[&[u8]]) -> [u8; DIGEST] {
     let mut h = Sha3_256::new();
-    h.update((parts.len() as u64).to_le_bytes());
-    for p in parts {
-        h.update((p.len() as u64).to_le_bytes());
-        h.update(p);
-    }
+    let mut buf =
+        Vec::with_capacity(8 + parts.len() * 8 + parts.iter().map(|p| p.len()).sum::<usize>());
+    serialize_parts(parts, &mut buf);
+    h.update(&buf);
     h.finalize().into()
 }
 
-/// Domain-separated one-shot BLAKE3 over labeled parts.
+/// Serialize the labeled-parts byte stream: `[u64 nparts]` then per part
+/// `[u64 len] [bytes]` — the exact stream the one-part-per-update form
+/// feeds the hash.
+#[inline]
+fn serialize_parts(parts: &[&[u8]], buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&(parts.len() as u64).to_le_bytes());
+    for p in parts {
+        buf.extend_from_slice(&(p.len() as u64).to_le_bytes());
+        buf.extend_from_slice(p);
+    }
+}
+
+/// The prefix form: writes `[u64 total_nparts]` followed by only the
+/// first parts' serializations — the caller appends the remaining parts'
+/// `[len][bytes]` tails so the full stream is bit-identical to
+/// `serialize_parts` over all `total_nparts` parts.
+#[inline]
+fn serialize_prefix(total_nparts: usize, parts: &[&[u8]], buf: &mut Vec<u8>) {
+    debug_assert!(parts.len() <= total_nparts);
+    buf.extend_from_slice(&(total_nparts as u64).to_le_bytes());
+    for p in parts {
+        buf.extend_from_slice(&(p.len() as u64).to_le_bytes());
+        buf.extend_from_slice(p);
+    }
+}
+
+/// Domain-separated one-shot BLAKE3 over labeled parts (single `update`).
 pub fn blake3_domain(parts: &[&[u8]]) -> [u8; DIGEST] {
     let mut h = Blake3Hasher::new();
-    let _ = h.write(&(parts.len() as u64).to_le_bytes());
-    for p in parts {
-        let _ = h.write(&(p.len() as u64).to_le_bytes());
-        let _ = h.write(p);
-    }
+    let mut buf =
+        Vec::with_capacity(8 + parts.len() * 8 + parts.iter().map(|p| p.len()).sum::<usize>());
+    serialize_parts(parts, &mut buf);
+    h.update(&buf);
     let mut out = [0u8; DIGEST];
     h.finalize_xof().fill(&mut out);
     out
+}
+
+/// One-shot BLAKE3 over a single pre-serialized byte stream (the hot
+/// Merkle paths: the leaf/node prefixes are precomputed per tree/level,
+/// and each hash is exactly one `update` + `finalize`).
+#[inline]
+fn blake3_one_shot(buf: &[u8]) -> [u8; DIGEST] {
+    let mut h = Blake3Hasher::new();
+    h.update(buf);
+    *h.finalize().as_bytes()
+}
+
+/// The serialized leaf-hash prefix: `"magnetar/leaf/v1" ‖ domain ‖
+/// n_leaves` — everything before the leaf's `index ‖ value` tail, so the
+/// per-leaf hash is a 64-byte tail memcpy + one BLAKE3 compression.
+pub(crate) struct LeafHashPrefix {
+    buf: Vec<u8>,
+}
+
+impl LeafHashPrefix {
+    pub(crate) fn new(domain: &str, n_leaves: usize) -> Self {
+        let mut buf = Vec::with_capacity(96 + domain.len());
+        serialize_prefix(
+            5,
+            &[
+                b"magnetar/leaf/v1",
+                domain.as_bytes(),
+                &(n_leaves as u64).to_le_bytes(),
+            ],
+            &mut buf,
+        );
+        LeafHashPrefix { buf }
+    }
+
+    /// The full leaf stream for `(index, value)` in `out`; returns its length.
+    #[inline]
+    pub(crate) fn write_stream(
+        &self,
+        index: usize,
+        value: magnetar_field::Gf128,
+        out: &mut [u8; 160],
+    ) -> usize {
+        let pfx = self.buf.len();
+        out[..pfx].copy_from_slice(&self.buf);
+        let mut at = pfx;
+        out[at..at + 8].copy_from_slice(&8u64.to_le_bytes());
+        at += 8;
+        out[at..at + 8].copy_from_slice(&(index as u64).to_le_bytes());
+        at += 8;
+        out[at..at + 8].copy_from_slice(&16u64.to_le_bytes());
+        at += 8;
+        out[at..at + 16].copy_from_slice(&fe_to_bytes(value));
+        at += 16;
+        at
+    }
+
+    #[inline]
+    pub(crate) fn hash(&self, index: usize, value: magnetar_field::Gf128) -> [u8; DIGEST] {
+        let mut buf = [0u8; 160];
+        let at = self.write_stream(index, value, &mut buf);
+        blake3_one_shot(&buf[..at])
+    }
+}
+
+/// The serialized node-hash prefix: `"magnetar/node/v1" ‖ domain ‖ level`
+/// (the level is fixed per build pass).
+pub(crate) struct NodeHashPrefix {
+    buf: Vec<u8>,
+}
+
+impl NodeHashPrefix {
+    pub(crate) fn new(domain: &str, level: u64) -> Self {
+        let mut buf = Vec::with_capacity(96 + domain.len());
+        serialize_prefix(
+            5,
+            &[b"magnetar/node/v1", domain.as_bytes(), &level.to_le_bytes()],
+            &mut buf,
+        );
+        NodeHashPrefix { buf }
+    }
+
+    #[inline]
+    pub(crate) fn hash(&self, l: &[u8; DIGEST], r: &[u8; DIGEST]) -> [u8; DIGEST] {
+        let pfx = self.buf.len();
+        let mut buf = [0u8; 224];
+        buf[..pfx].copy_from_slice(&self.buf);
+        let mut at = pfx;
+        buf[at..at + 8].copy_from_slice(&32u64.to_le_bytes());
+        at += 8;
+        buf[at..at + 32].copy_from_slice(l);
+        at += 32;
+        buf[at..at + 8].copy_from_slice(&32u64.to_le_bytes());
+        at += 8;
+        buf[at..at + 32].copy_from_slice(r);
+        at += 32;
+        blake3_one_shot(&buf[..at])
+    }
 }
 
 /// Fiat–Shamir transcript (SHA3-256 duplex with ratcheting).
@@ -203,15 +327,8 @@ impl MerkleTree {
             "Merkle leaves must be a power of two"
         );
         let dom = domain.as_bytes().to_vec();
-        let leaf = |(i, &x): (usize, &magnetar_field::Gf128)| {
-            blake3_domain(&[
-                b"magnetar/leaf/v1",
-                &dom,
-                &(n as u64).to_le_bytes(),
-                &(i as u64).to_le_bytes(),
-                &fe_to_bytes(x),
-            ])
-        };
+        let leaf_pfx = LeafHashPrefix::new(domain, n);
+        let leaf = |(i, &x): (usize, &magnetar_field::Gf128)| leaf_pfx.hash(i, x);
         let level: Vec<[u8; DIGEST]> = if n >= PAR_TREE_THRESHOLD {
             leaves.par_iter().enumerate().map(leaf).collect()
         } else {
@@ -222,15 +339,8 @@ impl MerkleTree {
             let cur = levels.last().unwrap();
             let lvl = levels.len() - 1;
             let half = cur.len() / 2;
-            let node = |j: usize| {
-                blake3_domain(&[
-                    b"magnetar/node/v1",
-                    &dom,
-                    &(lvl as u64).to_le_bytes(),
-                    &cur[2 * j],
-                    &cur[2 * j + 1],
-                ])
-            };
+            let node_pfx = NodeHashPrefix::new(domain, lvl as u64);
+            let node = |j: usize| node_pfx.hash(&cur[2 * j], &cur[2 * j + 1]);
             let next: Vec<[u8; DIGEST]> = if half >= PAR_TREE_THRESHOLD {
                 (0..half).into_par_iter().map(node).collect()
             } else {
@@ -277,13 +387,7 @@ impl MerkleTree {
         index: usize,
         value: magnetar_field::Gf128,
     ) -> [u8; DIGEST] {
-        blake3_domain(&[
-            b"magnetar/leaf/v1",
-            domain.as_bytes(),
-            &(n_leaves as u64).to_le_bytes(),
-            &(index as u64).to_le_bytes(),
-            &fe_to_bytes(value),
-        ])
+        LeafHashPrefix::new(domain, n_leaves).hash(index, value)
     }
 
     /// Verify an opening. Returns the leaf digest on success.
@@ -308,26 +412,14 @@ impl MerkleTree {
         if index >= n_leaves {
             return Err("index out of range");
         }
-        let dom = domain.as_bytes();
         let mut acc = leaf_digest;
         let mut idx = index;
         for (lvl, sib) in path.iter().enumerate() {
+            let node_pfx = NodeHashPrefix::new(domain, lvl as u64);
             let node = if idx & 1 == 0 {
-                blake3_domain(&[
-                    b"magnetar/node/v1",
-                    dom,
-                    &(lvl as u64).to_le_bytes(),
-                    &acc,
-                    sib,
-                ])
+                node_pfx.hash(&acc, sib)
             } else {
-                blake3_domain(&[
-                    b"magnetar/node/v1",
-                    dom,
-                    &(lvl as u64).to_le_bytes(),
-                    sib,
-                    &acc,
-                ])
+                node_pfx.hash(sib, &acc)
             };
             acc = node;
             idx >>= 1;
@@ -456,13 +548,7 @@ pub fn verify_leaf(
     path: &[[u8; DIGEST]],
     root: &[u8; DIGEST],
 ) -> Result<(), &'static str> {
-    let leaf = blake3_domain(&[
-        b"magnetar/leaf/v1",
-        domain.as_bytes(),
-        &(n_leaves as u64).to_le_bytes(),
-        &(index as u64).to_le_bytes(),
-        &fe_to_bytes(value),
-    ]);
+    let leaf = MerkleTree::leaf_digest_of(domain, n_leaves, index, value);
     let acc = MerkleTree::verify(domain, n_leaves, index, leaf, path)?;
     if &acc == root {
         Ok(())
@@ -473,6 +559,40 @@ pub fn verify_leaf(
 
 #[cfg(test)]
 mod tests {
+    /// The prefix-path digests must be bit-identical to the generic
+    /// parts form (the optimization changes speed only).
+    #[test]
+    fn prefix_hashes_bit_identical() {
+        use magnetar_field::Gf128;
+        let domain = "some/level/7";
+        let n = 4096usize;
+        for idx in [0usize, 1, 2, 1234, 4095] {
+            let v = Gf128(idx as u128 * 0x9E3779B97F4A7C15);
+            let generic = blake3_domain(&[
+                b"magnetar/leaf/v1",
+                domain.as_bytes(),
+                &(n as u64).to_le_bytes(),
+                &(idx as u64).to_le_bytes(),
+                &fe_to_bytes(v),
+            ]);
+            let pfx = LeafHashPrefix::new(domain, n).hash(idx, v);
+            assert_eq!(generic, pfx, "leaf {idx}");
+        }
+        let l = [7u8; 32];
+        let r = [9u8; 32];
+        for lvl in [0usize, 3, 21] {
+            let generic = blake3_domain(&[
+                b"magnetar/node/v1",
+                domain.as_bytes(),
+                &(lvl as u64).to_le_bytes(),
+                &l,
+                &r,
+            ]);
+            let pfx = NodeHashPrefix::new(domain, lvl as u64).hash(&l, &r);
+            assert_eq!(generic, pfx, "node {lvl}");
+        }
+    }
+
     use super::*;
 
     #[test]

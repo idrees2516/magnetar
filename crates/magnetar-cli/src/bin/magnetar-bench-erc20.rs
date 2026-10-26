@@ -29,6 +29,16 @@ use magnetar_pcs::PcsParams;
 use magnetar_zkvm::{keygen_with, proof_stats, prove, verify, PublicInput};
 use std::time::Instant;
 
+/// The instance-batching density knob (paper §5.1: cycles per SIMD
+/// instance). `MAGNETAR_CPI=1|2|4|8…` sweeps it; the default is the
+/// witness layout's production constant.
+fn cpi_from_env() -> usize {
+    std::env::var("MAGNETAR_CPI")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI)
+}
+
 fn enc_i(imm: u32, rs1: u32, funct3: u32, rd: u32, op: u32) -> u32 {
     ((imm & 0xfff) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | op
 }
@@ -123,9 +133,14 @@ fn main() {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(12);
+    let min_stream_log2: usize = std::env::args()
+        .nth(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(13);
+    let cpi = cpi_from_env();
     println!("ERC-20 mixed-block load test (the paper's Table-6 workload shape)");
     println!(
-        "(64-bit balances, checked subtraction, every 16th transfer fails; {} cycles/tx)\n",
+        "(64-bit balances, checked subtraction, every 16th transfer fails; {} cycles/tx, cpi={cpi})\n",
         CYCLES_PER_TX
     );
     // ---- The monolithic prover (the small scales). ----
@@ -138,7 +153,7 @@ fn main() {
         let n_tx = total / CYCLES_PER_TX;
         let prog = erc20_program(n_tx as u32);
         let input = vec![1_000_000u64, 0u64];
-        let (pk, vk) = keygen_with(prog.clone(), total, 2, PcsParams::default());
+        let (pk, vk) = keygen_with(prog.clone(), total, 2, PcsParams::default(), cpi);
         let trace = magnetar_cpu::interp::execute(&pk.program, &input, total);
         let out = trace.final_state.output;
         // Sanity: successful transfers each move 7 from ram[0].
@@ -183,17 +198,14 @@ fn main() {
         "cpuRoot",
         "cpu/seg"
     );
-    for log2_t in [13usize, 14, 15, 16, 17, 18, 19, 20, 21]
-        .iter()
-        .filter(|t| {
-            **t <= max_log2
-                && **t
-                    >= std::env::var("MAGNETAR_MIN_LOG2")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(13)
-        })
-    {
+    for log2_t in (13usize..=24).filter(|t| {
+        *t >= min_stream_log2.max(
+            std::env::var("MAGNETAR_MIN_LOG2")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+        ) && *t <= max_log2
+    }) {
         let total = 1usize << log2_t;
         let n_tx = total / CYCLES_PER_TX;
         let prog = erc20_program(n_tx as u32);
@@ -202,9 +214,19 @@ fn main() {
         let out = trace.final_state.output;
         let expect = 1_000_000u64 - 7 * (n_tx as u64 - n_tx as u64 / 16);
         assert_eq!(out, expect, "the from-balance after {n_tx} mixed transfers");
-        // Adaptive ladder: bigger segments at scale (the per-segment
-        // fixed-cost amortization), overridable with MAGNETAR_SEG_LOG2.
-        let segments = magnetar_ivc::streaming::segment_count(total);
+        // Adaptive ladder: 2^12-cycle segments above 2^13 total. The
+        // root's per-instance discharge machinery costs ~33 ms wall per
+        // instance regardless of the instance's size (measured at
+        // 2^17–2^19), so 2^12-cycle segments amortize it 4× better than
+        // the 2^10-cycle ones of the previous release — measured at 2^18:
+        // 7,374 vs 4,341 cycles/s — while the per-worker envelope stays
+        // at the 2^12-cycle monolithic bound (≈ 350 MiB).
+        let segments = if total >= (1usize << 13) {
+            (total / (1usize << 12)).clamp(1, 4096)
+        } else {
+            1
+        }
+        .next_power_of_two();
         let t0 = Instant::now();
         let (proof, stats) = magnetar_ivc::prove_ivc_streaming(
             &prog,
@@ -213,21 +235,18 @@ fn main() {
             total,
             segments,
             &PcsParams::default(),
+            cpi,
         );
         let prove_ms = t0.elapsed().as_secs_f64() * 1e3;
-        if std::env::var_os("MAGNETAR_RSS").is_some() {
-            eprintln!(
-                "[rss] before-verify      {:>8.0} MiB",
-                magnetar_ivc::peak_rss_bytes() as f64 / 1048576.0
-            );
-        }
-        let ok = magnetar_ivc::verify_ivc(&prog, &input, out, total, &proof, &PcsParams::default());
-        if std::env::var_os("MAGNETAR_RSS").is_some() {
-            eprintln!(
-                "[rss] after-verify       {:>8.0} MiB",
-                magnetar_ivc::peak_rss_bytes() as f64 / 1048576.0
-            );
-        }
+        let ok = magnetar_ivc::verify_ivc(
+            &prog,
+            &input,
+            out,
+            total,
+            &proof,
+            &PcsParams::default(),
+            cpi,
+        );
         assert!(ok.is_ok(), "erc20 streaming at T=2^{log2_t} must verify");
         println!(
             "{:>7} {:>4} {:>10.0} {:>9.0}M {:>12.0} {:>10.0} {:>9.0} | {:>9.0} {:>9.0} {:>9.1}",

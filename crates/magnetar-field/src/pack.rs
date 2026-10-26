@@ -37,6 +37,48 @@ pub fn unpack_bits(p: Gf128) -> [bool; 128] {
     bits
 }
 
+/// A tabulated `φ_c` for one fixed coefficient vector `c`: 32 nibble
+/// tables (`T[j][v] = Σ_{b ∈ v} c[4j + b]`), so one application is 32
+/// table lookups + 31 additions — the per-bit branch loop is ~100x
+/// slower on the packed-table scales (the ring switch's A-factor
+/// materialization runs it over every packed word).
+pub struct PhiTab {
+    tabs: [[Gf128; 16]; 32],
+}
+
+impl PhiTab {
+    pub fn build(c: &[Gf128; 128]) -> Self {
+        let mut tabs = [[ZERO; 16]; 32];
+        for j in 0..32 {
+            for v in 0..16usize {
+                let mut acc = ZERO;
+                for b in 0..4usize {
+                    if (v >> b) & 1 == 1 {
+                        acc += c[4 * j + b];
+                    }
+                }
+                tabs[j][v] = acc;
+            }
+        }
+        PhiTab { tabs }
+    }
+
+    /// `φ_c(p)` via the nibble tables.
+    #[inline]
+    pub fn apply(&self, p: Gf128) -> Gf128 {
+        let lo = p.0 as u64;
+        let hi = (p.0 >> 64) as u64;
+        let mut acc = ZERO;
+        for j in 0..16 {
+            acc += self.tabs[j][(lo >> (4 * j)) as usize & 15];
+        }
+        for j in 0..16 {
+            acc += self.tabs[16 + j][(hi >> (4 * j)) as usize & 15];
+        }
+        acc
+    }
+}
+
 /// The ring-switching functional: `φ_c(P) = Σ_b c_b · bit_b(P)`.
 ///
 /// Given a packed element `P` and coefficients `c` (typically `c_b =

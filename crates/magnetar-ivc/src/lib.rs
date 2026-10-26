@@ -192,7 +192,13 @@ pub fn prove_ivc(
         total_len,
     );
     assert_eq!(full.records.len(), total_len);
-    let (pk, _vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone());
+    let (pk, _vk) = keygen_with(
+        program.to_vec(),
+        seg_len,
+        AMOUNT_BITS,
+        pcs.clone(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+    );
     let a_rom = pk.rom.a_rom;
 
     let mut statements = Vec::with_capacity(segments);
@@ -355,6 +361,7 @@ pub fn verify_ivc(
     total_len: usize,
     proof: &IvcProof,
     pcs: &PcsParams,
+    cpi: usize,
 ) -> Result<(), &'static str> {
     let segments = proof.statements.len();
     if !segments.is_power_of_two() || segments < 1 {
@@ -364,7 +371,7 @@ pub fn verify_ivc(
     if !seg_len.is_power_of_two() || seg_len < 2 {
         return Err("ivc: segment length");
     }
-    let (pk, vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone());
+    let (pk, vk) = keygen_with(program.to_vec(), seg_len, AMOUNT_BITS, pcs.clone(), cpi);
     // ---- The boundary chain.
     if proof.statements[0].init != Boundary::initial(input) {
         return Err("ivc: the first segment must start at the canonical state");

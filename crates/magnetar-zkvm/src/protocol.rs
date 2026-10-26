@@ -25,7 +25,9 @@ use crate::mosaic::{
 };
 use crate::RomTables;
 
-use magnetar_cpu::circuit::{build_circuit, witness_row, CircuitSpec, WITNESS_LAYOUT};
+use magnetar_cpu::circuit::{
+    build_circuit_batched, witness_row, CircuitSpec, InstanceGeometry, WITNESS_LAYOUT,
+};
 use magnetar_cpu::interp::execute;
 use magnetar_field::{mul, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
@@ -54,9 +56,14 @@ pub const AMOUNT_BITS: usize = 2;
 pub struct KeyGen {
     /// The RV64I program (raw instruction words).
     pub program: Vec<u32>,
-    /// The dual SIMD R1CS circuit.
+    /// The dual SIMD R1CS circuit (instance-batched at `cpi` cycles per
+    /// instance).
     pub circuit: CircuitSpec,
-    /// The witness-segment layout (virtual + direct, declared order).
+    /// The instance-batched geometry (cpi, the column map, the shared
+    /// `(1, x)` half).
+    pub geo: InstanceGeometry,
+    /// The witness-segment layout (virtual + direct, declared order;
+    /// lengths scaled by `cpi`).
     pub layout: SegmentLayout,
     /// The MosaicPCS component layout.
     pub mosaic: MosaicLayout,
@@ -89,6 +96,7 @@ impl KeyGen {
 pub struct VerifyingKey {
     pub program: Vec<u32>,
     pub circuit: CircuitSpec,
+    pub geo: InstanceGeometry,
     pub layout: SegmentLayout,
     pub mosaic: MosaicLayout,
     pub rom: RomTables,
@@ -247,67 +255,58 @@ pub struct Proof {
     pub mosaic: MosaicProof,
 }
 
-/// The W-segment names, in declared order (must match the circuit's
-/// offsets: each 64-column block at its aligned offset).
-/// The W-segment table (name, length, direct) — public for the stats
-/// instrumentation.
+/// The W-segment table (name, per-cycle length, direct) — mirrors
+/// `magnetar_cpu::SEGMENTS_CPU` (the source of truth) — public for the
+/// stats instrumentation.
 pub const fn segments() -> &'static [(&'static str, usize, bool)] {
-    SEGMENTS
+    magnetar_cpu::SEGMENTS_CPU
 }
 
-const SEGMENTS: &[(&str, usize, bool)] = &[
-    ("rs1", 64, false),
-    ("rs2", 64, false),
-    ("rd", 64, false),
-    ("load-val", 64, false),
-    ("shift-out", 64, false),
-    ("t1", 64, true),
-    ("t2", 64, true),
-    ("carry", 64, true),
-    ("alu", 64, true),
-    ("shift-src", 64, true),
-    ("store-old", 64, true),
-    ("store-src", 64, true),
-    ("flags", 16, true),
-    ("off", 8, true),
-    ("ram-addr", 8, true),
-    ("pc", 8, false),
-    ("fetch", 64, false),
-    ("eqaux", 64, true),
-    // The flag-derivation aux block (Remark 4): virtual — its values are
-    // R1CS-constrained against the bus and the ALU, so its VS claim needs
-    // no external discharge.
-    ("crossaux", 1024, false),
-];
+/// The declared segment table (the cpu-crate source of truth; the
+/// batched keygen scales its lengths by `cpi`).
+const SEGMENTS: &[(&str, usize, bool)] = magnetar_cpu::SEGMENTS_CPU;
 
 /// Derive the keys from the public program.
 pub fn keygen(program: Vec<u32>, trace_len: usize) -> (KeyGen, VerifyingKey) {
-    keygen_with(program, trace_len, AMOUNT_BITS, PcsParams::default())
+    keygen_with(
+        program,
+        trace_len,
+        AMOUNT_BITS,
+        PcsParams::default(),
+        WITNESS_LAYOUT::DEFAULT_CPI,
+    )
 }
 
 /// KeyGen with explicit parameters (the test scale and the production
-/// envelope differ in the shift-amount width and the PCS rate).
+/// envelope differ in the shift-amount width, the PCS rate, and the
+/// cycles-per-instance density).
 pub fn keygen_with(
     program: Vec<u32>,
     trace_len: usize,
     amount_bits: usize,
     pcs: PcsParams,
+    cpi: usize,
 ) -> (KeyGen, VerifyingKey) {
     assert!(trace_len.is_power_of_two() && trace_len >= 2);
+    assert!(
+        cpi.is_power_of_two() && cpi <= trace_len,
+        "cpi must be a power of two ≤ trace_len"
+    );
     // JALR's target is data-dependent; the cross-step transition table is
     // static — reject the program (docs/STATUS.md).
     assert!(
         !program.iter().any(|w| w & 0x7f == 0x67),
         "JALR is not supported (see docs/STATUS.md): the cross-step transition table is static"
     );
-    let circuit = build_circuit();
+    let geo = WITNESS_LAYOUT::geometry(cpi);
+    let circuit = build_circuit_batched(cpi);
     let layout = SegmentLayout::build(
-        WITNESS_LAYOUT::M / 2,
+        geo.w_cols,
         SEGMENTS
             .iter()
             .map(|(name, len, direct)| SegmentSpec {
                 name: name.to_string(),
-                len: *len,
+                len: len * cpi,
                 direct: *direct,
             })
             .collect(),
@@ -323,6 +322,7 @@ pub fn keygen_with(
     let pk = KeyGen {
         program: program.clone(),
         circuit: circuit.clone(),
+        geo: geo.clone(),
         layout: layout.clone(),
         mosaic: mosaic.clone(),
         rom: rom.clone(),
@@ -336,6 +336,7 @@ pub fn keygen_with(
     let vk = VerifyingKey {
         program,
         circuit,
+        geo,
         layout,
         mosaic,
         rom,
@@ -386,14 +387,18 @@ fn mosaic_components(n: usize, a_rom: usize) -> Vec<crate::mosaic::ComponentSpec
 
 /// One prover-side witness bundle.
 pub struct WitnessData {
-    /// The bit-packed w-half: 128 witness columns per `u128`, row-major
-    /// per instance (`q × W_COLS/128` words). This is the canonical
-    /// prover-side witness form — every consumer (the Spartan instance
-    /// fold, the matrix applications, the router inputs) reads bits by
-    /// word index, never by strided 16-byte gathers.
+    /// The bit-packed w-half: 128 per-instance witness columns per
+    /// `u128`, row-major per instance (`q' × w_cols/128` words, `q' =
+    /// T/cpi` instances). This is the canonical prover-side witness form
+    /// — every consumer (the Spartan instance fold, the matrix
+    /// applications, the router inputs) reads bits by word index, never
+    /// by strided 16-byte gathers.
     w_packed: Vec<u128>,
-    /// The public x columns (shared across every instance — the
-    /// eq(r_inst)-fold of a shared vector is the identity).
+    /// The instance-batched geometry.
+    pub geo: InstanceGeometry,
+    /// The public x columns (shared across every instance AND every
+    /// cycle of an instance — the eq-fold of a shared vector is the
+    /// identity).
     pub x_cols: Vec<Gf128>,
     /// The direct component tables (bits), in Mosaic order.
     direct_tables: Vec<Vec<bool>>,
@@ -406,10 +411,46 @@ pub struct WitnessData {
 }
 
 impl WitnessData {
-    /// Witness bit `(u, col)` of the w-half as a field element.
+    /// Witness bit `(instance u, per-instance column col')` of the
+    /// w-half as a field element.
     pub fn wbit(&self, u: usize, col: usize) -> Gf128 {
-        let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
+        let w128 = self.geo.w128;
         Gf128((self.w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1)
+    }
+
+    /// Witness bit `(cycle, per-cycle column col)` (the per-cycle
+    /// addressing: cycle `u·cpi + δ` of instance `u`, the column mapped
+    /// through the geometry).
+    pub fn wbit_cycle(&self, cycle: usize, col: usize) -> Gf128 {
+        let (u, delta) = (cycle / self.geo.cpi, cycle % self.geo.cpi);
+        self.wbit(u, self.geo.map_col(col, delta))
+    }
+
+    /// The 64-bit witness word at a 64-aligned per-cycle column `col` of
+    /// cycle `cycle` — one packed-word load at `cpi = 1` (the segment
+    /// blocks are 64-aligned and contiguous); at `cpi > 1` the per-cycle
+    /// word's bits are strided by `cpi` in the packed instance words, so
+    /// the word gathers bit-by-bit.
+    #[inline]
+    pub fn wword_cycle(&self, cycle: usize, col: usize) -> u64 {
+        debug_assert_eq!(col % 64, 0);
+        let (u, delta) = (cycle / self.geo.cpi, cycle % self.geo.cpi);
+        if self.geo.cpi == 1 {
+            let w = self.w_packed[u * self.geo.w128 + (col >> 7)];
+            return if col & 64 == 0 {
+                w as u64
+            } else {
+                (w >> 64) as u64
+            };
+        }
+        let base = self.geo.map_col(col, delta);
+        let step = self.geo.cpi;
+        let mut word = 0u64;
+        for b in 0..64usize {
+            let c = base + b * step;
+            word |= (((self.w_packed[u * self.geo.w128 + (c >> 7)] >> (c & 127)) & 1) as u64) << b;
+        }
+        word
     }
 
     pub fn w_packed(&self) -> &[u128] {
@@ -423,14 +464,16 @@ fn build_witness(
     pub_in: &PublicInput,
     trace: &magnetar_cpu::interp::Trace,
 ) -> WitnessData {
-    let q = pk.trace_len;
-    let m = WITNESS_LAYOUT::M;
-    let n = q.trailing_zeros() as usize;
+    let q_cycles = pk.trace_len;
+    let n = q_cycles.trailing_zeros() as usize;
+    let geo = pk.geo.clone();
+    let cpi = geo.cpi;
+    let q = q_cycles / cpi; // SIMD instances
     let rows = &trace.program.rows;
     let a_rom = pk.rom.a_rom;
-    // The public x vector per cycle.
+    // The per-cycle public x vector (the I/O binding).
     let public_x: Vec<Gf128> = {
-        let mut v = vec![ZERO; m / 2 - 1];
+        let mut v = vec![ZERO; WITNESS_LAYOUT::M / 2 - 1];
         v[0] = Gf128(pub_in.output as u128);
         for (i, &w) in pub_in.input.iter().enumerate() {
             if 1 + i < v.len() {
@@ -439,37 +482,69 @@ fn build_witness(
         }
         v
     };
-    // The witness: the bit-packed w-half (one word per 128 columns per
-    // instance) plus the shared public x vector. The former
-    // `q × m × 16 B` joint table — every bit a full field element — is
-    // gone: consumers read packed words and the x columns by index.
-    let w128 = magnetar_cpu::WITNESS_LAYOUT::W_COLS / 128;
+    // The shared per-instance x half: the same public vector (the
+    // per-cycle positions preserved, the rest padding).
+    let x_cols: Vec<Gf128> = {
+        let ncopy = public_x.len().min(geo.w_cols - 1);
+        let mut v = vec![ZERO; geo.w_cols - 1];
+        v[..ncopy].copy_from_slice(&public_x[..ncopy]);
+        v
+    };
+    // The witness: the bit-packed w-half (one word per 128 per-instance
+    // columns per instance). Instance u packs its cpi cycles through the
+    // geometry's column map — the per-cycle z is assembled per cycle and
+    // scattered into the instance's batched segment blocks.
+    let w128 = geo.w128;
+    debug_assert_eq!(w128, geo.w_cols / 128);
     let mut w_packed = vec![0u128; q * w128];
-    for (u, rec) in trace.records.iter().enumerate() {
-        let row = &rows[rec.micro_pc % rows.len()].row;
-        let z = witness_row(rec, row, &public_x);
-        let dst = &mut w_packed[u * w128..(u + 1) * w128];
-        for (k, w) in dst.iter_mut().enumerate() {
-            let mut word = 0u128;
-            for c in 0..128 {
-                word |= (z[k * 128 + c].0 & 1) << c;
+    for u in 0..q {
+        for delta in 0..cpi {
+            let cycle = u * cpi + delta;
+            let Some(rec) = trace.records.get(cycle) else {
+                continue;
+            };
+            let row = &rows[rec.micro_pc % rows.len()].row;
+            let z = witness_row(rec, row, &public_x);
+            let base = u * w128;
+            for (col, &zc) in z.iter().enumerate().take(WITNESS_LAYOUT::W_COLS) {
+                if zc.0 & 1 == 1 {
+                    let c = geo.map_col(col, delta);
+                    w_packed[base + (c >> 7)] |= 1u128 << (c & 127);
+                }
             }
-            *w = word;
         }
     }
-    // The direct segment tables (bit-extraction from the packed words).
+    // The direct segment tables (bit-extraction from the packed words):
+    // the batched segment's local index is `δ·len + col` (the δ-blocks
+    // contiguous), the instance shift `log(len·cpi)`. The table keeps the
+    // component's total cube `(local ‖ instance)` = `len·T` bits — the
+    // same size at every cpi.
     let mut direct_tables = Vec::new();
     for (name, len, _direct) in SEGMENTS.iter() {
         if !*_direct {
             continue;
         }
         let off = pk.layout.offsets[pk.layout.index_of(name).expect("segment")];
-        let lv = len.trailing_zeros() as usize;
-        let mut bits = vec![false; 1usize << (lv + n)];
-        for (u, _) in trace.records.iter().enumerate() {
-            for c in 0..*len {
-                bits[c | (u << lv)] =
-                    (w_packed[u * w128 + ((off + c) >> 7)] >> ((off + c) & 127)) & 1 == 1;
+        let blen = len * cpi;
+        let lv = blen.trailing_zeros() as usize;
+        debug_assert_eq!(1usize << lv, blen);
+        // The layout offsets are batched (cpi·per-cycle) — the per-cycle
+        // base column is `off / cpi`.
+        debug_assert_eq!(off % cpi, 0);
+        let per_cycle_off = off / cpi;
+        let mut bits = vec![false; blen * q];
+        for u in 0..q {
+            for delta in 0..cpi {
+                let cycle = u * cpi + delta;
+                if cycle >= trace.records.len() {
+                    break;
+                }
+                for c in 0..*len {
+                    // The local index: `col·cpi + δ` (δ = the low bits).
+                    let col = geo.map_col(per_cycle_off + c, delta);
+                    bits[(c * cpi + delta) | (u << lv)] =
+                        (w_packed[u * w128 + (col >> 7)] >> (col & 127)) & 1 == 1;
+                }
             }
         }
         direct_tables.push(bits);
@@ -480,7 +555,7 @@ fn build_witness(
     // every cycle (the paper's one-write-per-cycle model; no-op writes
     // carry zero increments).
     let write_one_hot = || -> Vec<bool> {
-        let mut b = vec![false; (1usize << 6) * q];
+        let mut b = vec![false; (1usize << 6) * q_cycles];
         for (u, rec) in trace.records.iter().enumerate() {
             let row = &rows[rec.micro_pc % rows.len()].row;
             let idx = if row.rd == 0 { 32 } else { row.rd };
@@ -491,7 +566,7 @@ fn build_witness(
     let reg_ports = vec![
         // Read 1: rs1's index.
         {
-            let mut b = vec![false; (1usize << 6) * q];
+            let mut b = vec![false; (1usize << 6) * q_cycles];
             for (u, rec) in trace.records.iter().enumerate() {
                 let row = &rows[rec.micro_pc % rows.len()].row;
                 b[row.rs1 | (u << 6)] = true;
@@ -500,7 +575,7 @@ fn build_witness(
         },
         // Read 2: rs2's index.
         {
-            let mut b = vec![false; (1usize << 6) * q];
+            let mut b = vec![false; (1usize << 6) * q_cycles];
             for (u, rec) in trace.records.iter().enumerate() {
                 let row = &rows[rec.micro_pc % rows.len()].row;
                 b[row.rs2 | (u << 6)] = true;
@@ -516,7 +591,7 @@ fn build_witness(
     ];
     // The register increment: XOR of the old and new written value.
     let reg_inc: Vec<Gf128> = {
-        let mut t = vec![ZERO; (1usize << 6) * q];
+        let mut t = vec![ZERO; (1usize << 6) * q_cycles];
         for (u, rec) in trace.records.iter().enumerate() {
             let xor = rec.rd_old ^ rec.rd_val;
             for o in 0..64 {
@@ -531,7 +606,7 @@ fn build_witness(
     };
     // The RAM Twist's witness.
     let ram_read_bits = {
-        let mut b = vec![false; (1usize << 8) * q];
+        let mut b = vec![false; (1usize << 8) * q_cycles];
         for (u, rec) in trace.records.iter().enumerate() {
             let idx = if rec.is_load || rec.is_store {
                 rec.ram_addr
@@ -546,14 +621,14 @@ fn build_witness(
     // cycle (loads write the same word back — a zero-increment no-op at
     // the loaded address; non-memory cycles write cell 0's content).
     let ram_write_bits = {
-        let mut b = vec![false; (1usize << 8) * q];
+        let mut b = vec![false; (1usize << 8) * q_cycles];
         for (u, rec) in trace.records.iter().enumerate() {
             b[rec.ram_addr | (u << 8)] = true;
         }
         b
     };
     let ram_inc: Vec<Gf128> = {
-        let mut t = vec![ZERO; (1usize << 6) * q];
+        let mut t = vec![ZERO; (1usize << 6) * q_cycles];
         for (u, rec) in trace.records.iter().enumerate() {
             if rec.is_store {
                 let xor = rec.ram_old ^ rec.ram_new;
@@ -581,7 +656,7 @@ fn build_witness(
     };
     // The fetch component.
     let fetch_bits = {
-        let mut b = vec![false; (1usize << a_rom) * q];
+        let mut b = vec![false; (1usize << a_rom) * q_cycles];
         for (u, rec) in trace.records.iter().enumerate() {
             b[(rec.micro_pc % rows.len()) | (u << a_rom)] = true;
         }
@@ -590,7 +665,8 @@ fn build_witness(
     let fetch_comp = magnetar_memory::AddressComponent::from_bits(a_rom, n, &fetch_bits);
     WitnessData {
         w_packed,
-        x_cols: public_x,
+        geo,
+        x_cols,
         direct_tables,
         reg_wit,
         ram_wit,
@@ -622,9 +698,12 @@ pub fn prove_inner(
     next_pc_public: Option<usize>,
     t: &mut Transcript,
 ) -> (InnerProof, Vec<MosaicClaim>) {
-    let q = pk.trace_len;
-    let m = WITNESS_LAYOUT::M;
-    let n = q.trailing_zeros() as usize;
+    let q_cycles = pk.trace_len;
+    let n = q_cycles.trailing_zeros() as usize; // the memory args' cycle vars
+    let geo = &pk.geo;
+    let cpi = geo.cpi;
+    let q = q_cycles / cpi; // the SIMD instance count
+    let m = geo.m;
     let a_rom = pk.rom.a_rom;
     let _rows = &trace.program.rows;
     let rel = DualRelation {
@@ -648,10 +727,20 @@ pub fn prove_inner(
         let i = pk.layout.index_of(name).expect("segment");
         seg_claims[i].clone()
     };
-    // The shared points.
-    let r_val: Vec<Gf128> = seg("rs1").r_local; // 6 vars
-    let r_local3: Vec<Gf128> = seg("pc").r_local; // 3 vars
+    // The shared points. A segment claim's local point is
+    // `[δ-vars ‖ col-vars]` (δ = the low bits of the batched segment's
+    // local index — ONE variable shared by every segment) and its
+    // instance point covers the `T/cpi` instances — the cycle point of
+    // cycle `u·cpi + δ` is the concatenation `[δ-vars ‖ instance-vars]`
+    // (δ = the cycle index's low bits).
+    let dvars = cpi.trailing_zeros() as usize;
+    let r_delta: Vec<Gf128> = seg("rs1").r_local[..dvars].to_vec();
+    let r_val: Vec<Gf128> = seg("rs1").r_local[dvars..dvars + 6].to_vec();
+    let r_local3: Vec<Gf128> = seg("pc").r_local[dvars..dvars + 3].to_vec();
     let r_inst: Vec<Gf128> = seg("rs1").r_inst;
+    let mut r_cycle: Vec<Gf128> = r_delta.clone();
+    r_cycle.extend_from_slice(&r_inst);
+    debug_assert_eq!(r_cycle.len(), n);
     // ---- 4a. BinaryTwist for registers. The initial memory is the
     // boundary's register file when a segment statement is present
     // (the Remark-4 initial-state binding), else the canonical zeros.
@@ -666,7 +755,7 @@ pub fn prove_inner(
         rv_claims: vec![seg("rs1").value, seg("rs2").value],
         wv_claim: seg("rd").value,
         r_val: r_val.clone(),
-        r_cycle: r_inst.clone(),
+        r_cycle: r_cycle.clone(),
     };
     let _pt = AccumTimer::new("3b-reg-twist");
     let (reg_proof, reg_twist_claims) = prove_twist(&reg_inst, &wd.reg_wit, t);
@@ -686,7 +775,7 @@ pub fn prove_inner(
     let mut reg_index_claims = Vec::new();
     for (s, comps) in port_comps.iter().enumerate() {
         let weights = slice_weights(&r_val, positions[s], 6);
-        let (claim, proof) = prove_psi_claim(comps, &r_inst, &weights, &format!("reg-psi-{s}"), t);
+        let (claim, proof) = prove_psi_claim(comps, &r_cycle, &weights, &format!("reg-psi-{s}"), t);
         reg_psi.push(proof);
         reg_index_claims.push(claim);
     }
@@ -703,7 +792,7 @@ pub fn prove_inner(
         };
         let mut acc = ZERO;
         let eq_v = magnetar_field::EqBits::build(&r_val).values;
-        let eq_c = magnetar_field::EqBits::build(&r_inst).values;
+        let eq_c = magnetar_field::EqBits::build(&r_cycle).values;
         for (u, rec) in trace.records.iter().enumerate() {
             // The write value: the written cell's post-write content —
             // the new word on stores, the current content at the access
@@ -749,7 +838,7 @@ pub fn prove_inner(
         rv_claims: vec![seg("load-val").value],
         wv_claim: ram_wv_claim,
         r_val: r_val.clone(),
-        r_cycle: r_inst.clone(),
+        r_cycle: r_cycle.clone(),
     };
     let _pt = AccumTimer::new("3c-ram-twist");
     let (ram_proof, ram_twist_claims) = prove_twist(&ram_inst, &wd.ram_wit, t);
@@ -761,7 +850,7 @@ pub fn prove_inner(
     let mut ram_addr_claims = Vec::new();
     for (s, comps) in wd.ram_wit.ports.iter().enumerate() {
         let weights = slice_weights(&r_local3, 0, 8);
-        let (claim, proof) = prove_psi_claim(comps, &r_inst, &weights, &format!("ram-psi-{s}"), t);
+        let (claim, proof) = prove_psi_claim(comps, &r_cycle, &weights, &format!("ram-psi-{s}"), t);
         ram_psi.push(proof);
         ram_addr_claims.push(claim);
     }
@@ -773,19 +862,24 @@ pub fn prove_inner(
     let inc_claim: Gf128 = magnetar_field::eval_mle(&wd.ram_wit.inc, &inc_point);
     t.absorb_field("ram-inc-claim", &[inc_claim]);
     // ---- 5a. BinaryRouter for shifts.
-    // The X table: the shift_src segment's bits.
-    let shift_src_off = pk.layout.offsets[pk.layout.index_of("shift-src").expect("segment")];
+    // The X table: the shift_src segment's bits (per cycle — the router's
+    // j dimension is the cycle).
+    let shift_src_off = pk.layout.offsets[pk.layout.index_of("shift-src").expect("segment")] / cpi;
     let x_shift: Vec<Gf128> = {
-        let mut x = vec![ZERO; (1usize << 6) * q];
+        let mut x = vec![ZERO; (1usize << 6) * q_cycles];
         for (u, _) in trace.records.iter().enumerate() {
-            for b in 0..64usize {
-                x[b | (u << 6)] = wd.wbit(u, shift_src_off + b);
+            let mut bits = wd.wword_cycle(u, shift_src_off);
+            while bits != 0 {
+                let b = bits.trailing_zeros() as usize;
+                x[b | (u << 6)] = ONE;
+                bits &= bits - 1;
             }
         }
         x
     };
     // The selector tables (over (h, j)) from the ROM at the fetched rows.
-    let (sel_lo, sel_hi, sel_st) = selector_tables_from_trace(&pk.rom, trace, pk.amount_bits, q);
+    let (sel_lo, sel_hi, sel_st) =
+        selector_tables_from_trace(&pk.rom, trace, pk.amount_bits, q_cycles);
     let (_, o_v, u_v, h_v) = pk.shift_tensor.clone();
     let shift_layout = RoutingLayout {
         o_vars: o_v,
@@ -797,15 +891,15 @@ pub fn prove_inner(
     // The shift router runs the join-enumeration prover (linear in T):
     // the per-column X and selector tables, never a joint materialization.
     let shift_wit = JoinWitness {
-        x: x_shift.clone(),
+        x: x_shift,
         selectors: vec![
             SelCol {
-                table: sel_lo.clone(),
+                table: sel_lo,
                 h_off: 0,
                 h_vars: pk.amount_bits,
             },
             SelCol {
-                table: sel_hi.clone(),
+                table: sel_hi,
                 h_off: pk.amount_bits,
                 h_vars: 2,
             },
@@ -818,7 +912,7 @@ pub fn prove_inner(
         &shift_layout,
         shift_claim,
         &r_val,
-        &r_inst,
+        &r_cycle,
         &RoutingTensor::from_parts(
             pk.shift_tensor.0.clone(),
             pk.shift_tensor.1,
@@ -845,21 +939,26 @@ pub fn prove_inner(
         a_vars: a_vs,
     };
     // The X table: (old, src) with u = bit + 64·half.
-    let old_off = pk.layout.offsets[pk.layout.index_of("store-old").expect("segment")];
-    let src_off = pk.layout.offsets[pk.layout.index_of("store-src").expect("segment")];
+    let old_off = pk.layout.offsets[pk.layout.index_of("store-old").expect("segment")] / cpi;
+    let src_off = pk.layout.offsets[pk.layout.index_of("store-src").expect("segment")] / cpi;
     let x_store: Vec<Gf128> = {
-        let mut x = vec![ZERO; (1usize << u_vs) * q];
+        let mut x = vec![ZERO; (1usize << u_vs) * q_cycles];
         for (u, _) in trace.records.iter().enumerate() {
-            for b in 0..64usize {
-                x[b | (u << u_vs)] = wd.wbit(u, old_off + b);
-                x[(b + 64) | (u << u_vs)] = wd.wbit(u, src_off + b);
+            let old_bits = wd.wword_cycle(u, old_off);
+            let src_bits = wd.wword_cycle(u, src_off);
+            for (half, bits) in [(0usize, old_bits), (64, src_bits)] {
+                let mut b = bits;
+                while b != 0 {
+                    let bit = b.trailing_zeros() as usize;
+                    x[(bit + half) | (u << u_vs)] = ONE;
+                    b &= b - 1;
+                }
             }
         }
         x
     };
     // The raw offset bits â_k(j) (per offset variable, one bool per cycle)
     // — the join prover derives the eq-links (1 + a_k + â_k) itself.
-    let off_off = pk.layout.offsets[pk.layout.index_of("off").expect("segment")];
     let off_bits: Vec<Vec<bool>> = (0..3)
         .map(|k| {
             trace
@@ -869,12 +968,11 @@ pub fn prove_inner(
                 .collect()
         })
         .collect();
-    let _ = off_off;
     // The store router runs the join-enumeration prover as well.
     let store_wit = JoinWitness {
-        x: x_store.clone(),
+        x: x_store,
         selectors: vec![SelCol {
-            table: sel_st.clone(),
+            table: sel_st,
             h_off: 0,
             h_vars: h_vs,
         }],
@@ -899,31 +997,38 @@ pub fn prove_inner(
         t,
     );
     drop(_pt);
-    // The store X split claims (the two segment MLEs at the router's
-    // terminal point).
+    // The store X split claims: the two 64-bit segment MLEs at the
+    // router's terminal point, evaluated DIRECTLY from the packed
+    // witness words — the word at cycle u contributes
+    // eq(p_j, u) · φ_{eq(p_bits,·)}(word), one popcount-weighted select
+    // per cycle (the old path rebuilt both 64·q bit tables).
     let store_x_claims: [Gf128; 2] = {
         let [p_old_pt, p_src_pt] = terminal_store_src_points(&store_layout, &store_router.terminal);
-        let old_mle = {
-            let mut x = vec![ZERO; (1usize << 6) * q];
-            for (u, _) in trace.records.iter().enumerate() {
-                for b in 0..64usize {
-                    x[b | (u << 6)] = wd.wbit(u, old_off + b);
+        let eval_word_mle = |off: usize, pt: &[Gf128]| -> Gf128 {
+            let (p_bits, p_j) = pt.split_at(6);
+            let eq_b = magnetar_field::EqBits::build(p_bits).values;
+            let eq_j = magnetar_field::EqBits::build(p_j).values;
+            let mut acc = ZERO;
+            for u in 0..q_cycles {
+                if eq_j[u] == ZERO {
+                    continue;
                 }
-            }
-            x
-        };
-        let src_mle = {
-            let mut x = vec![ZERO; (1usize << 6) * q];
-            for (u, _) in trace.records.iter().enumerate() {
-                for b in 0..64usize {
-                    x[b | (u << 6)] = wd.wbit(u, src_off + b);
+                let word = wd.wword_cycle(u, off);
+                // φ over the set bits only (the cleared bits multiply 0).
+                let mut inner = ZERO;
+                let mut bits = word;
+                while bits != 0 {
+                    let b = bits.trailing_zeros() as usize;
+                    inner += eq_b[b];
+                    bits &= bits - 1;
                 }
+                acc += mul(eq_j[u], inner);
             }
-            x
+            acc
         };
         [
-            magnetar_field::eval_mle(&old_mle, &p_old_pt),
-            magnetar_field::eval_mle(&src_mle, &p_src_pt),
+            eval_word_mle(old_off, &p_old_pt),
+            eval_word_mle(src_off, &p_src_pt),
         ]
     };
     t.absorb_field("store-x", &store_x_claims);
@@ -940,7 +1045,7 @@ pub fn prove_inner(
             (WITNESS_LAYOUT::BUS_RD, 6, reg_index_claims[2]),
         ],
         r_val: r_val.clone(),
-        r_cycle: r_inst.clone(),
+        r_cycle: r_cycle.clone(),
         pc_r_local: r_local3.clone(),
         pc_claim: seg("pc").value,
     };
@@ -1007,6 +1112,7 @@ pub fn prove_inner(
         &pk.layout,
         &pk.mosaic,
         n,
+        cpi,
         &seg_claims,
         &reg_twist_claims,
         &ram_twist_claims,
@@ -1080,7 +1186,7 @@ pub fn prove_inner(
             *ram_inc_v,
         ));
         // The public-point claims.
-        for c in boundary_point_claims(&pk.mosaic, a_rom, n, st) {
+        for c in boundary_point_claims(&pk.mosaic, a_rom, n, cpi, st) {
             mosaic_claims.push(c);
         }
         final_reg = Some(reg_fs_proof);
@@ -1096,8 +1202,10 @@ pub fn prove_inner(
         ));
         let halt_sel: Vec<Gf128> = {
             let h = magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT;
-            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((h >> i) & 1) as u128)).collect();
-            v.extend(vec![ONE; n]);
+            // The last cycle's point: δ and the instance bits all ones.
+            let mut v: Vec<Gf128> = vec![ONE; cpi.trailing_zeros() as usize];
+            v.extend((0..4).map(|i| Gf128(((h >> i) & 1) as u128)));
+            v.extend(vec![ONE; n - cpi.trailing_zeros() as usize]);
             v
         };
         mosaic_claims.push(MosaicClaim::new(
@@ -1146,8 +1254,12 @@ pub fn prove_inner(
         ));
         let flags_idx = pk.mosaic.index_of("seg-flags").expect("component");
         let flag_pt = |flag: usize, r_j: &[Gf128]| -> Vec<Gf128> {
-            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((flag >> i) & 1) as u128)).collect();
-            v.extend_from_slice(r_j);
+            // The batched component's local index is `col·cpi + δ` — the
+            // point is `[r_j's δ part ‖ flag bits ‖ r_j's instance part]`.
+            let dv = cpi.trailing_zeros() as usize;
+            let mut v: Vec<Gf128> = r_j[..dv].to_vec();
+            v.extend((0..4).map(|i| Gf128(((flag >> i) & 1) as u128)));
+            v.extend_from_slice(&r_j[dv..]);
             v
         };
         mosaic_claims.push(MosaicClaim::new(
@@ -1416,8 +1528,11 @@ fn terminal_x_point(layout: &RoutingLayout, terminal: &[Gf128]) -> Vec<Gf128> {
     pt
 }
 
-/// The two store source-segment claim points: the u-slice's low 6 vars
-/// (the bit index) ++ the j-slice, for each half.
+/// The two store source-segment claim points **in the X tables'
+/// convention** (`[bit-index vars ‖ cycle]`) — the per-cycle tables'
+/// MLE evaluations. The Mosaic claims reorder these into the batched
+/// components' `[δ ‖ bit-index ‖ instance]` convention (see
+/// `collect_mosaic_claims`).
 fn terminal_store_src_points(layout: &RoutingLayout, terminal: &[Gf128]) -> [Vec<Gf128>; 2] {
     let x = terminal_x_point(layout, terminal);
     let bits = x[..x.len() - layout.j_vars - 1].to_vec();
@@ -1427,6 +1542,18 @@ fn terminal_store_src_points(layout: &RoutingLayout, terminal: &[Gf128]) -> [Vec
     let mut p1 = bits;
     p1.extend_from_slice(&j);
     [p0, p1]
+}
+
+/// Reorder a router X point `[bit-index vars ‖ cycle]` into the batched
+/// segment component's `[δ ‖ bit-index vars ‖ the cycle's instance part]`
+/// (the component's local index is `col·cpi + δ`).
+fn x_point_to_component(x_pt: &[Gf128], u_vars: usize, j_vars: usize, cpi: usize) -> Vec<Gf128> {
+    let dv = cpi.trailing_zeros() as usize;
+    let mut pt: Vec<Gf128> = x_pt[u_vars..u_vars + dv].to_vec();
+    pt.extend_from_slice(&x_pt[..u_vars]);
+    pt.extend_from_slice(&x_pt[u_vars + dv..]);
+    let _ = j_vars;
+    pt
 }
 
 /// Build the per-cycle selector tables from the trace's fetch sequence.
@@ -1460,8 +1587,10 @@ pub fn boundary_point_claims(
     mosaic: &MosaicLayout,
     a_rom: usize,
     n: usize,
+    cpi: usize,
     st: &SegmentStatement,
 ) -> Vec<MosaicClaim> {
+    let dv = cpi.trailing_zeros() as usize;
     let mut out = Vec::with_capacity(3);
     // fetch-ra at (init pc, cycle 0) = 1.
     let mut pt: Vec<Gf128> = (0..a_rom)
@@ -1475,18 +1604,23 @@ pub fn boundary_point_claims(
     ));
     // The halt flag at cycles 0 and T−1. The 16 flag bits are 4 MLE
     // variables (little-endian), so the selector for flag bit F_HALT is
-    // the **bits of F_HALT**, not the index comparison.
+    // the **bits of F_HALT**, not the index comparison. The batched
+    // seg-flags component's local index is `col·cpi + δ` (δ the low
+    // bits), so the point is `[δ ‖ flag bits ‖ instance]` — at the last
+    // cycle BOTH the δ and the instance bits are all ones.
     let halt = magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT;
     let sel: Vec<Gf128> = (0..4).map(|i| Gf128(((halt >> i) & 1) as u128)).collect();
-    let mut pt0 = sel.clone();
-    pt0.extend(vec![ZERO; n]);
+    let mut pt0: Vec<Gf128> = vec![ZERO; dv];
+    pt0.extend_from_slice(&sel);
+    pt0.extend(vec![ZERO; n - dv]);
     out.push(MosaicClaim::new(
         mosaic.index_of("seg-flags").expect("component"),
         pt0,
         Gf128(st.init.halted as u128),
     ));
-    let mut ptl = sel;
-    ptl.extend(vec![ONE; n]);
+    let mut ptl: Vec<Gf128> = vec![ONE; dv];
+    ptl.extend_from_slice(&sel);
+    ptl.extend(vec![ONE; n - dv]);
     out.push(MosaicClaim::new(
         mosaic.index_of("seg-flags").expect("component"),
         ptl,
@@ -1502,6 +1636,7 @@ fn collect_mosaic_claims(
     layout: &SegmentLayout,
     mosaic: &MosaicLayout,
     n: usize,
+    cpi: usize,
     seg_claims: &[SegmentClaim],
     reg_claims: &TwistPcsClaims,
     ram_claims: &TwistPcsClaims,
@@ -1636,29 +1771,29 @@ fn collect_mosaic_claims(
             out.push(MosaicClaim::new(idx("fetch-ra"), c.point.clone(), c.value));
         }
     }
-    // 7. The shift router's X claim → the shift-src segment.
+    // 7. The shift router's X claim → the shift-src segment. The router's
+    //    X point is `[bit-index vars (6) ‖ cycle]`; the batched segment
+    //    component's local index is `col·cpi + δ`, so the claim point is
+    //    reordered to `[δ ‖ bit-index ‖ the cycle's instance part]`.
     {
         let x_pt = terminal_x_point(shift_layout, shift_terminal);
-        // The u-slice IS the bit index (6 vars) ++ the j-slice.
-        let mut pt = x_pt[..6].to_vec();
-        pt.extend_from_slice(&x_pt[shift_layout.u_vars..]);
         out.push(MosaicClaim::new(
             idx("seg-shift-src"),
-            pt,
+            x_point_to_component(&x_pt, shift_layout.u_vars, shift_layout.j_vars, cpi),
             shift_router.x_value,
         ));
     }
-    // 8. The store router's X split claims.
+    // 8. The store router's X split claims (the same δ-first reorder).
     {
         let [p_old, p_src] = terminal_store_src_points(store_layout, store_terminal);
         out.push(MosaicClaim::new(
             idx("seg-store-old"),
-            p_old,
+            x_point_to_component(&p_old, store_layout.u_vars - 1, store_layout.j_vars, cpi),
             store_x_claims[0],
         ));
         out.push(MosaicClaim::new(
             idx("seg-store-src"),
-            p_src,
+            x_point_to_component(&p_src, store_layout.u_vars - 1, store_layout.j_vars, cpi),
             store_x_claims[1],
         ));
     }
@@ -1691,12 +1826,16 @@ pub fn verify_inner(
     next_pc_public: Option<usize>,
     t: &mut Transcript,
 ) -> Result<Vec<MosaicClaim>, &'static str> {
-    let q = vk.trace_len;
-    let m = WITNESS_LAYOUT::M;
-    let n = q.trailing_zeros() as usize;
+    let q_cycles = vk.trace_len;
+    let n = q_cycles.trailing_zeros() as usize; // the memory args' cycle vars
+    let geo = &vk.geo;
+    let cpi = geo.cpi;
+    let q = q_cycles / cpi; // the SIMD instance count
+    let m = geo.m;
     let a_rom = vk.rom.a_rom;
-    // The public x per cycle (the I/O binding).
-    let public: Vec<Vec<Gf128>> = {
+    // The shared public x (the I/O binding — identical for every
+    // instance AND every cycle of an instance).
+    let x_shared: Vec<Gf128> = {
         let mut v = vec![ZERO; m / 2 - 1];
         v[0] = Gf128(pub_in.output as u128);
         for (i, &w) in pub_in.input.iter().enumerate() {
@@ -1704,7 +1843,7 @@ pub fn verify_inner(
                 v[1 + i] = Gf128(w as u128);
             }
         }
-        vec![v; q]
+        v
     };
     let rel = DualRelation {
         m,
@@ -1716,14 +1855,21 @@ pub fn verify_inner(
         c_fld: vk.circuit.c_fld.clone(),
     };
     // ---- 3. Virtual Spartan.
-    let seg_claims = verify_virtual_spartan(&rel, &vk.layout, q, &public, &inner.vs, t)?;
+    let seg_claims = verify_virtual_spartan(&rel, &vk.layout, q, &x_shared, &inner.vs, t)?;
     let seg = |name: &str| -> SegmentClaim {
         let i = vk.layout.index_of(name).expect("segment");
         seg_claims[i].clone()
     };
-    let r_val: Vec<Gf128> = seg("rs1").r_local;
-    let r_local3: Vec<Gf128> = seg("pc").r_local;
+    // The points: the batched segment claims' local point is
+    // `[δ-vars ‖ col-vars]`; the cycle point is `[δ-vars ‖ instance-vars]`.
+    let dvars = cpi.trailing_zeros() as usize;
+    let r_delta: Vec<Gf128> = seg("rs1").r_local[..dvars].to_vec();
+    let r_val: Vec<Gf128> = seg("rs1").r_local[dvars..dvars + 6].to_vec();
+    let r_local3: Vec<Gf128> = seg("pc").r_local[dvars..dvars + 3].to_vec();
     let r_inst: Vec<Gf128> = seg("rs1").r_inst;
+    let mut r_cycle: Vec<Gf128> = r_delta.clone();
+    r_cycle.extend_from_slice(&r_inst);
+    debug_assert_eq!(r_cycle.len(), n);
     // ---- 4a. The register Twist. The initial memory comes from the
     // boundary statement when present.
     let reg_inst = TwistInstance {
@@ -1737,7 +1883,7 @@ pub fn verify_inner(
         rv_claims: vec![seg("rs1").value, seg("rs2").value],
         wv_claim: seg("rd").value,
         r_val: r_val.clone(),
-        r_cycle: r_inst.clone(),
+        r_cycle: r_cycle.clone(),
     };
     let reg_claims = verify_twist(&reg_inst, 1, &inner.reg_twist, t)?;
     // The register-index Ψ-sum-checks.
@@ -1752,7 +1898,7 @@ pub fn verify_inner(
             1,
             6,
             n,
-            &r_inst,
+            &r_cycle,
             &weights,
             inner.reg_index_claims[s],
             &inner.reg_psi[s],
@@ -1784,7 +1930,7 @@ pub fn verify_inner(
         rv_claims: vec![seg("load-val").value],
         wv_claim: inner.ram_wv_claim,
         r_val: r_val.clone(),
-        r_cycle: r_inst.clone(),
+        r_cycle: r_cycle.clone(),
     };
     let ram_claims = verify_twist(&ram_inst, 1, &inner.ram_twist, t)?;
     // The RAM address Ψ-sum-checks — the claims must equal the ram-addr
@@ -1797,7 +1943,7 @@ pub fn verify_inner(
             1,
             8,
             n,
-            &r_inst,
+            &r_cycle,
             &weights,
             inner.ram_addr_claims[s],
             &inner.ram_psi[s],
@@ -1834,7 +1980,7 @@ pub fn verify_inner(
         &shift_layout,
         seg("shift-out").value,
         &r_val,
-        &r_inst,
+        &r_cycle,
         &shift_r_pub,
         2,
         0,
@@ -1900,7 +2046,7 @@ pub fn verify_inner(
             (WITNESS_LAYOUT::BUS_RD, 6, inner.reg_index_claims[2]),
         ],
         r_val: r_val.clone(),
-        r_cycle: r_inst.clone(),
+        r_cycle: r_cycle.clone(),
         pc_r_local: r_local3.clone(),
         pc_claim: seg("pc").value,
     };
@@ -1952,6 +2098,7 @@ pub fn verify_inner(
         &vk.layout,
         &vk.mosaic,
         n,
+        cpi,
         &seg_claims,
         &reg_claims,
         &ram_claims,
@@ -2013,7 +2160,7 @@ pub fn verify_inner(
             let (ipt, iv) = &claims.inc_point;
             mosaic_claims.push(MosaicClaim::new(idx_inc, ipt.clone(), *iv));
         }
-        for c in boundary_point_claims(&vk.mosaic, a_rom, n, st) {
+        for c in boundary_point_claims(&vk.mosaic, a_rom, n, cpi, st) {
             mosaic_claims.push(c);
         }
     } else {
@@ -2026,8 +2173,10 @@ pub fn verify_inner(
         ));
         let halt_sel: Vec<Gf128> = {
             let h = magnetar_cpu::circuit::WITNESS_LAYOUT::F_HALT;
-            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((h >> i) & 1) as u128)).collect();
-            v.extend(vec![ONE; n]);
+            // The last cycle's point: δ and the instance bits all ones.
+            let mut v: Vec<Gf128> = vec![ONE; cpi.trailing_zeros() as usize];
+            v.extend((0..4).map(|i| Gf128(((h >> i) & 1) as u128)));
+            v.extend(vec![ONE; n - cpi.trailing_zeros() as usize]);
             v
         };
         mosaic_claims.push(MosaicClaim::new(
@@ -2066,8 +2215,12 @@ pub fn verify_inner(
         ));
         let flags_idx = vk.mosaic.index_of("seg-flags").expect("component");
         let flag_pt = |flag: usize, r_j: &[Gf128]| -> Vec<Gf128> {
-            let mut v: Vec<Gf128> = (0..4).map(|i| Gf128(((flag >> i) & 1) as u128)).collect();
-            v.extend_from_slice(r_j);
+            // The batched component's local index is `col·cpi + δ` — the
+            // point is `[r_j's δ part ‖ flag bits ‖ r_j's instance part]`.
+            let dv = cpi.trailing_zeros() as usize;
+            let mut v: Vec<Gf128> = r_j[..dv].to_vec();
+            v.extend((0..4).map(|i| Gf128(((flag >> i) & 1) as u128)));
+            v.extend_from_slice(&r_j[dv..]);
             v
         };
         mosaic_claims.push(MosaicClaim::new(
@@ -2179,6 +2332,113 @@ mod tests {
         );
     }
 
+    /// The instance-batched ladder (paper §5.1: several cycles per SIMD
+    /// instance): the same statement proves and verifies at every `cpi`,
+    /// and a tampered witness-derived claim is rejected at every `cpi` —
+    /// the batched relations bind exactly the per-cycle constraint
+    /// surface.
+    #[test]
+    fn end_to_end_instance_batched_cpi() {
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            (2u32 << 20) | (1 << 15) | (3 << 7) | 0x33,
+            (3u32 << 20) | (2 << 15) | (4 << 7) | 0x33,
+            0x0000_0073,
+        ];
+        for cpi in [2usize, 4, 8] {
+            let (pk, vk) = keygen_with(program.clone(), 8, AMOUNT_BITS, PcsParams::default(), cpi);
+            assert_eq!(pk.geo.cpi, cpi);
+            assert_eq!(pk.geo.m, 2 * 2048 * cpi);
+            assert_eq!(pk.circuit.m, pk.geo.m);
+            // q' = 8/cpi SIMD instances.
+            assert_eq!(pk.circuit.cpi, cpi);
+            let pub_in = PublicInput {
+                input: vec![],
+                output: 0,
+            };
+            let proof = prove(&pk, &pub_in);
+            assert!(
+                verify(&vk, &pub_in, &proof).is_ok(),
+                "cpi={cpi}: honest proof must verify"
+            );
+            // Tamper: a witness-derived proof element (the first direct
+            // segment's claimed value) — the batched adder recurrence
+            // must reject at every cpi.
+            let mut bad = proof.clone();
+            bad.inner.vs.segment_values[0] += ONE;
+            assert!(
+                verify(&vk, &pub_in, &bad).is_err(),
+                "cpi={cpi}: the tampered witness must be rejected"
+            );
+        }
+    }
+
+    /// The batched memory shape (loads/stores through the twists and the
+    /// routers) at cpi = 2: the virtual claims' cycle points thread
+    /// `[δ-vars ‖ instance-vars]` through every auxiliary argument.
+    #[test]
+    fn end_to_end_memory_ops_batched() {
+        // addi x1, x0, 16; addi x2, x0, 0xAB; sb x2, 0(x1); lb x3, 0(x1);
+        // lh x4, 0(x1); slli x5, x1, 3; ecall.
+        let program = vec![
+            0x01000093,                                 // addi x1, x0, 16
+            0x0ab00113,                                 // addi x2, x0, 0xAB
+            ((2u32 << 20) | (1 << 15)) | 0x23,          // sb x2, 0(x1)
+            (1 << 15) | (3 << 7) | 0x03,                // lb x3, 0(x1)
+            (1 << 15) | (1 << 12) | (4 << 7) | 0x03,    // lh x4, 0(x1)
+            (1u32 << 12) | (5 << 7) | (1 << 15) | 0x13, // slli x5, x1, 3
+            0x0000_0073,
+        ];
+        let (pk, vk) = keygen_with(program, 16, AMOUNT_BITS, PcsParams::default(), 2);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: 0,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert!(
+            verify(&vk, &pub_in, &proof).is_ok(),
+            "cpi=2 memory proof verifies"
+        );
+    }
+
+    /// The batched tamper classes at cpi = 4: terminals, segment values,
+    /// inner rounds, and the public output binding.
+    #[test]
+    fn batched_tamper_classes_rejected() {
+        let program = vec![
+            enc_i(1, 0, 0, 1, 0x13),
+            enc_i(1, 0, 0, 2, 0x13),
+            (2u32 << 20) | (1 << 15) | (3 << 7) | 0x33,
+            0x0000_0073,
+        ];
+        let (pk, vk) = keygen_with(program, 8, AMOUNT_BITS, PcsParams::default(), 4);
+        let pub_in = PublicInput {
+            input: vec![],
+            output: 0,
+        };
+        let proof = prove(&pk, &pub_in);
+        assert!(verify(&vk, &pub_in, &proof).is_ok());
+        // A tampered outer terminal.
+        let mut bad = proof.clone();
+        bad.inner.vs.terminals[0] += ONE;
+        assert!(verify(&vk, &pub_in, &bad).is_err());
+        // A tampered segment value.
+        let mut bad = proof.clone();
+        bad.inner.vs.segment_values[0] += ONE;
+        assert!(verify(&vk, &pub_in, &bad).is_err());
+        // A tampered inner round.
+        let mut bad = proof.clone();
+        bad.inner.vs.inner[0][1] += ONE;
+        assert!(verify(&vk, &pub_in, &bad).is_err());
+        // A wrong output claim.
+        let bad_in = PublicInput {
+            input: vec![],
+            output: 1,
+        };
+        assert!(verify(&vk, &bad_in, &proof).is_err());
+    }
+
     /// The ZK-masked Mosaic batching discharge (roadmap H1): the round
     /// messages are blinded by per-round mask polynomials; the uniform
     /// finish offset closes the terminal identity. The masked proof must
@@ -2248,19 +2508,17 @@ mod tests {
         // the chunk ring (40 queries).
         let tail_bytes = |p: &Proof| -> usize {
             // The full byte inventory of the evaluation-argument tail:
-            // round messages + level roots + queries + tail + anchors
+            // round messages + level roots + queries + tail + the partials
             // (+ the wrap's consistency openings).
             let ring = |r: &magnetar_pcs::RingProof| -> usize {
                 let mut n = r.rounds.iter().map(|m| m.len() * 16).sum::<usize>();
+                n += r.partials.len() * 16;
                 n += r.level_roots.len() * 32;
                 for q in &r.queries {
                     n += q.levels.len() * 3 * (16 + 32);
                 }
                 for (_v, path) in &r.tail {
                     n += 16 + path.len() * 32;
-                }
-                for a in &r.anchors {
-                    n += 16 + a.main_path.len() * 32 + 16 + a.c_path.len() * 32;
                 }
                 n
             };
@@ -2362,7 +2620,13 @@ mod tests {
             0x0000_0073,                        // ecall
         ];
         let input = vec![1_000_000u64, 0u64];
-        let (pk, vk) = keygen_with(program.clone(), 256, 2, PcsParams::default());
+        let (pk, vk) = keygen_with(
+            program.clone(),
+            256,
+            2,
+            PcsParams::default(),
+            WITNESS_LAYOUT::DEFAULT_CPI,
+        );
         let pub_in = PublicInput {
             input: input.clone(),
             output: 1_000_000 - 7 * 19,
@@ -2391,7 +2655,13 @@ mod tests {
             (3u32 << 20) | (1 << 15) | (1 << 12) | (3 << 7) | 0x13, // slli x3, x1, 3
             0x0000_0073,
         ];
-        let (pk, vk) = keygen_with(program, 4, 2, PcsParams::default());
+        let (pk, vk) = keygen_with(
+            program,
+            4,
+            2,
+            PcsParams::default(),
+            WITNESS_LAYOUT::DEFAULT_CPI,
+        );
         let pub_in = PublicInput {
             input: vec![],
             output: 0,

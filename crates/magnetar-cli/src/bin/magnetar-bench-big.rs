@@ -30,8 +30,13 @@ fn main() {
         enc_i(0, 5, 0, 10, 0x13),
         0x0000_0073,
     ];
-    let (pk, vk) =
-        magnetar_zkvm::keygen_with(program.clone(), t, 2, magnetar_pcs::PcsParams::default());
+    let (pk, vk) = magnetar_zkvm::keygen_with(
+        program.clone(),
+        t,
+        2,
+        magnetar_pcs::PcsParams::default(),
+        magnetar_cpu::WITNESS_LAYOUT::DEFAULT_CPI,
+    );
     let trace = magnetar_cpu::interp::execute(&pk.program, &[], t);
     let out = trace.final_state.output;
     let pub_in = magnetar_zkvm::PublicInput {

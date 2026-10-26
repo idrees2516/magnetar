@@ -366,7 +366,8 @@ pub fn prove_bus_shout(
     }
     // The pc Ψ-sum-check (weights = eq(pc_r_local, ·) over the address bits).
     let weights = pc_weights(&spec.pc_r_local, a);
-    let (_, pc_psi) = prove_psi_claim(components, &spec.r_cycle, &weights, "bus-pc-psi", t);
+    let (_pc_psi_claim, pc_psi) =
+        prove_psi_claim(components, &spec.r_cycle, &weights, "bus-pc-psi", t);
     let psi_claims = pc_psi.component_claims.clone();
     // Δ\* per component (sparse per-cycle address traces).
     let comp_addrs: Vec<Vec<usize>> = components
