@@ -793,6 +793,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "magnetar-mikros"
+version = "0.1.0"
+dependencies = [
+ "magnetar-field",
+ "magnetar-hash",
+ "magnetar-pcs",
+ "rand",
+]
+
+[[package]]
 name = "magnetar-pcs"
 version = "0.1.0"
 dependencies = [

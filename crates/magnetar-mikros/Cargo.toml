@@ -1,0 +1,15 @@
+[package]
+name = "magnetar-mikros"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Mikros: bitwidth-aware SNARK components over extensions of small fields (IACR ePrint 2026/2646) — algebraic vector packing, packed Hadamard/inner-product/permutation proofs, packed PCS openings, and batched-instance R1CS."
+
+[dependencies]
+magnetar-field = { path = "../magnetar-field" }
+magnetar-hash = { path = "../magnetar-hash" }
+magnetar-pcs = { path = "../magnetar-pcs" }
+
+[dev-dependencies]
+rand = "0.10"

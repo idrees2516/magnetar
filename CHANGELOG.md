@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.10.0 — Mikros (ePrint 2026/2646): the bitwidth-aware SNARK suite, complete and benchmarked
+
+The paper's full protocol stack on this repo's fields
+(`F = GF(2) ⊂ K = GF(2^8) ⊂ E = GF(2^128)`, packing width κ = 128):
+algorithms 1–6 implemented, cross-validated against dense E-arithmetic
+references, tamper-gated, and benchmarked against the paper's Tables 3–4.
+
+### The new crate (`magnetar-mikros`)
+- **Algorithm 1** (`innerprod`): the packed inner-product proof — the
+  monomial/reciprocal packing, the Laurent correction polynomials
+  `h±` (2·127 GF(2) coefficients), `x ←$ E×`, Fact-1 to the terminal
+  packed claims with the monomial column weights.
+- **Algorithm 3** (`perm`): the packed permutation proof — the GF(2)
+  coefficient-tree `C_τ(Z)` (7 levels, the AND-convolution build with
+  tail-safe row-half extraction), the column-major flatten, the E-tree
+  of cubic weighted sum-checks down to `l₇^⊤C₇(z)r₇`, the 7 coefficient
+  transitions (the `u` column claims via aggregate-then-evaluate, the
+  Lagrange-residual quotient `h = f/Ψ`, the per-node `η` encodings
+  z-evaluated then row-dotted — 3.6× over the per-pair GF(2^8) bucket
+  route on scalar hardware), and the terminal packed-PCS claims
+  `v₀ − z = l₀^⊤Dρ(x)` per operand.
+- **The cubic weighted sum-check engine** (`perm::cubic_*`): the
+  degree-3 round messages with the char-2 Boolean check, the child MLEs
+  at the shared row point, the verifier's ξ̂ fold.
+- **The benchmark binary** (`mikros-bench`): Table 3 (the 2^30 binary
+  Hadamard), Table 4 (end-to-end packed batches of 256 SHA-256 / Keccak
+  / BLAKE3 instances through Algorithm 6), and the perm anatomy ladder.
+
+### Fixed (found by the composed protocols and the dense references)
+- **The Fact-1 terminal absorb**: prove absorbed `fact1-term` (one
+  duplex call) while verify absorbed `fact1-v1` + `fact1-v2` — the
+  labels are part of the duplex domain separation, so every protocol
+  that samples a challenge *after* a Fact-1 silently forked its
+  transcript. Invisible in Fact-1's own tests; fatal in Algorithm 6.
+- **The Fact-1 → PCS point order**: Fact-1 binds its vector MSB-first,
+  the fold-chain PCS binds LSB-first — the witness claims are now
+  reversed at the opening boundary (batch + packed-open).
+- **`ts_msbf` coordinate order**: the MSB-first tensor-sum materializer
+  grew the recursion with the last coordinate first; the first draft
+  had it inverted, which only surfaced three transitions deep in the
+  perm unfold as a broken `v_{τ+1} = 〈u, r_{τ+1}〉` invariant.
+- **The Keccak io positions**: the output lanes are io-marked in (y,x)
+  order, not column-creation order — the batch io-bind's masked-eq scan
+  requires the sorted set; `CircuitBuilder::build` now sorts + dedups.
+- Prover-side claim asserts removed where tamper tests deliberately
+  feed dishonest claims (the established repo pattern: the verifier's
+  rejection is the test).
+
+### Benchmarks (single-threaded, the 2-vCPU container; the paper's host
+is a Xeon Gold 6342 with GFNI/AVX-512 — see `docs/BENCHMARKS.md` for
+the honest hardware-gap anatomy; ~41× on the pure PIOP core)
+- **Table 3 (N = 2^30 Hadamard)**: prover 27.99 s, verifier 258 µs,
+  proof 5,216 B, **peak RSS 915.8 MiB inside the paper's 0.89 GiB
+  envelope**.
+- **Table 4 (256-instance hash batches)**: SHA-256 2.54 s / Keccak
+  5.07 s / BLAKE3 1.24 s prover, verifier 78–191 ms, RSS ≤ 269 MiB —
+  the verifier within 3–10× of the paper, memory better; the proof
+  size 3.5–4.0 MiB is the FastChunk operating point (the size profiles
+  are the knob).
+- **The perm argument**: 703 ms at N = 2^20 / 2.36 s at 2^22 (the η
+  pipeline 86%, the `g` contractions 9%).
+
+### The remaining paper piece
+Algorithm 5 (the single-instance PLONK composition: the gate layer +
+the §5.1 copy-constraint encoding over `K_pos` at width κ_pos, feeding
+`perm`) — the Table-5 protocol. Everything below that composition is
+done: `perm.rs` exposes the exact terminal interface it consumes.
+
 ## 0.9.3 — the fw-bound-se group-fold attack + the transient-eq unlock + the 2^13-cycle operating point
 
 The biggest measured root lever of the 0.9.2 anatomy (the `fw-bound-se`

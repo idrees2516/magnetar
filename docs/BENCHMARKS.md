@@ -20,6 +20,114 @@ MAGNETAR_TIME=1 cargo run --release -p magnetar-cli --bin magnetar-bench-big -- 
 cargo run --release -p magnetar-cli --bin magnetar -- profiles     # dual-rate tails
 ```
 
+## Mikros (ePrint 2026/2646) — the bitwidth-aware SNARK benchmarks
+
+The `magnetar-mikros` crate implements the Mikros framework end-to-end on
+this stack's fields (`F = GF(2) ⊂ K = GF(2^8) ⊂ E = GF(2^128)`, packing
+width κ = 128): Algorithms 1–6 (packed inner-product, packed Hadamard,
+packed permutation, packed PCS opening, and the batched-instance R1CS
+SNARK), with every component cross-validated against dense E-arithmetic
+references and tamper-gated. Benchmarks run single-threaded per the
+paper's protocol:
+
+```sh
+cargo run --release -p magnetar-mikros --bin mikros-bench -- hadamard --log2-n 30
+cargo run --release -p magnetar-mikros --bin mikros-bench -- hashes --batch 256
+cargo run --release -p magnetar-mikros --bin mikros-bench -- perm --log2-n 22
+```
+
+**The hardware caveat (read this first):** the paper's host is a Xeon
+Gold 6342 with **GFNI + AVX-512 + VPCLMULQDQ**, where the dominant
+kernels (the GF(2^8) row products, the spread/transpose steps) are
+single instructions. This dev container (2 vCPU, 3 GiB) has *none* of
+those — the same kernels run scalar with table lookups. The Table-3 PIOP
+measures the gap directly: ~41× on the pure sum-check core. The numbers
+below are the honest container measurements; the protocol shape, proof
+sizes, and memory envelopes are the comparables, absolute times are not
+(on the InstaBox AVX-512 host the same code paths pick up the GFNI
+dispatch — see the `magnetar-field::avx` measured dispatch — and the
+earlier sessions measured 10–20× on exactly these kernel classes).
+
+### Table 3 — the binary Hadamard product at N = 2^30 (κ = 128)
+
+| metric | this implementation (container) | paper (Xeon 6342) |
+|---|---|---|
+| prover | 27,985 ms | 684.48 ms |
+| verifier | 258 µs | 34 µs |
+| proof size | 5,216 B | 4,888 B |
+| peak RSS | **915.8 MiB** | **0.89 GiB** |
+
+The proof size matches the paper's shape (the same κ column claims + the
+127-coefficient quotient + the Fact-1 reduction; the ~7% delta is our
+Fact-1 carrying `[p0,p1,s]` per round vs. their tighter encoding), and
+**the peak RSS lands inside the paper's own 0.89 GiB envelope** — the
+bitsliced plane layout is exactly their memory profile. The prover
+anatomy at 2^30: encodings 11.7 s + spreads/buckets 6.1 s + the `a,b`
+selector builds 7.8 s + the d-fold 1.8 s + Fact-1 0.5 s — the first two
+phases are precisely `VPGF2P8MULB`/`VPCLMULQDQ` territory.
+
+### Table 4 — end-to-end packed hash batches (256 instances, Algorithm 6)
+
+Our circuits: SHA-256 compression 96,000 rows (N = 2^17), Keccak-f[1600]
+132,096 rows (N = 2^18), BLAKE3 compression 61,440 rows (N = 2^16); the
+batch is ν = 2 packed blocks of κ = 128 instances (the §5.3
+larger-batch z-combination of the ν linchecks is the documented next
+step — it saves one Fact-1 per block).
+
+| workload | prover (256 inst.) | verifier | proof | peak RSS | paper prover |
+|---|---|---|---|---|---|
+| SHA-256 | 2,541 ms | 118 ms | 3,730 KiB | 136 MiB | 79.54 ms / 37.47 ms / 367.71 KiB |
+| Keccak | 5,069 ms | 191 ms | 3,993 KiB | 269 MiB | 100.15 ms / 19.30 ms / 380.31 KiB |
+| BLAKE3 | 1,240 ms | 78 ms | 3,471 KiB | 269 MiB | 56.13 ms / 35.74 ms / 355.64 KiB |
+
+Verifier times are within 3–10× of the paper (the direct sparse
+evaluation dominates both); memory is *better* than the paper's
+606 MiB SHA-256 figure (the packed planes are 2 MiB against their
+per-instance layouts). The proof size is the one honest regression: our
+FastChunk PCS operating point (rate 1/2, 40 correlated FRI queries)
+carries full Merkle paths per query; the paper's Ligerito-Fast openings
+are ~10× more compact. The repo's size profiles (the `magnetar profiles`
+command: FastChunk → DeepWrap) trade exactly this axis.
+
+### The permutation argument (Algorithm 3, the Table-5 complement)
+
+The grand-product proof over committed planes (the component the
+paper's Table 5 measures *via* the single-instance PLONK copy
+constraint — their "excl. perm." column is 6.72 s of 86.56 s at
+N = 2^25, i.e. the perm argument is ~12.9× the rest of the system).
+Measured at the §4.3 geometry (base field GF(2), κ = 128):
+
+| N | prover | bits/s | verifier | proof |
+|---|---|---|---|---|
+| 2^20 | 703 ms | 412,726 | 5.7 ms | 74.7 KiB |
+| 2^22 | 2,360 ms | 622,816 | 12.5 ms | 79.9 KiB |
+
+Prover anatomy: the η off-domain sampling pipeline ~86% (the per-node
+Lagrange encodings z-evaluated then row-dotted — the interchange that
+saved 3.6× over the per-pair bucket route), the `g` contractions ~9%,
+the coefficient-tree build + E-tree + cubic sum-checks the rest. The
+paper's Table-5 geometry runs the same algorithm at κ_pos = 16 over the
+position-encoded wires (§5.1) — the single-instance PLONK composition
+(Algorithm 5) is the remaining unimplemented protocol piece, with the
+copy-constraint reduction (Lemma 2's joint value/position encoding)
+specified in `perm.rs`'s module doc.
+
+### Implementation notes (the bugs the cross-validation caught)
+
+- The Fact-1 terminal absorb: the prover's `fact1-term` label vs. the
+  verifier's split `fact1-v1`/`fact1-v2` diverged the duplex state —
+  invisible in standalone tests (nothing sampled downstream), fatal in
+  every composed protocol.
+- The Fact-1 → PCS point order: Fact-1 binds the vector MSB-first, the
+  PCS binds its MLE LSB-first — the terminal claims must be *reversed*.
+- `ts_msbf` (the MSB-first tensor-sum materialization): the growing
+  recursion applies the **last** coordinate first; the first draft had
+  it backwards, which only surfaced as a claim-invariant break three
+  levels deep in the perm unfold.
+- The Keccak io positions: the output lanes are pushed in (y,x) order,
+  not column-creation order — the batch io-bind's masked-eq scan
+  requires the sorted set (fixed in `CircuitBuilder::build`).
+
 ## End-to-end results (this implementation)
 
 Current numbers (the fw-bound-se group-fold attack + the transient-eq

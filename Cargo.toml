@@ -13,6 +13,7 @@ members = [
     "crates/magnetar-ivc",
     "crates/magnetar-cli",
     "crates/magnetar-bitsum",
+    "crates/magnetar-mikros",
 ]
 
 [workspace.package]
@@ -36,6 +37,7 @@ magnetar-router = { path = "crates/magnetar-router" }
 magnetar-cpu = { path = "crates/magnetar-cpu" }
 magnetar-zkvm = { path = "crates/magnetar-zkvm" }
 magnetar-bitsum = { path = "crates/magnetar-bitsum" }
+magnetar-mikros = { path = "crates/magnetar-mikros" }
 
 # NVlabs cuTile GPU kernel DSL (optional; built only with magnetar-bitsum's
 # `cutile` feature — requires the CUDA 13.x toolkit at build time).
