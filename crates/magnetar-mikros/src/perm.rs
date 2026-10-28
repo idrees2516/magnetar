@@ -70,12 +70,17 @@ pub struct CubicProof {
     pub challenges: Vec<Gf128>,
 }
 
-fn triple_dot(x: &[Gf128], y: &[Gf128], z: &[Gf128]) -> Gf128 {
-    let mut acc = ZERO;
-    for i in 0..x.len() {
-        acc += mul(mul(x[i], y[i]), z[i]);
-    }
-    acc
+/// The VPCLMULQDQ-laned triple dot `〈x, y∘z〉` with caller scratch (the
+/// cubic rounds' inner product; bit-identical to the scalar
+/// `Σ_i x_i·(y_i·z_i)`, cross-validated by `simd::dot3_e`'s tests).
+fn triple_dot_v(
+    s1: &mut Vec<Gf128>,
+    s2: &mut Vec<Gf128>,
+    x: &[Gf128],
+    y: &[Gf128],
+    z: &[Gf128],
+) -> Gf128 {
+    crate::simd::dot3_e(s1, s2, x, y, z)
 }
 
 /// Prove `v = 〈ξ, cu ∘ cd〉` (all three length `L = 2^d`), folding in
@@ -94,6 +99,9 @@ pub fn cubic_prove(
     let mut len = xi.len();
     debug_assert_eq!(cu.len(), len);
     debug_assert_eq!(cd.len(), len);
+    // hoisted kernel scratch (the triple-dot staging buffers)
+    let mut s1: Vec<Gf128> = Vec::with_capacity(len / 2 + 1);
+    let mut s2: Vec<Gf128> = Vec::with_capacity(len / 2 + 1);
     while len > 1 {
         let half = len / 2;
         let (xi_lo, xi_hi) = xi.split_at_mut(half);
@@ -118,21 +126,20 @@ pub fn cubic_prove(
             .zip(cd_hi.iter())
             .map(|(a, b)| *a + *b)
             .collect();
-        let q0 = triple_dot(xi_lo, cu_lo, cd_lo);
-        let q3 = triple_dot(&xit, &cut, &cdt);
-        let q1 = triple_dot(&xit, cu_lo, cd_lo)
-            + triple_dot(xi_lo, &cut, cd_lo)
-            + triple_dot(xi_lo, cu_lo, &cdt);
-        let q2 = triple_dot(&xit, &cut, cd_lo)
-            + triple_dot(&xit, cu_lo, &cdt)
-            + triple_dot(xi_lo, &cut, &cdt);
+        let q0 = triple_dot_v(&mut s1, &mut s2, xi_lo, cu_lo, cd_lo);
+        let q3 = triple_dot_v(&mut s1, &mut s2, &xit, &cut, &cdt);
+        let q1 = triple_dot_v(&mut s1, &mut s2, &xit, cu_lo, cd_lo)
+            + triple_dot_v(&mut s1, &mut s2, xi_lo, &cut, cd_lo)
+            + triple_dot_v(&mut s1, &mut s2, xi_lo, cu_lo, &cdt);
+        let q2 = triple_dot_v(&mut s1, &mut s2, &xit, &cut, cd_lo)
+            + triple_dot_v(&mut s1, &mut s2, &xit, cu_lo, &cdt)
+            + triple_dot_v(&mut s1, &mut s2, xi_lo, &cut, &cdt);
         t.absorb_field("perm-cub", &[q0, q1, q2, q3]);
         let lambda = t.challenge_field("perm-cub-r");
-        for i in 0..half {
-            xi_lo[i] += mul(lambda, xit[i]);
-            cu_lo[i] += mul(lambda, cut[i]);
-            cd_lo[i] += mul(lambda, cdt[i]);
-        }
+        // the in-place folds through the VPCLMULQDQ lanes
+        magnetar_field::avx::axpy_run(xi_lo, &xit, lambda, half);
+        magnetar_field::avx::axpy_run(cu_lo, &cut, lambda, half);
+        magnetar_field::avx::axpy_run(cd_lo, &cdt, lambda, half);
         xi.truncate(half);
         cu.truncate(half);
         cd.truncate(half);
@@ -465,38 +472,36 @@ fn ncoef_at(tau: usize) -> usize {
 }
 
 /// `g_τ(z,x)[r] = Σ_{d,j} C_τ[d][r][j]·z^d·ρ_j(x)` — contract the columns
-/// with `ρ(x)` per coefficient layer, then evaluate at `z`.
+/// with `ρ(x)` per coefficient layer, then evaluate at `z`. The per-layer
+/// selector build runs j-outer through the AVX-512 lanes and the z-mix
+/// is a broadcast-multiply-accumulate run.
 fn contract_g(tree: &CoefTree, tau: usize, rho: &[Gf128], zp: &[Gf128]) -> Vec<Gf128> {
     let level = &tree.levels[tau];
     let rows = level.rows;
     let ncoef = ncoef_at(tau);
     let wp = level.wp;
     let mut g = vec![ZERO; rows];
+    let mut planes = vec![0u64; 128 * wp];
     for d in 0..ncoef {
-        // the E-selector build: coordinate-e plane = XOR of the column
-        // planes j with bit_e(ρ_j) set
-        let mut planes = vec![0u64; 128 * wp];
-        for e in 0..128 {
-            let out = &mut planes[e * wp..(e + 1) * wp];
-            for j in 0..KAPPA {
-                if (rho[j].0 >> e) & 1 == 1 {
-                    let sp = level.plane(CoefTree::plane_idx(tau, j, d));
-                    for k in 0..wp {
-                        out[k] ^= sp[k];
-                    }
+        planes.iter_mut().for_each(|w| *w = 0);
+        // the E-selector build, j-outer: plane e = XOR of the column planes
+        // j with bit_e(ρ_j) set
+        for j in 0..KAPPA {
+            let rj = rho[j].0;
+            if rj == 0 {
+                continue;
+            }
+            let sp = level.plane(CoefTree::plane_idx(tau, j, d));
+            for e in 0..128 {
+                if (rj >> e) & 1 == 1 {
+                    let out = &mut planes[e * wp..(e + 1) * wp];
+                    crate::simd::xor_into(out, sp);
                 }
             }
         }
         // g += (the transposed words)·z^d — tail-safe word assembly
-        for r in 0..rows {
-            let mut word = 0u128;
-            for e in 0..128 {
-                if (planes[e * wp + r / 64] >> (r % 64)) & 1 == 1 {
-                    word |= 1u128 << e;
-                }
-            }
-            g[r] += mul(Gf128(word), zp[d]);
-        }
+        let words = crate::planes::planes_to_words(&planes, wp * 64);
+        magnetar_field::avx::axpy_run(&mut g, &words[..rows], zp[d], rows);
     }
     g
 }
@@ -528,14 +533,20 @@ fn f_samples_eta(
     let rows_half = l.len();
     let ncoef = ncoef_at(tau);
     let wp = rows_half.div_ceil(64);
-    // hoisted scratch: the K-coded encodings and their byte spreads
-    let mut enc_u: [Vec<u64>; 8] = std::array::from_fn(|_| vec![0u64; wp]);
-    let mut enc_d: [Vec<u64>; 8] = std::array::from_fn(|_| vec![0u64; wp]);
+    // hoisted scratch: the K-coded encodings (ncoef·wp words per plane)
+    // and their byte spreads
+    let mut enc_u: [Vec<u64>; 8] = std::array::from_fn(|_| vec![0u64; ncoef * wp]);
+    let mut enc_d: [Vec<u64>; 8] = std::array::from_fn(|_| vec![0u64; ncoef * wp]);
     let mut spread_u: Vec<[u8; 64]> = vec![[0u8; 64]; wp];
     let mut spread_d: Vec<[u8; 64]> = vec![[0u8; 64]; wp];
     // the z-evaluated half encodings over the rows
     let mut gu: Vec<Gf128> = vec![ZERO; rows_half];
     let mut gd: Vec<Gf128> = vec![ZERO; rows_half];
+    // kernel scratch: the embed staging buffer + its product run
+    let mut ebuf = [ZERO; 64];
+    let mut prod = [ZERO; 64];
+    let mut s1: Vec<Gf128> = Vec::new();
+    let mut s2: Vec<Gf128> = Vec::new();
     let mut out = Vec::with_capacity(data.nodes_off.len());
     for node in 0..data.nodes_off.len() {
         let row = &data.psi_off[node];
@@ -554,13 +565,17 @@ fn f_samples_eta(
         for v in gd.iter_mut() {
             *v = ZERO;
         }
+        // all ncoef coefficient layers encoded in one merged pass per
+        // half — one dispatch per (c, j), the d-planes streamed contiguously
+        // (the coefficient planes of column j are adjacent in the level)
+        encode_layers_half_u(tree, tau, ncoef, &sel, rows_half, &mut enc_u);
+        encode_layers_half_d(tree, tau, ncoef, &sel, rows_half, &mut enc_d);
         for d in 0..ncoef {
-            encode_layer_into_u(tree, tau, d, &sel, rows_half, &mut enc_u);
-            encode_layer_into_d(tree, tau, d, &sel, rows_half, &mut enc_d);
             for w in 0..wp {
-                let words: [u64; 8] = std::array::from_fn(|c| enc_u[c][w]);
+                let base_idx = d * wp + w;
+                let words: [u64; 8] = std::array::from_fn(|c| enc_u[c][base_idx]);
                 spread_u[w] = crate::planes::spread8(&words);
-                let words: [u64; 8] = std::array::from_fn(|c| enc_d[c][w]);
+                let words: [u64; 8] = std::array::from_fn(|c| enc_d[c][base_idx]);
                 spread_d[w] = crate::planes::spread8(&words);
             }
             let zd = zp[d];
@@ -568,21 +583,29 @@ fn f_samples_eta(
                 let base = w * 64;
                 let su = &spread_u[w];
                 let sd = &spread_d[w];
-                for rr in 0..64 {
-                    let idx = base + rr;
-                    if idx >= rows_half {
-                        break;
-                    }
-                    gu[idx] += mul(f8.embed8[su[rr] as usize], zd);
-                    gd[idx] += mul(f8.embed8[sd[rr] as usize], zd);
+                let n = (rows_half - base).min(64);
+                // gu[base..] += embed(su)·z^d — L1 table lookups staged
+                // into a mul_run, then the lane XOR
+                for i in 0..n {
+                    ebuf[i] = f8.embed8[su[i] as usize];
                 }
+                let done = magnetar_field::avx::mul_run(&mut prod[..n], &ebuf[..n], zd, n);
+                for i in done..n {
+                    prod[i] = mul(ebuf[i], zd);
+                }
+                crate::simd::xor_into_e(&mut gu[base..base + n], &prod[..n]);
+                for i in 0..n {
+                    ebuf[i] = f8.embed8[sd[i] as usize];
+                }
+                let done = magnetar_field::avx::mul_run(&mut prod[..n], &ebuf[..n], zd, n);
+                for i in done..n {
+                    prod[i] = mul(ebuf[i], zd);
+                }
+                crate::simd::xor_into_e(&mut gd[base..base + n], &prod[..n]);
             }
         }
-        // f(γ′) = Σ_r l_r·ĜU[r]·ĜD[r] − gC(γ′)
-        let mut f_val = ZERO;
-        for r in 0..rows_half {
-            f_val += mul(l[r], mul(gu[r], gd[r]));
-        }
+        // f(γ′) = Σ_r l_r·ĜU[r]·ĜD[r] − gC(γ′) — the laned triple dot
+        let f_val = crate::simd::dot3_e(&mut s1, &mut s2, l, &gu, &gd);
         let mut g_c = ZERO;
         for j in 0..KAPPA {
             g_c += mul(u[j], f8.embed(row[j]));
@@ -592,40 +615,50 @@ fn f_samples_eta(
     out
 }
 
-/// `encode_layer_u` writing into caller-managed buffers (the per-node
-/// allocation hoist).
-fn encode_layer_into_u(
+/// All `ncoef` coefficient layers of the UPPER half encoded in one merged
+/// pass: `out[c]` holds the `ncoef·wp` words `encU[c][d·wp + w]` — one
+/// dispatch per (c, j) with the d-planes of column j streamed contiguously
+/// (they are adjacent in the level layout), amortising the kernel-call
+/// overhead across the whole coefficient stack (the τ=6 level has 65).
+fn encode_layers_half_u(
     tree: &CoefTree,
     tau: usize,
-    d: usize,
+    ncoef: usize,
     sel: &[[u64; 2]; 8],
     rows_half: usize,
     out: &mut [Vec<u64>; 8],
 ) {
     let level = &tree.levels[tau];
     let wp = rows_half.div_ceil(64);
+    let full = rows_half / 64; // whole words within the u-half
     for c in 0..8 {
         let selc = sel[c];
         let oc = &mut out[c];
-        for v in oc.iter_mut() {
-            *v = 0;
-        }
+        oc.clear();
+        oc.resize(ncoef * wp, 0);
         for j in 0..KAPPA {
             if (selc[j / 64] >> (j % 64)) & 1 == 1 {
-                let sp = level.plane(CoefTree::plane_idx(tau, j, d));
-                for k in 0..wp {
-                    oc[k] ^= half_word_u(sp, rows_half, k);
+                // the coefficient planes of column j are contiguous
+                for d in 0..ncoef {
+                    let sp = level.plane(CoefTree::plane_idx(tau, j, d));
+                    let dst = &mut oc[d * wp..(d + 1) * wp];
+                    crate::simd::xor_into(&mut dst[..full], &sp[..full]);
+                    for k in full..wp {
+                        dst[k] ^= half_word_u(sp, rows_half, k);
+                    }
                 }
             }
         }
     }
 }
 
-/// `encode_layer_d` writing into caller-managed buffers.
-fn encode_layer_into_d(
+/// All `ncoef` coefficient layers of the LOWER half, merged as above. The
+/// lower half is word-aligned whenever `rows_half` is a multiple of 64
+/// (every level of the benchmark geometries).
+fn encode_layers_half_d(
     tree: &CoefTree,
     tau: usize,
-    d: usize,
+    ncoef: usize,
     sel: &[[u64; 2]; 8],
     rows_half: usize,
     out: &mut [Vec<u64>; 8],
@@ -633,17 +666,25 @@ fn encode_layer_into_d(
     let level = &tree.levels[tau];
     let rows_total = level.rows;
     let wp = rows_half.div_ceil(64);
+    let aligned = rows_half.is_multiple_of(64);
     for c in 0..8 {
         let selc = sel[c];
         let oc = &mut out[c];
-        for v in oc.iter_mut() {
-            *v = 0;
-        }
+        oc.clear();
+        oc.resize(ncoef * wp, 0);
         for j in 0..KAPPA {
             if (selc[j / 64] >> (j % 64)) & 1 == 1 {
-                let sp = level.plane(CoefTree::plane_idx(tau, j, d));
-                for k in 0..wp {
-                    oc[k] ^= half_word_d(sp, rows_total, rows_half, k);
+                for d in 0..ncoef {
+                    let sp = level.plane(CoefTree::plane_idx(tau, j, d));
+                    let dst = &mut oc[d * wp..(d + 1) * wp];
+                    if aligned {
+                        let w0 = rows_half / 64;
+                        crate::simd::xor_into(dst, &sp[w0..w0 + wp]);
+                    } else {
+                        for k in 0..wp {
+                            dst[k] ^= half_word_d(sp, rows_total, rows_half, k);
+                        }
+                    }
                 }
             }
         }
@@ -758,9 +799,10 @@ pub fn prove_perm(
         let mut cur = c7.clone();
         for _ in 0..log_m {
             let half = cur.len() / 2;
-            let mut next = Vec::with_capacity(half);
-            for i in 0..half {
-                next.push(mul(cur[i], cur[half + i]));
+            let mut next = vec![ZERO; half];
+            let done = magnetar_field::avx::mulvv(&mut next, &cur[..half], &cur[half..], half);
+            for i in done..half {
+                next[i] = mul(cur[i], cur[half + i]);
             }
             e_vecs.push(next.clone());
             cur = next;

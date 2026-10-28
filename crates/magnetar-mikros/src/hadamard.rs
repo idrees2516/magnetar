@@ -165,70 +165,104 @@ pub fn prove_hadamard_timed(
     t.absorb_field("had-d", &d);
 
     // --- Step 2: the f-samples at the 127 off-domain nodes.
+    //
+    // The encodings are computed in NODE_BATCH-node batches: one source
+    // pass per batch (the single-node form re-reads the 8·m-byte witness
+    // per node — the dominant traffic of the whole proof at large m).
+    const NODE_BATCH: usize = 4;
     let t1 = Instant::now();
     let nodes = data.nodes_off.len();
     let wp = m / 64;
     let mk_enc = || -> [Vec<u64>; 8] { std::array::from_fn(|_| vec![0u64; wp]) };
     let mut enc_a = mk_enc();
     let mut enc_b = mk_enc();
-    let mut bucket: Vec<Gf128> = vec![Gf128(0); 65536];
+    // batched scratch: 4 nodes × 2 operands × 8 planes
+    let mut batch_sels: [[[u64; 2]; 8]; NODE_BATCH] = [[[0; 2]; 8]; NODE_BATCH];
+    let mut batch_a: [[Vec<u64>; 8]; NODE_BATCH] = std::array::from_fn(|_| mk_enc());
+    let mut batch_b: [[Vec<u64>; 8]; NODE_BATCH] = std::array::from_fn(|_| mk_enc());
+    let mut bucket: Vec<Gf128> = vec![Gf128(0); 65536]; // the scalar route's table
     let mut f_samples = Vec::with_capacity(nodes);
     let mut enc_ms = 0.0f64;
     let mut buck_ms = 0.0f64;
     let mut fold_ms = 0.0f64;
-    for node in 0..nodes {
-        // selectors: bit c of each ψ_j(γ') (shared by gA and gB — the same
-        // Lagrange basis drives both encodings)
-        let mut sel = [[0u64; 2]; 8];
-        let row = &data.psi_off[node];
-        for j in 0..KAPPA {
-            for c in 0..8 {
-                let bit = ((row[j] >> c) & 1) as u64;
-                sel[c][j / 64] |= bit << (j % 64);
+    let mut node = 0usize;
+    while node < nodes {
+        let take = NODE_BATCH.min(nodes - node);
+        // per-node selectors + the gC(γ') terms
+        let mut g_cs = [ZERO; NODE_BATCH];
+        for bi in 0..take {
+            let row = &data.psi_off[node + bi];
+            let mut sel = [[0u64; 2]; 8];
+            for j in 0..KAPPA {
+                for c in 0..8 {
+                    let bit = ((row[j] >> c) & 1) as u64;
+                    sel[c][j / 64] |= bit << (j % 64);
+                }
             }
+            batch_sels[bi] = sel;
+            let mut g_c = ZERO;
+            for j in 0..KAPPA {
+                g_c += mul(d[j], f8.embed(row[j]));
+            }
+            g_cs[bi] = g_c;
         }
+        // the batched encodings — one source pass per batch
         let te = Instant::now();
-        a.encode_k(&sel, &mut enc_a);
-        b.encode_k(&sel, &mut enc_b);
+        if take == NODE_BATCH {
+            a.encode_k4(&batch_sels, &mut batch_a);
+            b.encode_k4(&batch_sels, &mut batch_b);
+        } else {
+            for bi in 0..take {
+                a.encode_k(&batch_sels[bi], &mut batch_a[bi]);
+                b.encode_k(&batch_sels[bi], &mut batch_b[bi]);
+            }
+        }
         enc_ms += te.elapsed().as_secs_f64() * 1e3;
-        // bucket pass
-        for v in bucket.iter_mut() {
-            *v = Gf128(0);
-        }
-        let tb1 = Instant::now();
-        for w in 0..wp {
-            let mut wa = [0u64; 8];
-            let mut wb = [0u64; 8];
-            for c in 0..8 {
-                wa[c] = enc_a[c][w];
-                wb[c] = enc_b[c][w];
+        for bi in 0..take {
+            std::mem::swap(&mut enc_a, &mut batch_a[bi]);
+            std::mem::swap(&mut enc_b, &mut batch_b[bi]);
+            // The GFNI product-bucket route (VPGF2P8MULB + a 256-entry L1
+            // bucket + a 256-term fold) — None on non-GFNI hosts.
+            if let Some(total) = crate::simd::sample_fold_products(f8, &enc_a, &enc_b, &l.words) {
+                f_samples.push(total + g_cs[bi]); // char 2: subtract = add
+                continue;
             }
-            let ba = spread8(&wa);
-            let bb = spread8(&wb);
-            let base_row = w * 64;
-            for rr in 0..64 {
-                let key = ((ba[rr] as usize) << 8) | bb[rr] as usize;
-                bucket[key] += l.words[base_row + rr];
+            // scalar route: the 64K (a,b)-bucket pass + fold
+            for v in bucket.iter_mut() {
+                *v = Gf128(0);
             }
-        }
-        buck_ms += tb1.elapsed().as_secs_f64() * 1e3; // includes the spreads
-                                                      // gC(γ') = 〈d, ψ(γ')〉 and the fold Σ_key T16[key]·bucket[key]
-        let tf = Instant::now();
-        let mut g_c = ZERO;
-        for j in 0..KAPPA {
-            g_c += mul(d[j], f8.embed(row[j]));
-        }
-        let mut total = ZERO;
-        for key in 0..65536usize {
-            if bucket[key] != ZERO {
-                total += mul(bucket[key], f8.embed(f8.mul_tab[key]));
+            let tb1 = Instant::now();
+            for w in 0..wp {
+                let mut wa = [0u64; 8];
+                let mut wb = [0u64; 8];
+                for c in 0..8 {
+                    wa[c] = enc_a[c][w];
+                    wb[c] = enc_b[c][w];
+                }
+                let ba = spread8(&wa);
+                let bb = spread8(&wb);
+                let base_row = w * 64;
+                for rr in 0..64 {
+                    let key = ((ba[rr] as usize) << 8) | bb[rr] as usize;
+                    bucket[key] += l.words[base_row + rr];
+                }
             }
+            buck_ms += tb1.elapsed().as_secs_f64() * 1e3; // includes the spreads
+                                                          // the fold Σ_key T16[key]·bucket[key]
+            let tf = Instant::now();
+            let mut total = ZERO;
+            for key in 0..65536usize {
+                if bucket[key] != ZERO {
+                    total += mul(bucket[key], f8.embed(f8.mul_tab[key]));
+                }
+            }
+            f_samples.push(total + g_cs[bi]); // char 2: subtract = add
+            fold_ms += tf.elapsed().as_secs_f64() * 1e3;
         }
-        f_samples.push(total + g_c); // char 2: subtract = add
-        fold_ms += tf.elapsed().as_secs_f64() * 1e3;
+        node += take;
     }
     stats.encodings_ms = enc_ms;
-    stats.bucket_ms = buck_ms; // (spread+bucket; the split reported together)
+    stats.bucket_ms = buck_ms; // (the GFNI route reports here as ~0)
     stats.fold_ms = fold_ms;
     let _ = t1;
 
@@ -245,9 +279,7 @@ pub fn prove_hadamard_timed(
     let t3 = Instant::now();
     let a_vec = encode_e_words(a, &rho, m);
     let mut b_vec = encode_e_words(b, &rho, m);
-    for i in 0..m {
-        b_vec[i] = mul(b_vec[i], l.words[i]);
-    }
+    crate::simd::mul_assign_e(&mut b_vec, &l.words); // b ∘ l, VPCLMULQDQ-laned
     stats.ab_ms = t3.elapsed().as_secs_f64() * 1e3;
 
     // --- Step 5: the reduced claim and Fact 1.
@@ -274,32 +306,24 @@ pub fn prove_hadamard_timed(
 /// `A·ρ` as E-words: coordinate-e plane = XOR of witness planes j with
 /// bit_e(ρ_j) set (the E-generalisation of `encode_k`'s selector XOR).
 /// Shared by the Hadamard, inner-product, and permutation provers.
+///
+/// The j-outer pass streams each source plane once across the 128 output
+/// coordinate planes through the AVX-512 lanes — the L2 traffic of the
+/// c-outer draft (128 × re-read) collapses to a single pass.
 pub(crate) fn encode_e_words(ps: &PlaneSet, rho: &[Gf128], m: usize) -> Vec<Gf128> {
     let wp = m / 64;
     let mut planes = vec![0u64; 128 * wp];
-    let mut sel = [[0u64; 2]; 128];
-    for e in 0..128 {
-        let mut lo = 0u64;
-        let mut hi = 0u64;
-        for j in 0..KAPPA {
-            let bit = ((rho[j].0 >> e) & 1) as u64;
-            if j < 64 {
-                lo |= bit << j;
-            } else {
-                hi |= bit << (j - 64);
-            }
+    // the per-j selection mask over the 128 coordinate bits
+    for j in 0..KAPPA {
+        let rj = rho[j].0;
+        if rj == 0 {
+            continue;
         }
-        sel[e] = [lo, hi];
-    }
-    for e in 0..128 {
-        let (lo, hi) = (sel[e][0], sel[e][1]);
-        let out = &mut planes[e * wp..(e + 1) * wp];
-        for j in 0..KAPPA {
-            if ((if j < 64 { lo >> j } else { hi >> (j - 64) }) & 1) == 1 {
-                let sp = ps.plane(j);
-                for k in 0..wp {
-                    out[k] ^= sp[k];
-                }
+        let sp = ps.plane(j);
+        for e in 0..128 {
+            if (rj >> e) & 1 == 1 {
+                let out = &mut planes[e * wp..(e + 1) * wp];
+                crate::simd::xor_into(out, sp);
             }
         }
     }

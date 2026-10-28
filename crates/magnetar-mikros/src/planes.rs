@@ -75,12 +75,9 @@ impl PlaneSet {
 
     /// Parity inner product of two planes: `⊕_i a[i]·b[i]` (AND + popcount
     /// parity — the GF(2) dot of the small-value sumcheck papers).
+    /// Dispatches to the AVX-512 VPOPCNTQ kernel ([`crate::simd`]).
     pub fn parity_dot(a: &[u64], b: &[u64]) -> u64 {
-        let mut acc = 0u64;
-        for k in 0..a.len() {
-            acc ^= a[k] & b[k];
-        }
-        acc.count_ones() as u64 & 1
+        crate::simd::parity_dot_v(a, b)
     }
 
     /// The encoding primitive of the packed Hadamard prover:
@@ -89,18 +86,52 @@ impl PlaneSet {
     /// This is the bitsliced evaluation `gA(γ') = Σ_j a^(j)·ψ_j(γ')` — the
     /// selector `σ_c` is the c-th bit of each code `ψ_j(γ')` ("precomputed
     /// base-polynomial evaluations", §4.2).
+    ///
+    /// **The j-outer pass**: each source plane streams once and XORs into
+    /// every selected output plane through the AVX-512 lanes
+    /// ([`crate::simd::xor_into`]) — the callers that re-encode many nodes
+    /// over the same source batch them ([`Self::encode_k4`]) so the
+    /// 8·m-byte source is re-read once per batch, not once per node.
+    ///
+    /// The batched form of [`Self::encode_k`] for the η pipeline: four
+    /// selector sets against the same source planes in one pass — the
+    /// `8·m`-byte source streams once per batch instead of once per node
+    /// (a 4× traffic reduction across the 127 off-domain nodes; the batch's
+    /// 4·8 output planes stay L2-resident).
+    pub fn encode_k4(&self, sels: &[[[u64; 2]; 8]; 4], out: &mut [[Vec<u64>; 8]; 4]) {
+        debug_assert_eq!(self.words, out[0][0].len());
+        for b in 0..4 {
+            for oc in out[b].iter_mut() {
+                oc.iter_mut().for_each(|x| *x = 0);
+            }
+        }
+        // Each source plane streams once per batch and XORs into every
+        // selected output plane (the batch's 32 outputs are read/written
+        // L2-resident; the single-node form re-streams the source per node).
+        for j in 0..self.kappa {
+            let sp = self.plane(j);
+            let (word, bit) = (j / 64, j % 64);
+            for b in 0..4 {
+                for c in 0..8 {
+                    if (sels[b][c][word] >> bit) & 1 == 1 {
+                        crate::simd::xor_into(&mut out[b][c], sp);
+                    }
+                }
+            }
+        }
+    }
     pub fn encode_k(&self, selectors: &[[u64; 2]; 8], out: &mut [Vec<u64>; 8]) {
         let w = self.words;
-        for c in 0..8 {
-            let sel = selectors[c];
-            let oc = &mut out[c];
+        for oc in out.iter_mut() {
+            debug_assert_eq!(oc.len(), w);
             oc.iter_mut().for_each(|x| *x = 0);
-            for j in 0..self.kappa {
-                if (sel[j / 64] >> (j % 64)) & 1 == 1 {
-                    let sp = self.plane(j);
-                    for k in 0..w {
-                        oc[k] ^= sp[k];
-                    }
+        }
+        for j in 0..self.kappa {
+            let sp = self.plane(j);
+            let (word, bit) = (j / 64, j % 64);
+            for c in 0..8 {
+                if (selectors[c][word] >> bit) & 1 == 1 {
+                    crate::simd::xor_into(&mut out[c], sp);
                 }
             }
         }
@@ -200,46 +231,63 @@ fn transpose_rec(a: &mut [u64], row0: usize, bit0: usize, n: usize) {
 }
 
 /// Transpose `m` E-words into 128 coordinate planes of `m` bits.
+/// Cache-blocked over 8 chunks (one cache line per plane per block) with
+/// the AVX-512 64×64 transpose kernel.
 pub fn words_to_planes(words: &[Gf128], m: usize) -> Vec<u64> {
     assert!(m.is_multiple_of(64));
     let wp = m / 64;
     let mut planes = vec![0u64; 128 * wp];
-    for chunk in 0..wp {
-        let base = chunk * 64;
-        let mut lo = [0u64; 64];
-        let mut hi = [0u64; 64];
-        for r in 0..64 {
-            let w = words[base + r].0;
-            lo[r] = w as u64;
-            hi[r] = (w >> 64) as u64;
+    let mut tiles = [[0u64; 8]; 128];
+    for cb in (0..wp).step_by(8) {
+        let ncb = (wp - cb).min(8);
+        for k in 0..ncb {
+            let base = (cb + k) * 64;
+            let mut lo = [0u64; 64];
+            let mut hi = [0u64; 64];
+            for r in 0..64 {
+                let w = words[base + r].0;
+                lo[r] = w as u64;
+                hi[r] = (w >> 64) as u64;
+            }
+            crate::simd::flip64_v(&mut lo);
+            crate::simd::flip64_v(&mut hi);
+            for e in 0..64 {
+                tiles[e][k] = lo[e];
+                tiles[64 + e][k] = hi[e];
+            }
         }
-        flip64(&mut lo);
-        flip64(&mut hi);
-        for e in 0..64 {
-            planes[e * wp + chunk] = lo[e];
-            planes[(64 + e) * wp + chunk] = hi[e];
+        for e in 0..128 {
+            planes[e * wp + cb..][..ncb].copy_from_slice(&tiles[e][..ncb]);
         }
     }
     planes
 }
 
 /// The inverse transpose: 128 coordinate planes of `m` bits → `m` E-words.
+/// Cache-blocked (one line per plane per block) with the AVX-512 kernel.
 pub fn planes_to_words(planes: &[u64], m: usize) -> Vec<Gf128> {
     assert!(m.is_multiple_of(64));
     let wp = m / 64;
     let mut words = vec![Gf128(0); m];
-    for chunk in 0..wp {
-        let mut lo = [0u64; 64];
-        let mut hi = [0u64; 64];
-        for e in 0..64 {
-            lo[e] = planes[e * wp + chunk];
-            hi[e] = planes[(64 + e) * wp + chunk];
+    let mut tiles = [[0u64; 8]; 128];
+    for cb in (0..wp).step_by(8) {
+        let ncb = (wp - cb).min(8);
+        for e in 0..128 {
+            tiles[e][..ncb].copy_from_slice(&planes[e * wp + cb..][..ncb]);
         }
-        flip64(&mut lo);
-        flip64(&mut hi);
-        let base = chunk * 64;
-        for r in 0..64 {
-            words[base + r] = Gf128((lo[r] as u128) | ((hi[r] as u128) << 64));
+        for k in 0..ncb {
+            let mut lo = [0u64; 64];
+            let mut hi = [0u64; 64];
+            for e in 0..64 {
+                lo[e] = tiles[e][k];
+                hi[e] = tiles[64 + e][k];
+            }
+            crate::simd::flip64_v(&mut lo);
+            crate::simd::flip64_v(&mut hi);
+            let base = (cb + k) * 64;
+            for r in 0..64 {
+                words[base + r] = Gf128((lo[r] as u128) | ((hi[r] as u128) << 64));
+            }
         }
     }
     words

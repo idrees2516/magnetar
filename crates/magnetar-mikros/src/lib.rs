@@ -11,6 +11,7 @@
 //! | Paper object | Module | Notes |
 //! |---|---|---|
 //! | GF(2^8) intermediate field `K` (§4.2 small-field variant) | [`gf8`] | the unique order-256 subfield of `E`, AES-polynomial code basis (GFNI-compatible) |
+//! | GF(2^32) position-encoding field `K_pos` (§5.1) | [`gf32`] | the unique order-2^32 subfield of `E`, power-basis codes, PCLMULQDQ/VPCLMULQDQ multiplication |
 //! | Shared interpolation data (App. B.1) | [`interp`] | `H` = a 7-dim subspace, `Ψ`, Lagrange `ψ_j`, off-domain nodes, `V⁻¹` |
 //! | Algebraic vector packing (§4.1) | [`planes`] | column-plane layouts, selector-XOR encodings, bit↔byte spreads |
 //! | Fact 1 inner-product reduction (§3.2) | [`fact1`] | `[p0,p1,s]` degree-2 rounds |
@@ -18,6 +19,8 @@
 //! | Packed inner-product proof, Algorithm 1 (§4.1) | [`innerprod`] | monomial/reciprocal packing |
 //! | Packed PCS opening, Algorithm 4 (§4.4) | [`pcs_open`] | `U = Ξ^T A` column claims + the char-2 `W` recursion (Eq. 25) |
 //! | Packed permutation proof, Algorithm 3 (§4.3) | [`perm`] | grand products from Hadamard products |
+//! | Copy-constraint permutation over K_pos (§5.1) | [`copy`] | Algorithm 3 at width κ_pos over GF(2^32) |
+//! | Single-instance PLONK SNARK, Algorithm 5 (§5.2) | [`plonk`] | the gate layer + the copy layer + the grouped openings |
 //! | Batched-instance R1CS, Algorithm 6 (§5.3) | [`batch`] | the Table-4 hash benchmarks (public wiring) |
 //! | Binary hash circuits | [`circuits`] | SHA-256 compression, Keccak-f[1600], BLAKE3 compression |
 //!
@@ -41,3 +44,4 @@ pub mod pcs_open;
 pub mod perm;
 pub mod planes;
 pub mod r1cs;
+pub mod simd;

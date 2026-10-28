@@ -968,6 +968,61 @@ mod imp256_mul_run {
     }
 }
 
+/// Elementwise multiply of two runs: `dst[k] = a[k] · b[k]` (the
+/// E-tree-ladder / Hadamard-word primitive). Returns the number of leading
+/// entries consumed (0 = no backend; the caller finishes the tail scalar).
+pub fn mulvv(dst: &mut [Gf128], a: &[Gf128], b: &[Gf128], count: usize) -> usize {
+    debug_assert_eq!(a.len(), count);
+    debug_assert_eq!(b.len(), count);
+    match detect() {
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx512 => {
+            let n4 = count / 4;
+            #[allow(unsafe_code)]
+            // SAFETY: the measured dispatch confirmed the target features.
+            unsafe {
+                use std::arch::x86_64::{_mm512_loadu_si512, _mm512_storeu_si512};
+                for i in 0..n4 {
+                    let k = 4 * i;
+                    let va = _mm512_loadu_si512(a.as_ptr().add(k).cast());
+                    let vb = _mm512_loadu_si512(b.as_ptr().add(k).cast());
+                    let prod = imp512::Avx.mul_mm_public(va, vb);
+                    _mm512_storeu_si512(dst.as_mut_ptr().add(k).cast(), prod);
+                }
+            }
+            4 * n4
+        }
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx2 => {
+            let n2 = count / 2;
+            #[allow(unsafe_code)]
+            // SAFETY: the measured dispatch confirmed the target features.
+            unsafe {
+                use std::arch::x86_64::{_mm256_loadu_si256, _mm256_storeu_si256};
+                for i in 0..n2 {
+                    let k = 2 * i;
+                    let va = _mm256_loadu_si256(a.as_ptr().add(k).cast());
+                    let vb = _mm256_loadu_si256(b.as_ptr().add(k).cast());
+                    let prod = imp256::Avx2.mul_mm_public(va, vb);
+                    _mm256_storeu_si256(dst.as_mut_ptr().add(k).cast(), prod);
+                }
+            }
+            2 * n2
+        }
+        SimdKind::Scalar => 0,
+    }
+}
+
+/// Elementwise multiply-accumulate over a run: `dst[k] += a[k] · b[k]` (the
+/// z-Horner and eta-pipeline accumulation). Returns the entries consumed.
+pub fn axpyvv_run(dst: &mut [Gf128], a: &[Gf128], b: &[Gf128], count: usize) -> usize {
+    let done = mulvv(dst, a, b, count);
+    for k in done..count {
+        dst[k] += crate::gf128::mul(a[k], b[k]);
+    }
+    count
+}
+
 /// 2-lane broadcast multiply for strided callers: `[r·t0, r·t1]` through
 /// the measured backend (scalar on non-x86 hosts).
 pub fn mul2_inline(r: Gf128, t: [Gf128; 2]) -> [Gf128; 2] {
@@ -1182,5 +1237,35 @@ fn axpy_matches_scalar() {
         let mut got = vec![Gf128(0); n];
         axpy_run(&mut got, &srcv, r, n);
         assert_eq!(acc, got, "n={n}");
+    }
+}
+
+#[test]
+fn mulvv_matches_scalar() {
+    let mut rng_state = 0x9e3779b9u64;
+    let mut rg = || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        Gf128((rng_state as u128) | (((rng_state >> 1) as u128) << 64))
+    };
+    for &n in &[3usize, 8, 17, 64, 100, 257] {
+        let a: Vec<Gf128> = (0..n).map(|_| rg()).collect();
+        let b: Vec<Gf128> = (0..n).map(|_| rg()).collect();
+        let want: Vec<Gf128> = (0..n).map(|k| crate::gf128::mul(a[k], b[k])).collect();
+        let mut got = vec![Gf128(0); n];
+        let done = mulvv(&mut got, &a, &b, n);
+        for k in done..n {
+            got[k] = crate::gf128::mul(a[k], b[k]);
+        }
+        assert_eq!(got, want, "n={n}");
+        // the accumulate form against a nonzero base
+        let mut acc: Vec<Gf128> = (0..n).map(|_| rg()).collect();
+        let mut want2 = acc.clone();
+        for k in 0..n {
+            want2[k] += crate::gf128::mul(a[k], b[k]);
+        }
+        axpyvv_run(&mut acc, &a, &b, n);
+        assert_eq!(acc, want2, "axpyvv n={n}");
     }
 }
