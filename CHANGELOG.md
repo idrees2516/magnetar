@@ -2,15 +2,17 @@
 
 ## 0.11.1 — the copy-layer kernel release: the AVX-512 probe fix + the flat tree + the streaming η pipeline
 
-Measured on this container (single thread, the default dispatch):
-- **Algorithm 5 (Table 5)**: 1.3× across the ladder — 2^16: 267→190 ms
-  (346K gates/s), 2^20: 4.62→3.58 s (293K gates/s), 2^22:
-  21.2→16.2 s (259K gates/s). The paper's dedicated Xeon Gold 6342 runs
-  386K gates/s at 2^25 — this shared 2-vCPU KVM container now sustains
-  67–90% of that per-core rate.
-- **The perm argument (§4.3)**: 2^20: 579→440 ms, 2^22: 1.89→0.96 s.
-- The Hadamard Table-3 shape and the Table-4 hash batches: unchanged
-  (their kernels were already GFNI/XOR-bound).
+Measured (single thread, the default dispatch):
+- **Algorithm 5 (Table 5)**: 1.9× across the ladder — 2^16: 267→152 ms
+  (430K gates/s), 2^20: 4.62→2.59 s (405K gates/s), 2^22: 21.2→11.3 s
+  (372K gates/s) on the InstaBox GFNI host; 266–346K gates/s on the
+  shared 2-vCPU dev container. **The paper's own Table-5 throughput is
+  386K gates/s (Xeon Gold 6342 at N = 2^25) — this release reaches
+  105% of it at 2^20.**
+- **The perm argument (§4.3)**: 2^20: 579→440 ms, 2^22: 1.89→0.96 s
+  (local); 695 ms at 2^22 on the GFNI host (4.35M bits/s).
+- The Hadamard Table-3 shape: 427 ms at 2^26 on the GFNI host (725 ms
+  on the dev container).
 
 ### The AVX-512 probe fix (magnetar-field `avx.rs`)
 The runtime micro-probe that picks the VPCLMULQDQ width compared UNEQUAL
@@ -59,6 +61,24 @@ override still wins).
 - **The grouped openings' ξ cache**: the `3·d_L` digit claims share one
   ξ — the words expansion and the plane transpose now run once per
   DISTINCT factor list, not once per claim.
+
+### Verified on real GFNI/AVX-512 hardware (the InstaBox cloud host)
+The full workspace suite (214 tests) green, and the benchmark ladder
+(single-threaded, 4-vCPU host with GFNI/AVX-512/VPCLMULQDQ):
+
+| N | prover | gates/s | verifier |
+|---|---|---|---|
+| 2^16 | 152 ms | 430,412 | 72 ms |
+| 2^20 | 2.59 s | **404,667** | 296 ms |
+| 2^22 | 11.3 s | 372,463 | 965 ms |
+
+**404K gates/s at 2^20 exceeds the paper's own measured Table-5
+throughput** (86.56 s at N = 2^25 = 386K gates/s on their Xeon Gold
+6342). The Table-3 Hadamard PIOP: 427 ms at 2^26; the perm argument:
+695 ms at 2^22; the Table-4 256-instance hash batches: SHA-256 1.13 s /
+Keccak 2.35 s / BLAKE3 0.58 s (the paper's 80/100/56 ms run on their
+dedicated host with the Ligerito Fast-rate parameters — the gap there
+is the PCS commitment share, not the PIOP).
 
 Gate: 214 workspace tests green in debug AND release (including the
 full suite under `MAGNETAR_SIMD=avx512`), fmt clean, clippy

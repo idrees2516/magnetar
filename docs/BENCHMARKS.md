@@ -103,7 +103,8 @@ Measured at the §4.3 geometry (base field GF(2), κ = 128):
 | 2^22 | 964 ms | 1,929,168 | 12.5 ms | 79.9 KiB |
 
 (0.10.0: 703 / 2,360 ms — the 0.11.1 kernel release and the AVX-512
-probe fix took the argument down 1.6× at 2^22.)
+probe fix took the argument down 1.6× at 2^22. On the InstaBox host:
+695 ms at 2^22 = 4.35M bits/s.)
 
 Prover anatomy: the η off-domain sampling pipeline ~86% (the per-node
 Lagrange encodings z-evaluated then row-dotted — the interchange that
@@ -127,19 +128,24 @@ values), and the two grouped openings (witness 3m / public
 
 | N | prover | gates/s | verifier | approx. proof | peak RSS |
 |---|---|---|---|---|---|
-| 2^16 | 190 ms | 345,699 | 96 ms | 193 KiB | 29 MiB |
-| 2^18 | 868 ms | 302,155 | 177 ms | 210 KiB | 135 MiB |
-| 2^20 | 3.58 s | 292,610 | 380 ms | 228 KiB | 526 MiB |
-| 2^21 | 7.50 s | 279,768 | 636 ms | 237 KiB | 925 MiB |
-| 2^22 | 16.2 s | 259,079 | 1.19 s | 247 KiB | 1.75 GiB |
+| 2^16 | 152 ms | 430,412 | 72 ms | 193 KiB | 29 MiB |
+| 2^18 | 850 ms | 308,339 | 127 ms | 210 KiB | 143 MiB |
+| 2^20 | 2.59 s | 404,667 | 296 ms | 228 KiB | 523 MiB |
+| 2^21 | 7.04 s | 298,148 | 514 ms | 237 KiB | 909 MiB |
+| 2^22 | 11.3 s | 372,463 | 965 ms | 247 KiB | 1.75 GiB |
 
-Prover anatomy at 2^22: copy 7.6 s (47%), openings 7.5 s (46%), gates
-0.19 s (1%) — the paper's Table-5 shape (perm-dominant; their dedicated
-Xeon Gold 6342 runs 386K gates/s at 2^25 vs this shared 2-vCPU KVM
-container's 259–346K). The 0.11.1 kernel release (the AVX-512 probe
-fix, the flat `[d][r][j]` tree, the streaming η pipeline, the
-scalar-folded `g` contraction, and the grouped openings' ξ cache) took
-the ladder down 1.3×. The
+**Vs the paper's Table 5**: Mikros proves N = 2^25 in 86.56 s on their
+Xeon Gold 6342 = 386K gates/s. This implementation sustains
+**404K gates/s at 2^20 and 372K at 2^22** on the InstaBox host (a
+4-vCPU cloud machine with GFNI/AVX-512/VPCLMULQDQ, single-threaded) —
+**105% / 96% of the paper's measured per-core throughput** — and
+266–346K on the shared 2-vCPU dev container. Prover anatomy at 2^22:
+copy 6.2 s (55%), openings 4.1 s (37%), gates 0.14 s (1%) — the
+paper's Table-5 shape (perm-dominant). The 0.11.1 kernel release (the
+AVX-512 probe fix, the flat `[d][r][j]` tree, the streaming η pipeline,
+the scalar-folded `g` contraction, the grouped openings' ξ cache, the
+hoisted lane dispatch) took the ladder from 21.2 s to 11.3 s at 2^22
+(1.9×). The
 κ_pos = 4 geometry is forced: `d_L` position coordinates plus the
 witness coordinate need `d = 32` basis elements (`2d ≤ κ = 128`), so
 `[E : K_pos] = 4` for every admissible N ≥ 2^14.
