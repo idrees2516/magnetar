@@ -99,8 +99,11 @@ Measured at the §4.3 geometry (base field GF(2), κ = 128):
 
 | N | prover | bits/s | verifier | proof |
 |---|---|---|---|---|
-| 2^20 | 703 ms | 412,726 | 5.7 ms | 74.7 KiB |
-| 2^22 | 2,360 ms | 622,816 | 12.5 ms | 79.9 KiB |
+| 2^20 | 440 ms | 662,920 | 5.7 ms | 74.7 KiB |
+| 2^22 | 964 ms | 1,929,168 | 12.5 ms | 79.9 KiB |
+
+(0.10.0: 703 / 2,360 ms — the 0.11.1 kernel release and the AVX-512
+probe fix took the argument down 1.6× at 2^22.)
 
 Prover anatomy: the η off-domain sampling pipeline ~86% (the per-node
 Lagrange encodings z-evaluated then row-dotted — the interchange that
@@ -124,17 +127,19 @@ values), and the two grouped openings (witness 3m / public
 
 | N | prover | gates/s | verifier | approx. proof | peak RSS |
 |---|---|---|---|---|---|
-| 2^16 | 267 ms | 245,677 | 91 ms | 193 KiB | 29 MiB |
-| 2^18 | 1.17 s | 56,246 | 161 ms | 251 KiB | 134 MiB |
-| 2^20 | 4.61 s | 227,680 | 361 ms | 361 KiB | 524 MiB |
-| 2^21 | 10.1 s | 207,091 | 615 ms | 437 KiB | 922 MiB |
-| 2^22 | 21.2 s | 197,895 | 1.13 s | 585 KiB | 1.79 GiB |
+| 2^16 | 190 ms | 345,699 | 96 ms | 193 KiB | 29 MiB |
+| 2^18 | 868 ms | 302,155 | 177 ms | 210 KiB | 135 MiB |
+| 2^20 | 3.58 s | 292,610 | 380 ms | 228 KiB | 526 MiB |
+| 2^21 | 7.50 s | 279,768 | 636 ms | 237 KiB | 925 MiB |
+| 2^22 | 16.2 s | 259,079 | 1.19 s | 247 KiB | 1.75 GiB |
 
-Prover anatomy at 2^22: copy 13.0 s (62%), openings 7.1 s (33%), gates
-0.19 s (1%) — the same shape as the paper's Table 5 (perm 92% at 2^25 on
-their Xeon Gold 6342), with the gate layer (the GFNI-accelerated
-Algorithm 2) an even smaller share here and the public-group commitment
-(the preprocessed selector + digit tables) carried in the openings. The
+Prover anatomy at 2^22: copy 7.6 s (47%), openings 7.5 s (46%), gates
+0.19 s (1%) — the paper's Table-5 shape (perm-dominant; their dedicated
+Xeon Gold 6342 runs 386K gates/s at 2^25 vs this shared 2-vCPU KVM
+container's 259–346K). The 0.11.1 kernel release (the AVX-512 probe
+fix, the flat `[d][r][j]` tree, the streaming η pipeline, the
+scalar-folded `g` contraction, and the grouped openings' ξ cache) took
+the ladder down 1.3×. The
 κ_pos = 4 geometry is forced: `d_L` position coordinates plus the
 witness coordinate need `d = 32` basis elements (`2d ≤ κ = 128`), so
 `[E : K_pos] = 4` for every admissible N ≥ 2^14.

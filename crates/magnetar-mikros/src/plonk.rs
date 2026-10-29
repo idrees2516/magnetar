@@ -429,13 +429,28 @@ fn prove_group_open(
     let mut v_msgs = Vec::with_capacity(claims.len());
     let mut us = Vec::new();
     let mut words_cache = Vec::with_capacity(claims.len());
+    // the distinct-ξ cache: many claims share one ξ (the 3·d_L digit
+    // claims of Algorithm 5 share the copy terminal's ξ_wire) — the words
+    // expansion and the plane transpose are computed once per DISTINCT
+    // factor list, not once per claim.
+    /// A distinct-ξ cache entry: (the factor key, the words, the planes).
+    type XiCacheEntry = (Vec<(Gf128, Gf128)>, Vec<Gf128>, Vec<u64>);
+    let mut xi_cache: Vec<XiCacheEntry> = Vec::new();
     for (claim, mat) in claims.iter().zip(matrices.iter()) {
-        // ξ materialised as words → coordinate planes → U = Ξ^⊤ A
-        let words = factors_words(&claim.xi_factors);
-        debug_assert_eq!(words.len(), m);
-        words_cache.push(words.clone());
-        let xi_planes = words_to_planes(&words, m);
-        let rows = compute_u(mat, &xi_planes, m / 64);
+        let entry = match xi_cache.iter().position(|(k, _, _)| *k == claim.xi_factors) {
+            Some(i) => &xi_cache[i],
+            None => {
+                let words = factors_words(&claim.xi_factors);
+                debug_assert_eq!(words.len(), m);
+                let planes = words_to_planes(&words, m);
+                xi_cache.push((claim.xi_factors.clone(), words, planes));
+                xi_cache.last().expect("just pushed")
+            }
+        };
+        let words = entry.1.clone();
+        words_cache.push(words);
+        let xi_planes = &entry.2;
+        let rows = compute_u(mat, xi_planes, m / 64);
         let mut v_msg = vec![ZERO; KAPPA];
         for j in 0..KAPPA {
             let mut acc = 0u128;

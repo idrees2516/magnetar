@@ -247,62 +247,26 @@ impl Gf32 {
         1u32 << k
     }
 
-    /// Four independent products, VPCLMULQDQ-laned when available (the
-    /// coefficient-tree and encoding kernels' inner op; bit-identical to
-    /// four [`Self::mul`] calls — unit-gated).
+    /// Four independent products, VPCLMULQDQ-laned when available — the
+    /// 256-bit form (2 products/register) or the 512-bit form (4), per the
+    /// feature dispatch (the coefficient-tree and encoding kernels' inner
+    /// op; bit-identical to four [`Self::mul`] calls — unit-gated).
     #[inline(always)]
     pub fn mul4(&self, a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
         #[cfg(target_arch = "x86_64")]
         {
-            if magnetar_field::avx::detect() == magnetar_field::avx::SimdKind::Avx512 {
+            if lane256_ok() {
                 #[allow(unsafe_code)]
-                // SAFETY: the measured dispatch confirmed avx512f +
-                // vpclmulqdq; the lane arrays are zero-extended [u64; 8]s
-                // built on the stack.
+                // SAFETY: the dispatch confirmed avx512vl + vpclmulqdq.
                 unsafe {
-                    use std::arch::x86_64::{
-                        _mm512_clmulepi64_epi128, _mm512_loadu_si512, _mm512_set1_epi64,
-                        _mm512_srli_epi64, _mm512_storeu_si512, _mm512_xor_si512,
-                    };
-                    let aa: [u64; 8] = [
-                        a[0] as u64,
-                        a[1] as u64,
-                        a[2] as u64,
-                        a[3] as u64,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ];
-                    let bb: [u64; 8] = [
-                        b[0] as u64,
-                        b[1] as u64,
-                        b[2] as u64,
-                        b[3] as u64,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ];
-                    let va = _mm512_loadu_si512(aa.as_ptr().cast());
-                    let vb = _mm512_loadu_si512(bb.as_ptr().cast());
-                    let t = _mm512_clmulepi64_epi128(va, vb, 0x00); // ≤62-bit per lane
-                    let t_hi = _mm512_srli_epi64(t, 32);
-                    let mu = _mm512_set1_epi64(self.mu_low as i64);
-                    let q_full = _mm512_clmulepi64_epi128(t_hi, mu, 0x00);
-                    // q̂ = t_hi ^ (t_hi·mu_low >> 32) (the μ = X³² + mu_low split)
-                    let q = _mm512_xor_si512(_mm512_srli_epi64(q_full, 32), t_hi);
-                    let p = _mm512_set1_epi64(self.p_low as i64);
-                    let qp = _mm512_clmulepi64_epi128(q, p, 0x00);
-                    let r = _mm512_xor_si512(t, qp);
-                    let mut lanes = [0u64; 8];
-                    _mm512_storeu_si512(lanes.as_mut_ptr().cast(), r);
-                    return [
-                        lanes[0] as u32,
-                        lanes[1] as u32,
-                        lanes[2] as u32,
-                        lanes[3] as u32,
-                    ];
+                    return mul4_256(a, b, self.p_low, self.mu_low);
+                }
+            }
+            if lane512_ok() {
+                #[allow(unsafe_code)]
+                // SAFETY: the dispatch confirmed avx512f + vpclmulqdq.
+                unsafe {
+                    return mul4_512(a, b, self.p_low, self.mu_low);
                 }
             }
         }
@@ -313,49 +277,121 @@ impl Gf32 {
         out
     }
 
-    /// The 4-term K_pos combination `⊕_j w_j·c_j`, VPCLMULQDQ-laned when
-    /// available (one CLMUL per term plus the horizontal lane XOR).
+    /// The 4-term K_pos combination `⊕_j w_j·c_j` (the encoding kernel's
+    /// row op).
     #[inline(always)]
     pub fn dot4(&self, w: [u32; 4], c: [u32; 4]) -> u32 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if magnetar_field::avx::detect() == magnetar_field::avx::SimdKind::Avx512 {
-                let prod = self.mul4(w, c);
-                #[allow(unsafe_code)]
-                // SAFETY: the dispatch confirmed the features; the lane
-                // array is a stack [u64; 8].
-                unsafe {
-                    use std::arch::x86_64::{
-                        _mm512_loadu_si512, _mm512_permutexvar_epi64, _mm512_set_epi64,
-                        _mm512_storeu_si512, _mm512_xor_si512,
-                    };
-                    let lanes: [u64; 8] = [
-                        prod[0] as u64,
-                        prod[1] as u64,
-                        prod[2] as u64,
-                        prod[3] as u64,
-                        0,
-                        0,
-                        0,
-                        0,
-                    ];
-                    let v = _mm512_loadu_si512(lanes.as_ptr().cast());
-                    // XOR the mirrored lane pairs: lanes 0,1 = p0^p2, p1^p3
-                    let idx = _mm512_set_epi64(6, 7, 4, 5, 2, 3, 0, 1);
-                    let x = _mm512_xor_si512(v, _mm512_permutexvar_epi64(idx, v));
-                    let mut out = [0u64; 8];
-                    _mm512_storeu_si512(out.as_mut_ptr().cast(), x);
-                    return (out[0] ^ out[1]) as u32;
-                }
-            }
-        }
-        let mut acc = 0u32;
-        for j in 0..4 {
-            acc ^= self.mul(w[j], c[j]);
-        }
-        acc
+        let p = self.mul4(w, c);
+        (p[0] ^ p[1]) ^ (p[2] ^ p[3])
     }
 }
+
+/// Whether the 256-bit VPCLMULQDQ lanes are available (avx512vl +
+/// vpclmulqdq — the `_mm256_clmulepi64_epi128` contract).
+#[cfg(target_arch = "x86_64")]
+fn lane256_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        std::is_x86_feature_detected!("avx512vl") && std::is_x86_feature_detected!("vpclmulqdq")
+    })
+}
+
+/// Whether the 512-bit VPCLMULQDQ lanes are available (avx512f +
+/// vpclmulqdq).
+#[cfg(target_arch = "x86_64")]
+fn lane512_ok() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("vpclmulqdq")
+    })
+}
+
+/// Two products per YMM (the even 64-bit slots hold the operands — imm
+/// 0x00 pairs per 128-bit LANE), two YMMs for four products.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl,vpclmulqdq")]
+#[allow(unsafe_code)]
+unsafe fn mul4_256(a: [u32; 4], b: [u32; 4], p_low: u32, mu_low: u32) -> [u32; 4] {
+    use std::arch::x86_64::{
+        _mm256_clmulepi64_epi128, _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_srli_epi64,
+        _mm256_storeu_si256, _mm256_xor_si256,
+    };
+    let mut out = [0u32; 4];
+    for half in 0..2 {
+        let aa: [u64; 4] = [a[2 * half] as u64, 0, a[2 * half + 1] as u64, 0];
+        let bb: [u64; 4] = [b[2 * half] as u64, 0, b[2 * half + 1] as u64, 0];
+        let va = _mm256_loadu_si256(aa.as_ptr().cast());
+        let vb = _mm256_loadu_si256(bb.as_ptr().cast());
+        let t = _mm256_clmulepi64_epi128(va, vb, 0x00);
+        let t_hi = _mm256_srli_epi64(t, 32);
+        let mu = _mm256_set1_epi64x(mu_low as i64);
+        let q_full = _mm256_clmulepi64_epi128(t_hi, mu, 0x00);
+        let q = _mm256_xor_si256(_mm256_srli_epi64(q_full, 32), t_hi);
+        let p = _mm256_set1_epi64x(p_low as i64);
+        let qp = _mm256_clmulepi64_epi128(q, p, 0x00);
+        let r = _mm256_xor_si256(t, qp);
+        let mut lanes = [0u64; 4];
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast(), r);
+        out[2 * half] = lanes[0] as u32;
+        out[2 * half + 1] = lanes[2] as u32;
+    }
+    out
+}
+
+/// Four products per ZMM (the even 64-bit slots hold the operands).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,vpclmulqdq")]
+#[allow(unsafe_code)]
+unsafe fn mul4_512(a: [u32; 4], b: [u32; 4], p_low: u32, mu_low: u32) -> [u32; 4] {
+    use std::arch::x86_64::{
+        _mm512_clmulepi64_epi128, _mm512_loadu_si512, _mm512_set1_epi64, _mm512_srli_epi64,
+        _mm512_storeu_si512, _mm512_xor_si512,
+    };
+    let aa: [u64; 8] = [
+        a[0] as u64,
+        0,
+        a[1] as u64,
+        0,
+        a[2] as u64,
+        0,
+        a[3] as u64,
+        0,
+    ];
+    let bb: [u64; 8] = [
+        b[0] as u64,
+        0,
+        b[1] as u64,
+        0,
+        b[2] as u64,
+        0,
+        b[3] as u64,
+        0,
+    ];
+    let va = _mm512_loadu_si512(aa.as_ptr().cast());
+    let vb = _mm512_loadu_si512(bb.as_ptr().cast());
+    let t = _mm512_clmulepi64_epi128(va, vb, 0x00); // ≤62-bit per lane
+    let t_hi = _mm512_srli_epi64(t, 32);
+    let mu = _mm512_set1_epi64(mu_low as i64);
+    let q_full = _mm512_clmulepi64_epi128(t_hi, mu, 0x00);
+    // q̂ = t_hi ^ (t_hi·mu_low >> 32) (the μ = X³² + mu_low split)
+    let q = _mm512_xor_si512(_mm512_srli_epi64(q_full, 32), t_hi);
+    let p = _mm512_set1_epi64(p_low as i64);
+    let qp = _mm512_clmulepi64_epi128(q, p, 0x00);
+    let r = _mm512_xor_si512(t, qp);
+    let mut lanes = [0u64; 8];
+    _mm512_storeu_si512(lanes.as_mut_ptr().cast(), r);
+    // the products live in the even slots
+    [
+        lanes[0] as u32,
+        lanes[2] as u32,
+        lanes[4] as u32,
+        lanes[6] as u32,
+    ]
+}
+
+/// (the impl continues: the Default/degree helpers stay below)
+#[allow(dead_code)]
+struct Gf32ImplMarker;
 
 impl Default for Gf32 {
     fn default() -> Self {

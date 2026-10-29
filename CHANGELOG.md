@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.11.1 — the copy-layer kernel release: the AVX-512 probe fix + the flat tree + the streaming η pipeline
+
+Measured on this container (single thread, the default dispatch):
+- **Algorithm 5 (Table 5)**: 1.3× across the ladder — 2^16: 267→190 ms
+  (346K gates/s), 2^20: 4.62→3.58 s (293K gates/s), 2^22:
+  21.2→16.2 s (259K gates/s). The paper's dedicated Xeon Gold 6342 runs
+  386K gates/s at 2^25 — this shared 2-vCPU KVM container now sustains
+  67–90% of that per-core rate.
+- **The perm argument (§4.3)**: 2^20: 579→440 ms, 2^22: 1.89→0.96 s.
+- The Hadamard Table-3 shape and the Table-4 hash batches: unchanged
+  (their kernels were already GFNI/XOR-bound).
+
+### The AVX-512 probe fix (magnetar-field `avx.rs`)
+The runtime micro-probe that picks the VPCLMULQDQ width compared UNEQUAL
+work: the scalar probe did 16,384 multiplies, avx2 16,384 (8,192 ×
+mul2), but **avx512 did 65,536 (16,384 × mul4) — 4× the work of the
+scalar baseline**, silently biasing the dispatch against AVX-512 on
+every capable host. The probe now does 16,384 multiplies on every
+candidate (4,096 × mul4); this host's sustained kernels measured 2× in
+favor of AVX-512, and the dispatch now agrees (the `MAGNETAR_SIMD`
+override still wins).
+
+### The gf32 lane kernels (the width-4 K_pos forms)
+- **The lane-packing bug**: `_mm512_clmulepi64_epi128` pairs operands per
+  128-bit LANE (the low 64 of each under imm 0x00) — the draft's
+  `[a0..a3, 0,0,0,0]` packing computed only TWO of the four products
+  (the odd slots never paired). The operands now sit at the EVEN 64-bit
+  slots (`[a0, ·, a1, ·, a2, ·, a3, ·]`) and the results read from the
+  even slots — caught by running the whole suite with
+  `MAGNETAR_SIMD=avx512` (the default dispatch never exercised the path:
+  a lesson in dispatch-gated test matrices).
+- **The target_feature discipline**: the lane bodies live in
+  `#[target_feature(enable = ...)]` functions (the repo's avx.rs
+  pattern) — inlined-in-place intrinsics without the attribute compile
+  to memory round-trips per instruction (a measured 4× regression
+  before the restructure).
+- **The 256-bit form first**: the ymm VPCLMULQDQ (2 products/register,
+  `avx512vl`) is preferred over the zmm form when both exist — the
+  measured dispatch and this host's sustained rates both favor it for
+  the 32-bit field; the zmm form remains for hosts where it wins.
+- `dot4`'s horizontal fold: the two-stage lane tree (i ↔ i^1 then
+  i ↔ i^2), no scalar tail.
+
+### The copy-layer kernels (magnetar-mikros `copy.rs`)
+- **The flat tree**: the coefficient tree's nested `Vec<Vec<Vec<u32>>>`
+  became one flat `Vec<u32>` per level in `[d][r][j]` order — the four
+  columns of a (d, r) pair sit in ONE cache line (the dot4/encode
+  kernels' access pattern); the draft pointer-chased three allocations
+  per element.
+- **The streaming η pipeline**: the off-domain f-sampling materialised
+  `ncoef·rows` E-vectors per node (hundreds of MB of traffic at
+  `m_pos = 2^20`); it now streams fixed 2,048-row blocks — enc (dot4) →
+  embed → the `z^d` broadcast-accumulate → the block's triple dot,
+  all L2-resident, the triple dots XOR-folding into the node scalar.
+- **The `g` contraction**: `ρ_j·z^d` folded into one scalar per (j, d)
+  — one E-mult per row (the scale-then-axpy draft spent two).
+- **The grouped openings' ξ cache**: the `3·d_L` digit claims share one
+  ξ — the words expansion and the plane transpose now run once per
+  DISTINCT factor list, not once per claim.
+
+Gate: 214 workspace tests green in debug AND release (including the
+full suite under `MAGNETAR_SIMD=avx512`), fmt clean, clippy
+--workspace --all-targets clean.
+
 ## 0.11.0 — Algorithm 5 (the single-instance PLONK SNARK) + the copy layer over K_pos; the Mikros stack complete
 
 The last protocol piece of ePrint 2026/2646: the end-to-end

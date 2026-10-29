@@ -290,10 +290,16 @@ impl PosInterp {
 // The coefficient tree over K_pos
 // ---------------------------------------------------------------------------
 
-/// One level: `layers[j][d][r]` — the `Z^d`-coefficient (a K_pos code) of
-/// column `j` at row `r`.
+/// One level of the coefficient tree, stored CONTIGUOUSLY as
+/// `data[((d·κ_pos) + j)·rows + r]` — the `Z^d`-coefficient (a K_pos
+/// code) of column `j` at row `r`. The `[d][j][r]` order puts the four
+/// columns of a (d, r) pair in ONE cache line (the dot4/encode kernels'
+/// access pattern); the nested-Vec draft pointer-chased per element.
 pub struct CopyTree {
-    pub levels: Vec<Vec<Vec<Vec<u32>>>>, // [τ][j][d][r]
+    /// Per level τ: the flat code array.
+    pub levels: Vec<Vec<u32>>,
+    /// Per level τ: the row count (`m_pos >> τ`).
+    pub level_rows: Vec<usize>,
     pub m_pos: usize,
 }
 
@@ -302,62 +308,78 @@ fn ncoef_at(tau: usize) -> usize {
 }
 
 impl CopyTree {
+    /// The flat index of `(τ level, coefficient d, row r, column j)` —
+    /// the `[d][r][j]` order puts the four columns of a (d, r) pair in
+    /// ONE cache line (the dot4/encode kernels' access pattern).
+    #[inline(always)]
+    fn idx(rows: usize, d: usize, r: usize, j: usize) -> usize {
+        (d * rows + r) * KPOS + j
+    }
+
     /// Build from the operand codes `d[j·m_pos + r]` (`D[r][j]`).
     pub fn build(f: &Gf32, d: &[u32], m_pos: usize) -> Self {
         assert_eq!(d.len(), m_pos * KPOS);
         assert!(m_pos.is_multiple_of(1 << LOG_KPOS));
-        let mut levels = Vec::with_capacity(LOG_KPOS + 1);
-        // C₀(Z) = Z·1 + D
-        let mut c0: Vec<Vec<Vec<u32>>> = Vec::with_capacity(KPOS);
-        for j in 0..KPOS {
-            let col = &d[j * m_pos..(j + 1) * m_pos];
-            c0.push(vec![col.to_vec(), vec![1u32; m_pos]]);
+        let mut levels: Vec<Vec<u32>> = Vec::with_capacity(LOG_KPOS + 1);
+        let mut level_rows: Vec<usize> = Vec::with_capacity(LOG_KPOS + 1);
+        // C₀(Z) = Z·1 + D — layout [(d·4 + j)·m_pos + r]
+        let mut c0 = vec![0u32; 2 * KPOS * m_pos];
+        for r in 0..m_pos {
+            for j in 0..KPOS {
+                c0[Self::idx(m_pos, 0, r, j)] = d[j * m_pos + r];
+                c0[Self::idx(m_pos, 1, r, j)] = 1;
+            }
         }
         levels.push(c0);
+        level_rows.push(m_pos);
         for tau in 0..LOG_KPOS {
             let prev = &levels[tau];
             let rows_in = m_pos >> tau;
             let ncoef_in = ncoef_at(tau);
             let rows_out = rows_in / 2;
             let ncoef_out = ncoef_in * 2 - 1;
-            let mut cur: Vec<Vec<Vec<u32>>> = (0..KPOS)
-                .map(|_| vec![vec![0u32; rows_out]; ncoef_out])
-                .collect();
+            let mut cur = vec![0u32; ncoef_out * KPOS * rows_out];
             // The row pairing is the CONTIGUOUS halves (C_{τ+1}[r] =
             // C_τ[r] ∘ C_τ[r + rows_out]) — the cubic engine's U/D
-            // convention (perm.rs's CoefTree does the same).
-            for j in 0..KPOS {
-                for d1 in 0..ncoef_in {
-                    for d2 in 0..ncoef_in {
-                        let pu = &prev[j][d1];
-                        let pd = &prev[j][d2];
-                        let po = &mut cur[j][d1 + d2];
-                        // 4-row batches through the VPCLMULQDQ lanes:
-                        // lane k multiplies the sources of output row r+k
-                        // (the tail lanes clamp to the last valid row and
-                        // are discarded)
-                        let mut r = 0;
-                        while r < rows_out {
-                            let take = 4.min(rows_out - r);
-                            let mut a = [0u32; 4];
-                            let mut b = [0u32; 4];
-                            for k in 0..4 {
-                                let rr = r + k.min(take - 1);
-                                a[k] = pu[rr];
-                                b[k] = pd[rr + rows_out];
-                            }
+            // convention (perm.rs's CoefTree does the same). The d1·d2
+            // products accumulate through the VPCLMULQDQ lanes, 4 rows
+            // per call (tail lanes clamp to the last valid row).
+            for d1 in 0..ncoef_in {
+                for d2 in 0..ncoef_in {
+                    let out_d = d1 + d2;
+                    let mut r = 0;
+                    while r < rows_out {
+                        let take = 4.min(rows_out - r);
+                        for j in 0..KPOS {
+                            let a = [
+                                prev[Self::idx(rows_in, d1, r, j)],
+                                prev[Self::idx(rows_in, d1, r + 1.min(take - 1), j)],
+                                prev[Self::idx(rows_in, d1, r + 2.min(take - 1), j)],
+                                prev[Self::idx(rows_in, d1, r + 3.min(take - 1), j)],
+                            ];
+                            let b = [
+                                prev[Self::idx(rows_in, d2, r + rows_out, j)],
+                                prev[Self::idx(rows_in, d2, r + rows_out + 1.min(take - 1), j)],
+                                prev[Self::idx(rows_in, d2, r + rows_out + 2.min(take - 1), j)],
+                                prev[Self::idx(rows_in, d2, r + rows_out + 3.min(take - 1), j)],
+                            ];
                             let prod = f.mul4(a, b);
                             for k in 0..take {
-                                po[r + k] ^= prod[k];
+                                cur[Self::idx(rows_out, out_d, r + k, j)] ^= prod[k];
                             }
-                            r += take;
                         }
+                        r += take;
                     }
                 }
             }
             levels.push(cur);
+            level_rows.push(rows_out);
         }
-        CopyTree { levels, m_pos }
+        CopyTree {
+            levels,
+            level_rows,
+            m_pos,
+        }
     }
 
     /// `C₂(z)` flattened column-major: `out[j·(m_pos/4) + r] =
@@ -368,11 +390,14 @@ impl CopyTree {
         let rows = self.m_pos >> LOG_KPOS;
         let ncoef = ncoef_at(LOG_KPOS);
         let mut out = vec![ZERO; self.m_pos];
+        let mut emb: Vec<Gf128> = vec![ZERO; rows];
         for j in 0..KPOS {
             let base = j * rows;
             let mut zd = ONE;
             for d in 0..ncoef {
-                let emb: Vec<Gf128> = top[j][d].iter().map(|&c| f.embed(c)).collect();
+                for r in 0..rows {
+                    emb[r] = f.embed(top[Self::idx(rows, d, r, j)]);
+                }
                 magnetar_field::avx::axpy_run(&mut out[base..base + rows], &emb, zd, rows);
                 zd = mul(zd, z);
             }
@@ -462,14 +487,17 @@ fn column_claims_u(
     scratch: &mut Vec<Gf128>,
 ) -> [Gf128; KPOS] {
     let level = &tree.levels[tau1];
+    let rows = tree.level_rows[tau1];
     let ncoef = ncoef_at(tau1);
-    let rows = tree.m_pos >> tau1;
     debug_assert_eq!(l.len(), rows);
+    let mut emb: Vec<Gf128> = vec![ZERO; rows];
     let mut u = [ZERO; KPOS];
     for j in 0..KPOS {
         let mut acc = ZERO;
         for d in 0..ncoef {
-            let emb: Vec<Gf128> = level[j][d].iter().map(|&c| f.embed(c)).collect();
+            for r in 0..rows {
+                emb[r] = f.embed(level[CopyTree::idx(rows, d, r, j)]);
+            }
             acc += mul(crate::simd::dot_e(scratch, l, &emb), zp[d]);
         }
         u[j] = acc;
@@ -482,6 +510,11 @@ fn column_claims_u(
 /// and aggregated against `l_{τ+1}`:
 /// `f(γ') = Σ_r l_r·ĜU[r]·ĜD[r] + gC(γ')` with
 /// `ĜU[r] = Σ_d z^d·embed(encU[d][r])`.
+///
+/// **Row-blocked streaming** over the flat `[d][j][r]` layout — the four
+/// columns of a (d, row) pair sit in one cache line; the block's enc
+/// (dot4) → embed → `z^d` broadcast-accumulate → triple dot all stay
+/// L2-resident, and the triple dots XOR-fold into the node's scalar.
 #[allow(clippy::too_many_arguments)]
 fn f_samples_copy(
     f: &Gf32,
@@ -495,49 +528,47 @@ fn f_samples_copy(
     let rows_half = tree.m_pos >> (tau + 1);
     let ncoef = ncoef_at(tau);
     let level = &tree.levels[tau];
-    let mut gu: Vec<Gf128> = vec![ZERO; rows_half];
-    let mut gd: Vec<Gf128> = vec![ZERO; rows_half];
+    let rows_total = tree.level_rows[tau];
+    const BLK: usize = 2048;
+    let mut enc: Vec<u32> = vec![0; BLK];
+    let mut ebuf: Vec<Gf128> = vec![ZERO; BLK];
+    let mut gu: Vec<Gf128> = vec![ZERO; BLK];
+    let mut gd: Vec<Gf128> = vec![ZERO; BLK];
     let mut s1: Vec<Gf128> = Vec::new();
     let mut s2: Vec<Gf128> = Vec::new();
     let mut out = [ZERO; 3];
     for node in 0..3 {
         let psi = interp.psi_off[node];
-        // the encodings of each half: enc[d][r] = Σ_j ψ_j·C_τ[j][d][r+half]
-        // (the contiguous U/D row halves — the tree's pairing)
-        let mut enc_u: Vec<Vec<u32>> = Vec::with_capacity(ncoef);
-        let mut enc_d: Vec<Vec<u32>> = Vec::with_capacity(ncoef);
-        for d in 0..ncoef {
-            let mut eu = vec![0u32; rows_half];
-            let mut ed = vec![0u32; rows_half];
-            for r in 0..rows_half {
-                let cu = [
-                    level[0][d][r],
-                    level[1][d][r],
-                    level[2][d][r],
-                    level[3][d][r],
-                ];
-                let cd = [
-                    level[0][d][r + rows_half],
-                    level[1][d][r + rows_half],
-                    level[2][d][r + rows_half],
-                    level[3][d][r + rows_half],
-                ];
-                eu[r] = f.dot4(psi, cu);
-                ed[r] = f.dot4(psi, cd);
+        let mut f_val = ZERO;
+        let mut b0 = 0;
+        while b0 < rows_half {
+            let blen = BLK.min(rows_half - b0);
+            gu[..blen].iter_mut().for_each(|v| *v = ZERO);
+            gd[..blen].iter_mut().for_each(|v| *v = ZERO);
+            for d in 0..ncoef {
+                let zd = zp[d];
+                for half in 0..2 {
+                    let dst = if half == 0 { &mut gu } else { &mut gd };
+                    let base = CopyTree::idx(rows_total, d, b0 + half * rows_half, 0);
+                    for (r, e) in enc[..blen].iter_mut().enumerate() {
+                        let c4 = &level[base + r * KPOS..][..KPOS];
+                        *e = f.dot4(psi, [c4[0], c4[1], c4[2], c4[3]]);
+                    }
+                    for (r, &c) in enc[..blen].iter().enumerate() {
+                        ebuf[r] = f.embed(c);
+                    }
+                    magnetar_field::avx::axpy_run(&mut dst[..blen], &ebuf[..blen], zd, blen);
+                }
             }
-            enc_u.push(eu);
-            enc_d.push(ed);
+            f_val += crate::simd::dot3_e(
+                &mut s1,
+                &mut s2,
+                &l[b0..b0 + blen],
+                &gu[..blen],
+                &gd[..blen],
+            );
+            b0 += blen;
         }
-        // ĝ = Σ_d z^d·embed(enc_d), then the triple dot against l
-        gu.iter_mut().for_each(|v| *v = ZERO);
-        gd.iter_mut().for_each(|v| *v = ZERO);
-        for d in 0..ncoef {
-            let emb_u: Vec<Gf128> = enc_u[d].iter().map(|&c| f.embed(c)).collect();
-            let emb_d: Vec<Gf128> = enc_d[d].iter().map(|&c| f.embed(c)).collect();
-            magnetar_field::avx::axpy_run(&mut gu, &emb_u, zp[d], rows_half);
-            magnetar_field::avx::axpy_run(&mut gd, &emb_d, zp[d], rows_half);
-        }
-        let f_val = crate::simd::dot3_e(&mut s1, &mut s2, l, &gu, &gd);
         let mut g_c = ZERO;
         for j in 0..KPOS {
             g_c += mul(u[j], f.embed(psi[j]));
@@ -548,7 +579,8 @@ fn f_samples_copy(
 }
 
 /// `g_τ(z,x)[r] = Σ_{d,j} C_τ[j][d][r]·z^d·ρ_j(x)` — per (j, d) the
-/// embedded layer scaled by `ρ_j·z^d`, accumulated over the full rows.
+/// embedded layer multiplied by the folded scalar `ρ_j·z^d` (ONE E-mult
+/// per row) and XOR-accumulated into `g`.
 fn contract_g_copy(
     f: &Gf32,
     tree: &CopyTree,
@@ -557,19 +589,25 @@ fn contract_g_copy(
     zp: &[Gf128],
 ) -> Vec<Gf128> {
     let level = &tree.levels[tau];
+    let rows = tree.level_rows[tau];
     let ncoef = ncoef_at(tau);
-    let rows = tree.m_pos >> tau;
     let mut g = vec![ZERO; rows];
+    let mut term = vec![ZERO; rows];
+    let mut emb: Vec<Gf128> = vec![ZERO; rows];
     for j in 0..KPOS {
-        let scale_j = rho[j];
-        let mut zd = zp[0];
         for d in 0..ncoef {
-            let emb: Vec<Gf128> = level[j][d].iter().map(|&c| f.embed(c)).collect();
-            let scaled: Vec<Gf128> = emb.iter().map(|&e| mul(e, scale_j)).collect();
-            magnetar_field::avx::axpy_run(&mut g, &scaled, zd, rows);
-            if d + 1 < ncoef {
-                zd = zp[d + 1];
+            let scalar = mul(rho[j], zp[d]);
+            if scalar == ZERO {
+                continue;
             }
+            for r in 0..rows {
+                emb[r] = f.embed(level[CopyTree::idx(rows, d, r, j)]);
+            }
+            let done = magnetar_field::avx::mul_run(&mut term, &emb, scalar, rows);
+            for r in done..rows {
+                term[r] = mul(emb[r], scalar);
+            }
+            crate::simd::xor_into_e(&mut g, &term);
         }
     }
     g
@@ -677,7 +715,6 @@ pub fn prove_copy(
             cur_pt = pt;
             e_proofs.push(cubic);
         }
-
         // ---- factor the final E-tree point: the first 2 coords are the
         // column bits, the rest the row bits.
         debug_assert_eq!(cur_pt.len(), log_m);
@@ -1065,7 +1102,10 @@ mod tests {
                 for j in 0..KPOS {
                     let mut acc = ZERO;
                     for d in 0..5usize {
-                        acc += mul(f.embed(tree.levels[LOG_KPOS][j][d][r]), pow_z(z, d));
+                        acc += mul(
+                            f.embed(tree.levels[LOG_KPOS][CopyTree::idx(rows, d, r, j)]),
+                            pow_z(z, d),
+                        );
                     }
                     assert_eq!(flat[j * rows + r], acc, "log_m={log_m} r={r} j={j}");
                 }

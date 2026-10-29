@@ -130,7 +130,11 @@ fn timed_probe_avx512() -> u128 {
     let a = [Gf128(0x1234_5678_9abc_def0_1357_9bdf_2468_ace0u128); 4];
     let b = [Gf128(0x0f0f_0f0f_0f0f_0f0f_f0f0_f0f0_f0f0_f0f0u128); 4];
     let t0 = std::time::Instant::now();
-    let sink: u128 = (0..16_384u64)
+    // 4,096 mul4 calls = the same 16,384 field multiplies as the scalar
+    // and avx2 probes — the comparison is per-mul, not per-rayon-item
+    // (the 16,384-item draft did 4× the work and silently biased the
+    // dispatch against AVX-512 on every host).
+    let sink: u128 = (0..4_096u64)
         .into_par_iter()
         .map(|i| {
             let mut x = a;
