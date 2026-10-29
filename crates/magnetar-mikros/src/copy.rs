@@ -537,6 +537,14 @@ fn f_samples_copy(
     let mut s1: Vec<Gf128> = Vec::new();
     let mut s2: Vec<Gf128> = Vec::new();
     let mut out = [ZERO; 3];
+    // the lane dispatch hoisted out of the row loop (the per-call OnceLock
+    // read + branch was measurable at m_pos = 2^20: 12M dot4 calls)
+    #[cfg(target_arch = "x86_64")]
+    let use256 = crate::gf32::lane256_ok();
+    #[cfg(target_arch = "x86_64")]
+    let use512 = crate::gf32::lane512_ok();
+    #[cfg(not(target_arch = "x86_64"))]
+    let (use256, use512) = (false, false);
     for node in 0..3 {
         let psi = interp.psi_off[node];
         let mut f_val = ZERO;
@@ -550,6 +558,32 @@ fn f_samples_copy(
                 for half in 0..2 {
                     let dst = if half == 0 { &mut gu } else { &mut gd };
                     let base = CopyTree::idx(rows_total, d, b0 + half * rows_half, 0);
+                    // enc (the hoisted-lane dot4) + embed fused per row
+                    #[cfg(target_arch = "x86_64")]
+                    for (r, e) in enc[..blen].iter_mut().enumerate() {
+                        let c4 = &level[base + r * KPOS..][..KPOS];
+                        let w = [psi[0], psi[1], psi[2], psi[3]];
+                        let c = [c4[0], c4[1], c4[2], c4[3]];
+                        let p = if use256 {
+                            #[allow(unsafe_code)]
+                            // SAFETY: the hoisted dispatch confirmed
+                            // avx512vl + vpclmulqdq.
+                            unsafe {
+                                crate::gf32::mul4_256(w, c, f.p_low, f.mu_low)
+                            }
+                        } else if use512 {
+                            #[allow(unsafe_code)]
+                            // SAFETY: the hoisted dispatch confirmed
+                            // avx512f + vpclmulqdq.
+                            unsafe {
+                                crate::gf32::mul4_512(w, c, f.p_low, f.mu_low)
+                            }
+                        } else {
+                            f.mul4(w, c)
+                        };
+                        *e = (p[0] ^ p[1]) ^ (p[2] ^ p[3]);
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
                     for (r, e) in enc[..blen].iter_mut().enumerate() {
                         let c4 = &level[base + r * KPOS..][..KPOS];
                         *e = f.dot4(psi, [c4[0], c4[1], c4[2], c4[3]]);

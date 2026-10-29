@@ -289,7 +289,7 @@ impl Gf32 {
 /// Whether the 256-bit VPCLMULQDQ lanes are available (avx512vl +
 /// vpclmulqdq — the `_mm256_clmulepi64_epi128` contract).
 #[cfg(target_arch = "x86_64")]
-fn lane256_ok() -> bool {
+pub(crate) fn lane256_ok() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
         std::is_x86_feature_detected!("avx512vl") && std::is_x86_feature_detected!("vpclmulqdq")
@@ -299,7 +299,7 @@ fn lane256_ok() -> bool {
 /// Whether the 512-bit VPCLMULQDQ lanes are available (avx512f +
 /// vpclmulqdq).
 #[cfg(target_arch = "x86_64")]
-fn lane512_ok() -> bool {
+pub(crate) fn lane512_ok() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
         std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("vpclmulqdq")
@@ -311,7 +311,7 @@ fn lane512_ok() -> bool {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512vl,vpclmulqdq")]
 #[allow(unsafe_code)]
-unsafe fn mul4_256(a: [u32; 4], b: [u32; 4], p_low: u32, mu_low: u32) -> [u32; 4] {
+pub(crate) unsafe fn mul4_256(a: [u32; 4], b: [u32; 4], p_low: u32, mu_low: u32) -> [u32; 4] {
     use std::arch::x86_64::{
         _mm256_clmulepi64_epi128, _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_srli_epi64,
         _mm256_storeu_si256, _mm256_xor_si256,
@@ -342,7 +342,7 @@ unsafe fn mul4_256(a: [u32; 4], b: [u32; 4], p_low: u32, mu_low: u32) -> [u32; 4
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,vpclmulqdq")]
 #[allow(unsafe_code)]
-unsafe fn mul4_512(a: [u32; 4], b: [u32; 4], p_low: u32, mu_low: u32) -> [u32; 4] {
+pub(crate) unsafe fn mul4_512(a: [u32; 4], b: [u32; 4], p_low: u32, mu_low: u32) -> [u32; 4] {
     use std::arch::x86_64::{
         _mm512_clmulepi64_epi128, _mm512_loadu_si512, _mm512_set1_epi64, _mm512_srli_epi64,
         _mm512_storeu_si512, _mm512_xor_si512,
