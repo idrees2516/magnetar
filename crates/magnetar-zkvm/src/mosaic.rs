@@ -355,7 +355,13 @@ pub fn commit_mosaic_split(
     }
     let code_params = CodeParams::derive(n, params.k, &params.domain);
     let codeword = Codeword::encode(&code_params, &packed);
-    let tree = MerkleTree::build(&format!("{}/level/0", params.domain), &codeword.values);
+    // the batched-leaf tree (the fold-width rule, shared with
+    // commit_table — the verifier's correlated queries derive it)
+    let tree = MerkleTree::build_batched(
+        &format!("{}/level/0", params.domain),
+        &codeword.values,
+        magnetar_pcs::eval::fold_tree_width(codeword.values.len()),
+    );
     let stmt = PcsStatement {
         root: tree.root(),
         n,
@@ -473,6 +479,7 @@ pub fn prove_mosaic_hier(
             let w = crate::wrap::prove_wrap(
                 deep_params,
                 cm.tree.as_ref().expect("monolithic commitment"),
+                cm.codeword.as_ref().expect("monolithic codeword"),
                 &cm.stmt.domain,
                 &cm.packed,
                 &r_block,

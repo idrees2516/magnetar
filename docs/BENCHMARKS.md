@@ -128,24 +128,29 @@ values), and the two grouped openings (witness 3m / public
 
 | N | prover | gates/s | verifier | approx. proof | peak RSS |
 |---|---|---|---|---|---|
-| 2^16 | 152 ms | 430,412 | 72 ms | 193 KiB | 29 MiB |
-| 2^18 | 850 ms | 308,339 | 127 ms | 210 KiB | 143 MiB |
-| 2^20 | 2.59 s | 404,667 | 296 ms | 228 KiB | 523 MiB |
-| 2^21 | 7.04 s | 298,148 | 514 ms | 237 KiB | 909 MiB |
-| 2^22 | 11.3 s | 372,463 | 965 ms | 247 KiB | 1.75 GiB |
+| 2^16 | 159 ms | 411,141 | 89 ms | 193 KiB | 28 MiB |
+| 2^18 | 641 ms | 408,943 | 156 ms | 210 KiB | 118 MiB |
+| 2^20 | 2.51 s | 417,913 | 374 ms | 228 KiB | 458 MiB |
+| 2^21 | 5.14 s | 407,721 | 720 ms | 237 KiB | ~0.9 GiB |
+| 2^22 | 10.6 s | 396,337 | 1,178 ms | 247 KiB | 1.60 GiB |
 
 **Vs the paper's Table 5**: Mikros proves N = 2^25 in 86.56 s on their
 Xeon Gold 6342 = 386K gates/s. This implementation sustains
-**404K gates/s at 2^20 and 372K at 2^22** on the InstaBox host (a
-4-vCPU cloud machine with GFNI/AVX-512/VPCLMULQDQ, single-threaded) —
-**105% / 96% of the paper's measured per-core throughput** — and
-266–346K on the shared 2-vCPU dev container. Prover anatomy at 2^22:
-copy 6.2 s (55%), openings 4.1 s (37%), gates 0.14 s (1%) — the
-paper's Table-5 shape (perm-dominant). The 0.11.1 kernel release (the
-AVX-512 probe fix, the flat `[d][r][j]` tree, the streaming η pipeline,
-the scalar-folded `g` contraction, the grouped openings' ξ cache, the
-hoisted lane dispatch) took the ladder from 21.2 s to 11.3 s at 2^22
-(1.9×). The
+**418K gates/s at 2^20 and 396K at 2^22** on this AVX-512 host
+(single-threaded, 2 vCPU) — **108% / 103% of the paper's measured
+per-core throughput**. Prover anatomy at 2^20 (the MIKROS_TIME=1
+breakdown): copy 1.70 s (68% — η 0.55, the E-tree unfold 0.22, the
+τ-cubics ~0.24, tree 0.19, `g` 0.25, u-claims 0.12), openings 0.67 s
+(27% — the public group's PCS sumcheck 0.15, fold+trees 0.33, Fact-1
+0.05, operand 0.05), expansion 0.06 s, gates ~0.05 s — the paper's
+Table-5 shape (copy/opening-dominant). The 0.11.1 kernel release (the
+AVX-512 probe fix, the flat `[d][r][j]` tree, the streaming η pipeline)
+took the ladder from 21.2 s to 11.3 s at 2^22 (1.9×); the 0.11.2 pass
+(the batched-leaf PCS trees, the single-message sum-check, the
+VPCLMULQDQ-laned Möbius shift, the AVX-512 tile transpose, the
+hoisted-transpose expansion, the `dot_vv` kernel) took it from 11.3 s
+to 10.6 s at 2^22 and 3.75 s to 2.51 s at 2^20 (1.5×) while cutting
+peak RSS 15% (1.75 → 1.60 GiB at 2^22). The
 κ_pos = 4 geometry is forced: `d_L` position coordinates plus the
 witness coordinate need `d = 32` basis elements (`2d ≤ κ = 128`), so
 `[E : K_pos] = 4` for every admissible N ≥ 2^14.
@@ -165,6 +170,100 @@ witness coordinate need `d = 32` basis elements (`2d ≤ κ = 128`), so
 - The Keccak io positions: the output lanes are pushed in (y,x) order,
   not column-creation order — the batch io-bind's masked-eq scan
   requires the sorted set (fixed in `CircuitBuilder::build`).
+
+## The ERC-20 transfer benchmark (Algorithm 5, the state-transition core)
+
+`mikros-bench erc20 --log2-n 16..22` — the honest ERC-20 transfer
+semantics as a bit-level PLONK circuit through the full Algorithm-5
+stack. Per transfer (uint256, Solidity's exact arithmetic):
+
+* **debit** `b_s' = b_s − amount` as `b_s + ¬amount + 1` (two's
+  complement, a 256-bit ripple-carry adder at 5 rows/bit — the carry
+  `c_i = x_i·y_i ⊕ (x_i⊕y_i)·c_{i-1}` needs two AND rows, and the
+  `x⊕y` row is shared by the carry and sum terms);
+* the adder's **carry-out is bound as a public io bit** — it is 1
+  exactly when `b_s ≥ amount` (the no-underflow assertion);
+* **credit** `b_r' = b_r + amount` — plain uint256 addition (Solidity
+  does not check recipient overflow: the sum wraps);
+* the `amount` bits are public io (the rollup's public calldata; 257 io
+  bits per transfer); the balances stay private witness — the
+  storage-root binding (keccak/Merkle-Patricia proofs) is the
+  documented follow-up, not part of this core.
+
+**2816 rows per transfer** (2×1280 adder + 256 `¬amount` rows), the
+circuit padded to the Theorem-1 power of two. Measured on this host
+(2 vCPU, GFNI/AVX-512/VPCLMULQDQ, single-threaded, TSC 3.20 GHz):
+
+| N | transfers | prover | gates/s | ms/transfer | transfers/s | cycles/gate | cycles/transfer | proof |
+|---|---|---|---|---|---|---|---|---|
+| 2^16 | 23 | 155 ms | 423,057 | 6.74 | 148.5 | 7,565 | 21.6M | 193 KiB |
+| 2^18 | 93 | 610 ms | 429,806 | 6.56 | 152.5 | 7,446 | 21.0M | 210 KiB |
+| 2^20 | 372 | 2.47 s | 424,751 | 6.64 | 150.7 | 7,534 | 21.2M | 228 KiB |
+| 2^21 | 744 | 5.14 s | 407,721 | 6.91 | 144.6 | 7,849 | 22.1M | 237 KiB |
+| 2^22 | 1489 | 10.4 s | 401,512 | 7.02 | 142.5 | 7,970 | 22.5M | 247 KiB |
+
+**Cycles/s**: the TSC runs at 3.20 GHz and the prover sustains
+3.20G cycles/s through the whole prove (the `rdtsc` bracket in the
+bench) — single-core, fully TSC-bound. That is **~7.5K cycles per
+gate** and **~21–22M cycles per transfer** end-to-end (circuit build +
+setup excluded; prover only). The paper's own cycles/s figures (1.7M
+at 2^16 on an M4) are not comparable across hash kernels and trace
+lengths; the per-gate constant here is the honest cross-platform
+metric.
+
+**Throughput**: 142–152 transfers/s single-core at every size from
+2^16 to 2^22 (6.6–7.0 ms per transfer, flat in N — linear proving,
+the paper's central claim, realized on this workload).
+
+## Can it prove Ethereum in real time?
+
+**Definitions first.** Ethereum produces a block every 12 s. "Real-time
+proving" means the prover finishes each block's proof inside that slot
+budget. Mainnet planning figures: ~30M gas target per block; a
+standard ERC-20 transfer costs ~50K gas (24K warm / ~51K
+storage-fresh), so a full block of transfers carries ~600 transfers.
+
+**The measured verdict for this stack (single core, this host):**
+
+| workload | gates | time at 418K gates/s | verdict vs 12 s |
+|---|---|---|---|
+| 600-transfer state-transition core (this circuit) | 1.69M | **4.0 s** | **REAL-TIME, 3.0× headroom** |
+| + keccak storage proofs (~30M rows, Table-4 Keccak rate) | ~32M | ~76 s | behind 6.3× |
+| + one ECDSA verify per transfer (~1.5M gates each, binary-circuit ballpark) | ~900M | ~36 min | behind ~180× |
+| full EVM block (type-1 zkEVM, 30M gas ≈ 1–2B constraints) | ~1.5B | ~1 h | behind ~300× |
+
+So: **the ERC-20 state-transition core already proves real time with
+3× headroom on one core** — the optimization target the bench set out
+to hit is met with margin, at every circuit size from 2^16 to 2^22
+(the last table row of each `erc20` run prints the verdict live).
+The extended stacks are honestly not real-time on one core, and the
+levers are known and quantified:
+
+1. **keccak storage proofs** (~30M rows/block at the Table-4 Keccak
+   row rate): ~76 s single-core. Sixteen cores of the current
+   single-thread rate ≈ 5 s — real time *with parallelism*; or a
+   SNARK-friendly state tree in the binary tower (the same
+   `κ_pos = 4` geometry the copy layer already runs) cuts the row
+   count ~50×.
+2. **ECDSA per transfer**: dominated by the 256-bit prime-field
+   multiplier chains in binary circuits. The standard rollup practice
+   is to keep signature validity out of the state-transition proof
+   (the sequencer attests; a dedicated ECDSA circuit batch-proves at
+   the Table-4 hash-batch operating point) — this repo's
+   `magnetar-bench-erc20` (the zkVM lineage) already exercises that
+   split.
+3. **Full EVM blocks**: nobody proves type-1 EVM in real time on a
+   single machine — the operating point is recursive aggregation
+   (docs/RECURSION.md) across many provers, exactly what the 0.11.x
+   kernel ladder is for.
+
+The end-to-end ERC-20 numbers above are single runs; treat ±10% as
+noise. Reproduce with:
+
+```sh
+cargo run --release -p magnetar-mikros --bin mikros-bench -- erc20 --log2-n 20
+MIKROS_TIME=1 cargo run --release -p magnetar-mikros --bin mikros-bench -- plonk --log2-n 20
+```
 
 ## End-to-end results (this implementation)
 

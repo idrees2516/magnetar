@@ -102,6 +102,53 @@ pub(crate) struct LeafHashPrefix {
     buf: Vec<u8>,
 }
 
+/// The batched-leaf variant: `"magnetar/leafN/v1" ‖ domain ‖ n_values ‖
+/// width` — each leaf digest covers `width` consecutive field elements
+/// (the PCS fold-chain trees: one BLAKE3 call amortizes the per-leaf
+/// fixed cost over 8 values, an ~8x cut of the fold-chain hashing at the
+/// FastChunk profile).
+pub(crate) struct BatchedLeafHashPrefix {
+    buf: Vec<u8>,
+    width: usize,
+}
+
+impl BatchedLeafHashPrefix {
+    pub(crate) fn new(domain: &str, n_values: usize, width: usize) -> Self {
+        let mut buf = Vec::with_capacity(112 + domain.len());
+        serialize_prefix(
+            5,
+            &[
+                b"magnetar/leafN/v1",
+                domain.as_bytes(),
+                &(n_values as u64).to_le_bytes(),
+                &(width as u64).to_le_bytes(),
+            ],
+            &mut buf,
+        );
+        BatchedLeafHashPrefix { buf, width }
+    }
+
+    /// The leaf stream for group `group_index` covering `values` (exactly
+    /// `width` elements): prefix ‖ width ‖ group_index ‖ byte_len ‖ values.
+    pub(crate) fn hash_group(
+        &self,
+        group_index: usize,
+        values: &[magnetar_field::Gf128],
+    ) -> [u8; DIGEST] {
+        debug_assert_eq!(values.len(), self.width);
+        let bytes = 16 * self.width;
+        let mut buf = Vec::with_capacity(self.buf.len() + 24 + bytes);
+        buf.extend_from_slice(&self.buf);
+        buf.extend_from_slice(&(self.width as u64).to_le_bytes());
+        buf.extend_from_slice(&(group_index as u64).to_le_bytes());
+        buf.extend_from_slice(&(bytes as u64).to_le_bytes());
+        for v in values {
+            buf.extend_from_slice(&fe_to_bytes(*v));
+        }
+        blake3_one_shot(&buf)
+    }
+}
+
 impl LeafHashPrefix {
     pub(crate) fn new(domain: &str, n_leaves: usize) -> Self {
         let mut buf = Vec::with_capacity(96 + domain.len());
@@ -297,6 +344,11 @@ impl Transcript {
 /// Minimum leaves (or nodes) before a level is hashed in parallel (R2).
 const PAR_TREE_THRESHOLD: usize = 1 << 13;
 
+/// The batched-leaf width (values per BLAKE3 call) used by the PCS fold
+/// trees. 8 keeps the leaf stream inside two BLAKE3 input blocks while
+/// amortizing the per-call fixed cost over 8 values.
+pub const BATCH_LEAF_WIDTH: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct MerkleTree {
     /// All levels, leaves first: levels[0] = leaf digests (n), levels[i] =
@@ -305,6 +357,9 @@ pub struct MerkleTree {
     domain: Vec<u8>,
     /// Number of leaves (power of two for the trees used in this stack).
     n_leaves: usize,
+    /// Values per leaf group: 1 for the classic per-value trees, 8 for the
+    /// batched PCS fold trees (n_leaves counts VALUES either way).
+    width: usize,
 }
 
 impl MerkleTree {
@@ -326,7 +381,6 @@ impl MerkleTree {
             n.is_power_of_two() || n == 1,
             "Merkle leaves must be a power of two"
         );
-        let dom = domain.as_bytes().to_vec();
         let leaf_pfx = LeafHashPrefix::new(domain, n);
         let leaf = |(i, &x): (usize, &magnetar_field::Gf128)| leaf_pfx.hash(i, x);
         let level: Vec<[u8; DIGEST]> = if n >= PAR_TREE_THRESHOLD {
@@ -334,6 +388,51 @@ impl MerkleTree {
         } else {
             leaves.iter().enumerate().map(leaf).collect()
         };
+        Self::finish_levels(domain, level, n, 1)
+    }
+
+    /// Build a batched-leaf tree: leaf i covers `values[i*width ..
+    /// (i+1)*width]` (one BLAKE3 call per group). `values.len()` must be a
+    /// power of two divisible by `width`; `n_leaves()` reports the VALUE
+    /// count and `open(value_index)`/`verify_batched` address the group
+    /// containing that value.
+    pub fn build_batched(domain: &str, values: &[magnetar_field::Gf128], width: usize) -> Self {
+        assert!(
+            width == 1 || width.is_power_of_two(),
+            "width must be 1 or a power of two"
+        );
+        let n = values.len();
+        assert!(
+            n.is_power_of_two(),
+            "batched trees need a power-of-two value count"
+        );
+        assert_eq!(n % width, 0, "the groups must tile the value array");
+        let n_groups = n / width;
+        let leaf_pfx = BatchedLeafHashPrefix::new(domain, n, width);
+        let level: Vec<[u8; DIGEST]> = if n_groups >= PAR_TREE_THRESHOLD {
+            values
+                .par_chunks_exact(width)
+                .enumerate()
+                .map(|(g, vals)| leaf_pfx.hash_group(g, vals))
+                .collect()
+        } else {
+            values
+                .chunks_exact(width)
+                .enumerate()
+                .map(|(g, vals)| leaf_pfx.hash_group(g, vals))
+                .collect()
+        };
+        Self::finish_levels(domain, level, n, width)
+    }
+
+    /// The shared level-by-level node pass (R5: one hash domain per level).
+    fn finish_levels(
+        domain: &str,
+        level: Vec<[u8; DIGEST]>,
+        n_values: usize,
+        width: usize,
+    ) -> Self {
+        let dom = domain.as_bytes().to_vec();
         let mut levels = vec![level];
         while levels.last().unwrap().len() > 1 {
             let cur = levels.last().unwrap();
@@ -351,8 +450,14 @@ impl MerkleTree {
         MerkleTree {
             levels,
             domain: dom,
-            n_leaves: n,
+            n_leaves: n_values,
+            width,
         }
+    }
+
+    /// The leaf-group width (1 for the classic per-value trees).
+    pub fn width(&self) -> usize {
+        self.width
     }
 
     /// The commitment (root).
@@ -365,18 +470,31 @@ impl MerkleTree {
         self.n_leaves
     }
 
-    /// Open leaf `index`, returning the value digest and the sibling path
-    /// (bottom-up).
+    /// Open the leaf covering VALUE `index`, returning the group digest
+    /// and the sibling path (bottom-up). For width-1 trees this is the
+    /// classic per-value opening; for batched trees the digest is the
+    /// GROUP's (the caller reveals the group's values alongside).
     pub fn open(&self, index: usize) -> ([u8; DIGEST], Vec<[u8; DIGEST]>) {
         assert!(index < self.n_leaves);
         let mut path = Vec::with_capacity(self.levels.len() - 1);
-        let mut idx = index;
+        let mut idx = if self.width == 1 {
+            index
+        } else {
+            index / self.width
+        };
         for level in &self.levels[..self.levels.len() - 1] {
             let sib = idx ^ 1;
             path.push(level[sib]);
             idx >>= 1;
         }
-        (self.levels[0][index], path)
+        (
+            self.levels[0][if self.width == 1 {
+                index
+            } else {
+                index / self.width
+            }],
+            path,
+        )
     }
 
     /// The digest of a leaf `value` (used by verifiers to recompute leaf
@@ -388,6 +506,73 @@ impl MerkleTree {
         value: magnetar_field::Gf128,
     ) -> [u8; DIGEST] {
         LeafHashPrefix::new(domain, n_leaves).hash(index, value)
+    }
+
+    /// The digest of the batched leaf covering VALUE `value_index` — the
+    /// full group `values` (exactly `width` elements) is hashed in one
+    /// BLAKE3 call.
+    pub fn leaf_digest_of_batched(
+        domain: &str,
+        n_values: usize,
+        width: usize,
+        value_index: usize,
+        values: &[magnetar_field::Gf128],
+    ) -> [u8; DIGEST] {
+        assert_eq!(
+            values.len(),
+            width,
+            "the batched leaf covers `width` values"
+        );
+        BatchedLeafHashPrefix::new(domain, n_values, width).hash_group(value_index / width, values)
+    }
+
+    /// Verify a batched-leaf opening for VALUE `value_index` (its group's
+    /// digest walked up `path`). Returns the recomputed root on success.
+    pub fn verify_batched(
+        domain: &str,
+        n_values: usize,
+        width: usize,
+        value_index: usize,
+        leaf_digest: [u8; DIGEST],
+        path: &[[u8; DIGEST]],
+    ) -> Result<[u8; DIGEST], &'static str> {
+        if !n_values.is_power_of_two() || n_values == 0 {
+            return Err("bad value count");
+        }
+        if width == 1 || width.is_power_of_two() {
+            // ok
+        } else {
+            return Err("bad width");
+        }
+        if !n_values.is_multiple_of(width) {
+            return Err("width does not tile");
+        }
+        let n_groups = n_values / width;
+        if value_index >= n_values {
+            return Err("index out of range");
+        }
+        let expect_depth = if n_groups == 1 {
+            0
+        } else {
+            n_groups.trailing_zeros() as usize
+        };
+        if path.len() != expect_depth {
+            return Err("path length mismatch");
+        }
+        let group = value_index / width;
+        let mut acc = leaf_digest;
+        let mut idx = group;
+        for (lvl, sib) in path.iter().enumerate() {
+            let node_pfx = NodeHashPrefix::new(domain, lvl as u64);
+            let node = if idx & 1 == 0 {
+                node_pfx.hash(&acc, sib)
+            } else {
+                node_pfx.hash(sib, &acc)
+            };
+            acc = node;
+            idx >>= 1;
+        }
+        Ok(acc)
     }
 
     /// Verify an opening. Returns the leaf digest on success.
@@ -499,6 +684,7 @@ impl MerkleTree {
             levels,
             domain: dom,
             n_leaves,
+            width: 1,
         }
     }
 }

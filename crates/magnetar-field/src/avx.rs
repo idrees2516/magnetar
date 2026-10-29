@@ -1262,3 +1262,115 @@ fn mulvv_matches_scalar() {
         assert_eq!(aliased, want, "aliased mulvv n={n}");
     }
 }
+
+/// The vectorized inner product `Σ a[k]·b[k]` over `count` entries — one
+/// XOR-accumulating pass through the measured backend (Fact-1's dots, the
+/// cubic sum-checks, the claim-expansion value dots). Covers the scalar
+/// tail internally and returns the field element.
+pub fn dot_vv(a: &[Gf128], b: &[Gf128], count: usize) -> Gf128 {
+    debug_assert_eq!(a.len(), count);
+    debug_assert_eq!(b.len(), count);
+    let mut acc = crate::gf128::Gf128(0);
+    let mut done = 0usize;
+    match detect() {
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx512 => {
+            let n4 = count / 4;
+            if n4 > 0 {
+                #[allow(unsafe_code)]
+                // SAFETY: the measured dispatch confirmed the target features.
+                unsafe {
+                    use std::arch::x86_64::{
+                        _mm256_extracti128_si256, _mm256_xor_si256, _mm512_extracti64x4_epi64,
+                        _mm512_loadu_si512, _mm512_setzero_si512, _mm512_xor_si512,
+                    };
+                    let mut vacc = _mm512_setzero_si512();
+                    for i in 0..n4 {
+                        let k = 4 * i;
+                        let va = _mm512_loadu_si512(a.as_ptr().add(k).cast());
+                        let vb = _mm512_loadu_si512(b.as_ptr().add(k).cast());
+                        let prod = imp512::Avx.mul_mm_public(va, vb);
+                        vacc = _mm512_xor_si512(vacc, prod);
+                    }
+                    // horizontal reduce 512 -> 256 -> 128
+                    let lo = _mm512_extracti64x4_epi64(vacc, 0);
+                    let hi = _mm512_extracti64x4_epi64(vacc, 1);
+                    let r256 = _mm256_xor_si256(lo, hi);
+                    let lo128 = _mm256_extracti128_si256(r256, 0);
+                    let hi128 = _mm256_extracti128_si256(r256, 1);
+                    use std::arch::x86_64::_mm_xor_si128;
+                    let r128 = _mm_xor_si128(lo128, hi128);
+                    let w = cast128(r128);
+                    acc = Gf128(w[0] as u128 | ((w[1] as u128) << 64));
+                }
+            }
+            done = 4 * n4;
+        }
+        #[cfg(target_arch = "x86_64")]
+        SimdKind::Avx2 => {
+            let n2 = count / 2;
+            #[allow(unsafe_code)]
+            // SAFETY: the measured dispatch confirmed the target features.
+            unsafe {
+                use std::arch::x86_64::{
+                    _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_setzero_si256,
+                    _mm256_xor_si256, _mm_xor_si128,
+                };
+                let mut vacc = _mm256_setzero_si256();
+                for i in 0..n2 {
+                    let k = 2 * i;
+                    let va = _mm256_loadu_si256(a.as_ptr().add(k).cast());
+                    let vb = _mm256_loadu_si256(b.as_ptr().add(k).cast());
+                    let prod = imp256::Avx2.mul_mm_public(va, vb);
+                    vacc = _mm256_xor_si256(vacc, prod);
+                }
+                let lo128 = _mm256_extracti128_si256(vacc, 0);
+                let hi128 = _mm256_extracti128_si256(vacc, 1);
+                let r128 = _mm_xor_si128(lo128, hi128);
+                let w = cast128(r128);
+                acc = Gf128(w[0] as u128 | ((w[1] as u128) << 64));
+            }
+            done = 2 * n2;
+        }
+        SimdKind::Scalar => {}
+    }
+    for k in done..count {
+        acc += crate::gf128::mul(a[k], b[k]);
+    }
+    acc
+}
+
+/// View a 128-bit vector as a 2-element u64 array (the horizontal-reduce
+/// helper for [`dot_vv`]).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn cast128(v: std::arch::x86_64::__m128i) -> [u64; 2] {
+    use std::arch::x86_64::_mm_storeu_si128;
+    let mut out = [0u64; 2];
+    _mm_storeu_si128(out.as_mut_ptr().cast(), v);
+    out
+}
+
+#[test]
+fn dot_vv_matches_scalar() {
+    let mut rng_state = 0x2545F4914F6DD1u64;
+    let mut rg = || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        Gf128((rng_state as u128) | (((rng_state >> 1) as u128) << 64))
+    };
+    for &n in &[1usize, 2, 3, 8, 17, 64, 100, 257] {
+        let a: Vec<Gf128> = (0..n).map(|_| rg()).collect();
+        let b: Vec<Gf128> = (0..n).map(|_| rg()).collect();
+        let mut want = Gf128(0);
+        for k in 0..n {
+            want += crate::gf128::mul(a[k], b[k]);
+        }
+        assert_eq!(dot_vv(&a, &b, n), want, "n={n}");
+    }
+    // all-zero second operand
+    let a: Vec<Gf128> = (0..9).map(|_| rg()).collect();
+    let z = vec![Gf128(0); 9];
+    assert_eq!(dot_vv(&a, &z, 9), Gf128(0));
+}

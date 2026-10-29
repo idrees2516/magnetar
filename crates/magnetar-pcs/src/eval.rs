@@ -24,6 +24,32 @@ use magnetar_sumcheck::{
     BindOrder, SumcheckSpec, Term,
 };
 
+/// The fold-level leaf width: batched 8-value leaves once a level is wide
+/// enough, pairs below that (an even `a_idx` always shares a group with its
+/// odd partner), single leaves only for a length-1 tail. Deterministic in
+/// the level's value count — both sides derive it identically.
+#[inline]
+pub fn fold_tree_width(level_len: usize) -> usize {
+    if level_len >= 16 {
+        magnetar_hash::BATCH_LEAF_WIDTH
+    } else if level_len >= 2 {
+        2
+    } else {
+        1
+    }
+}
+
+#[inline]
+fn fold_width(level_len: usize) -> usize {
+    fold_tree_width(level_len)
+}
+
+/// The tree width for fold level `level` (0..=n, tail included).
+#[inline]
+fn level_width(n: usize, k: usize, level: usize) -> usize {
+    fold_width(1usize << (n - level + k))
+}
+
 /// Tunable PCS parameters. Defaults target ≥ 120-bit security at the test
 /// scale: `k = 2` (rate 1/4, distance ≈ 1 at generic γ) and `q = 40`
 /// correlated queries.
@@ -121,17 +147,23 @@ pub struct PcsStatement {
     pub domain: String,
 }
 
-/// One level's openings along a correlated query path.
+/// One level's openings along a correlated query path. `a` and `b` are
+/// adjacent value indices — they always share one leaf group, so a single
+/// group reveal + path covers the pair; `c`'s group at the next level is
+/// revealed alongside.
 #[derive(Clone, Debug)]
 pub struct LevelOpen {
     /// Pair value at the fold bit = 0.
     pub a: Gf128,
-    pub a_path: Vec<[u8; DIGEST]>,
     /// Pair value at the fold bit = 1.
     pub b: Gf128,
-    pub b_path: Vec<[u8; DIGEST]>,
     /// Image value in the next level.
     pub c: Gf128,
+    /// The leaf group covering `a`/`b` at this level (width values).
+    pub a_vals: Vec<Gf128>,
+    /// The leaf group covering `c` at the next level (its width values).
+    pub c_vals: Vec<Gf128>,
+    pub a_path: Vec<[u8; DIGEST]>,
     pub c_path: Vec<[u8; DIGEST]>,
 }
 
@@ -152,8 +184,9 @@ pub struct PcsProof {
     pub terminal_claim: Gf128,
     /// Correlated path queries.
     pub queries: Vec<PathQuery>,
-    /// The full tail `D_n` (`2^k` values) with Merkle paths.
-    pub tail: Vec<(Gf128, Vec<[u8; DIGEST]>)>,
+    /// The full tail `D_n` in per-group reveals (`w_tail` values each, with
+    /// Merkle paths).
+    pub tail: Vec<(Vec<Gf128>, Vec<[u8; DIGEST]>)>,
 }
 
 /// Commit to a table: build the codeword and its Merkle tree.
@@ -161,7 +194,11 @@ pub fn commit_table(params: &PcsParams, table: &[Gf128]) -> (Codeword, MerkleTre
     let n = table.len().trailing_zeros() as usize;
     let code_params = CodeParams::derive(n, params.k, &params.domain);
     let codeword = Codeword::encode(&code_params, table);
-    let tree = MerkleTree::build(&level_domain(&params.domain, 0), &codeword.values);
+    let tree = MerkleTree::build_batched(
+        &level_domain(&params.domain, 0),
+        &codeword.values,
+        level_width(n, params.k, 0),
+    );
     let stmt = PcsStatement {
         root: tree.root(),
         n,
@@ -185,6 +222,9 @@ pub fn prove_eval(
     y: Gf128,
     t: &mut Transcript,
 ) -> PcsProof {
+    use std::time::Instant;
+    let time_on = std::env::var("MIKROS_TIME").is_ok();
+    let t_sc = Instant::now();
     let n = table.len().trailing_zeros() as usize;
     debug_assert_eq!(r.len(), n);
     // ---- 1. Sum-check.
@@ -203,31 +243,58 @@ pub fn prove_eval(
     let mut rounds = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
     for _ in 0..n {
+        // ONE message computation per round: the round message is
+        // absorbed in absorb_and_fold's byte format, the challenge drawn,
+        // and the fold applied via fold_msg (the double message() of the
+        // absorb_and_fold route was the sum-check's 2x).
         let msg = prover.message();
         rounds.push(msg.0.clone());
-        let r_i = prover.absorb_and_fold(t, "pcs-eval");
+        let mut buf = Vec::with_capacity(msg.0.len() * 16);
+        for c in &msg.0 {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+        }
+        t.absorb_bytes("pcs-eval", &buf);
+        let r_i = t.challenge_field("pcs-eval");
+        prover.fold_msg(&msg, r_i);
         challenges.push(r_i);
     }
     let (dense_claims, _running) = prover.finish();
     let terminal_claim = dense_claims[0];
     t.absorb_field("pcs-terminal", &[terminal_claim]);
+    if time_on {
+        eprintln!(
+            "  pcs[{} words]: sumcheck {:.0} ms",
+            table.len(),
+            t_sc.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t_fold = Instant::now();
 
     // ---- 2. Fold chain: levels 0..=n (fold variable 0 each round —
     // variables bound in increasing order).
     let code_params = CodeParams::derive(n, params.k, &params.domain);
+    let t_enc = Instant::now();
     let mut cw = Codeword::encode(&code_params, table);
+    if time_on {
+        eprintln!(
+            "  pcs encode: {:.0} ms",
+            t_enc.elapsed().as_secs_f64() * 1e3
+        );
+    }
     let mut trees = Vec::with_capacity(n + 1);
     let mut values = Vec::with_capacity(n + 1);
-    trees.push(MerkleTree::build(
+    trees.push(MerkleTree::build_batched(
         &level_domain(&params.domain, 0),
         &cw.values,
+        level_width(n, params.k, 0),
     ));
     values.push(cw.values.clone());
     for (i, &rc) in challenges.iter().enumerate() {
         cw = cw.fold(0, rc);
-        trees.push(MerkleTree::build(
+        trees.push(MerkleTree::build_batched(
             &level_domain(&params.domain, i + 1),
             &cw.values,
+            level_width(n, params.k, i + 1),
         ));
         values.push(cw.values.clone());
     }
@@ -239,6 +306,13 @@ pub fn prove_eval(
     }
 
     // ---- 3. Correlated query paths.
+    if time_on {
+        eprintln!(
+            "  pcs fold+trees: {:.0} ms",
+            t_fold.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let t_q = Instant::now();
     let base_leaves = trees[0].n_leaves() as u64;
     let mut queries = Vec::with_capacity(params.queries);
     for qi in 0..params.queries {
@@ -247,12 +321,16 @@ pub fn prove_eval(
     }
 
     // ---- 4. Tail.
+    if time_on {
+        eprintln!("  pcs queries: {:.0} ms", t_q.elapsed().as_secs_f64() * 1e3);
+    }
     let tail_tree = trees.last().unwrap();
     let tail_vals = values.last().unwrap();
-    let tail: Vec<(Gf128, Vec<[u8; DIGEST]>)> = (0..tail_tree.n_leaves())
-        .map(|i| {
-            let (_, path) = tail_tree.open(i);
-            (tail_vals[i], path)
+    let w_tail = tail_tree.width();
+    let tail: Vec<(Vec<Gf128>, Vec<[u8; DIGEST]>)> = (0..tail_vals.len() / w_tail)
+        .map(|g| {
+            let (_, path) = tail_tree.open(g * w_tail);
+            (tail_vals[g * w_tail..g * w_tail + w_tail].to_vec(), path)
         })
         .collect();
 
@@ -273,15 +351,20 @@ fn build_path_query(trees: &[MerkleTree], values: &[Vec<Gf128>], pos: usize) -> 
         let a_idx = idx & !1usize;
         let b_idx = idx | 1usize;
         let next_idx = idx >> 1;
+        // a and b are adjacent — one leaf group covers both.
+        let w_i = trees[i].width();
+        let g = a_idx / w_i;
         let (_, a_path) = trees[i].open(a_idx);
-        let (_, b_path) = trees[i].open(b_idx);
         let (_, c_path) = trees[i + 1].open(next_idx);
+        let w_next = trees[i + 1].width();
+        let g_next = next_idx / w_next;
         levels.push(LevelOpen {
             a: values[i][a_idx],
             b: values[i][b_idx],
+            a_vals: values[i][g * w_i..g * w_i + w_i].to_vec(),
             a_path,
-            b_path,
             c: values[i + 1][next_idx],
+            c_vals: values[i + 1][g_next * w_next..g_next * w_next + w_next].to_vec(),
             c_path,
         });
         idx = next_idx;
@@ -347,24 +430,56 @@ pub fn verify_eval(
             } else {
                 proof.level_roots[i - 1]
             };
-            let leaf = MerkleTree::leaf_digest_of(&dom_i, leaves_at(i) as usize, a_idx, lvl.a);
-            let ra = MerkleTree::verify(&dom_i, leaves_at(i) as usize, a_idx, leaf, &lvl.a_path)
-                .map_err(|_| "query path a invalid")?;
+            let w_i = level_width(n, params.k, i);
+            if lvl.a_vals.len() != w_i {
+                return Err("leaf group width mismatch (a)");
+            }
+            // The a/b pair group: one digest + one path covers both values.
+            let leaf = MerkleTree::leaf_digest_of_batched(
+                &dom_i,
+                leaves_at(i) as usize,
+                w_i,
+                a_idx,
+                &lvl.a_vals,
+            );
+            let ra = MerkleTree::verify_batched(
+                &dom_i,
+                leaves_at(i) as usize,
+                w_i,
+                a_idx,
+                leaf,
+                &lvl.a_path,
+            )
+            .map_err(|_| "query path a invalid")?;
             if ra != expected_root {
                 return Err("query root a mismatch");
             }
-            let leaf = MerkleTree::leaf_digest_of(&dom_i, leaves_at(i) as usize, b_idx, lvl.b);
-            let rb = MerkleTree::verify(&dom_i, leaves_at(i) as usize, b_idx, leaf, &lvl.b_path)
-                .map_err(|_| "query path b invalid")?;
-            if rb != expected_root {
-                return Err("query root b mismatch");
+            if lvl.a_vals[a_idx % w_i] != lvl.a {
+                return Err("leaf group does not contain a");
+            }
+            if b_idx / w_i != a_idx / w_i {
+                // cannot happen for adjacent (even, odd) pairs; still checked.
+                return Err("pair straddles leaf groups");
+            }
+            if lvl.a_vals[b_idx % w_i] != lvl.b {
+                return Err("leaf group does not contain b");
             }
             let dom_next = level_domain(&stmt.domain, i + 1);
-            let leaf =
-                MerkleTree::leaf_digest_of(&dom_next, leaves_at(i + 1) as usize, next_idx, lvl.c);
-            let rc = MerkleTree::verify(
+            let w_next = level_width(n, params.k, i + 1);
+            if lvl.c_vals.len() != w_next {
+                return Err("leaf group width mismatch (c)");
+            }
+            let leaf = MerkleTree::leaf_digest_of_batched(
                 &dom_next,
                 leaves_at(i + 1) as usize,
+                w_next,
+                next_idx,
+                &lvl.c_vals,
+            );
+            let rc = MerkleTree::verify_batched(
+                &dom_next,
+                leaves_at(i + 1) as usize,
+                w_next,
                 next_idx,
                 leaf,
                 &lvl.c_path,
@@ -372,6 +487,9 @@ pub fn verify_eval(
             .map_err(|_| "query path c invalid")?;
             if rc != proof.level_roots[i] {
                 return Err("query root c mismatch");
+            }
+            if lvl.c_vals[next_idx % w_next] != lvl.c {
+                return Err("leaf group does not contain c");
             }
             // Fold relation: (1+r)·a + r·b = c.
             let folded = lvl.a + mul(challenges[i], lvl.a + lvl.b);
@@ -382,24 +500,45 @@ pub fn verify_eval(
         }
     }
     // ---- 4. Tail.
-    if proof.tail.len() != (1usize << params.k) {
-        return Err("tail length mismatch");
-    }
     let tail_dom = level_domain(&stmt.domain, n);
+    let w_tail = level_width(n, params.k, n);
+    let n_tail_groups = (1usize << params.k) / w_tail;
+    if n_tail_groups == 0 || !(1usize << params.k).is_multiple_of(w_tail) {
+        return Err("bad tail geometry");
+    }
     let tail_expected_root = if n == 0 {
         stmt.root
     } else {
         proof.level_roots[n - 1]
     };
-    for (i, (val, path)) in proof.tail.iter().enumerate() {
-        let leaf = MerkleTree::leaf_digest_of(&tail_dom, 1usize << params.k, i, *val);
-        let root = MerkleTree::verify(&tail_dom, 1usize << params.k, i, leaf, path)
-            .map_err(|_| "tail path invalid")?;
+    if proof.tail.len() != n_tail_groups {
+        return Err("tail length mismatch");
+    }
+    for (g, (vals, path)) in proof.tail.iter().enumerate() {
+        if vals.len() != w_tail {
+            return Err("tail group width mismatch");
+        }
+        let leaf = MerkleTree::leaf_digest_of_batched(
+            &tail_dom,
+            1usize << params.k,
+            w_tail,
+            g * w_tail,
+            vals,
+        );
+        let root = MerkleTree::verify_batched(
+            &tail_dom,
+            1usize << params.k,
+            w_tail,
+            g * w_tail,
+            leaf,
+            path,
+        )
+        .map_err(|_| "tail path invalid")?;
         if root != tail_expected_root {
             return Err("tail root mismatch");
         }
     }
-    if proof.tail[0].0 != proof.terminal_claim {
+    if proof.tail[0].0[0] != proof.terminal_claim {
         return Err("tail terminal entry mismatch");
     }
     Ok(())
@@ -471,7 +610,7 @@ mod tests {
 
         // Tampered tail entry.
         let mut p = proof.clone();
-        p.tail[1].0 += Gf128(1);
+        p.tail[1].0[0] += Gf128(1);
         let mut tv = base();
         assert!(verify_eval(&stmt, &params, &r, y, &p, &mut tv).is_err());
 

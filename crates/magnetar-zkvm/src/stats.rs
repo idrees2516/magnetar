@@ -256,11 +256,16 @@ fn ring_fields(r: &magnetar_pcs::ring::RingProof) -> usize {
     let mut n = r.partials.len() + r.level_roots.len() * (32 / 16) + 1;
     for q in &r.queries {
         for lv in &q.levels {
-            n += 2 + (lv.a_path.len() + lv.b_path.len()) * (32 / 16);
+            // the batched group format: a/b/c scalars + the two group
+            // reveals + the two paths.
+            n += 3
+                + lv.a_vals.len()
+                + lv.c_vals.len()
+                + (lv.a_path.len() + lv.c_path.len()) * (32 / 16);
         }
     }
-    for (_v, path) in &r.tail {
-        n += 1 + path.len() * (32 / 16);
+    for (vals, path) in &r.tail {
+        n += vals.len() + path.len() * (32 / 16);
     }
     n
 }

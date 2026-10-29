@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.11.2 — the remaining-parts release: the batched-leaf PCS + the ERC-20 real-time benchmark
+
+Measured on the AVX-512 host (2 vCPU, single-threaded, before → after):
+- **Algorithm 5 (Table 5)**: 2^20: 3.75→2.51 s (418K gates/s = **108%
+  of the paper's 386K per-core**), 2^22: 15.6→10.6 s (396K = 103%);
+  peak RSS at 2^22 down 15% (1.89→1.60 GiB); setup (pack+commit)
+  1.47→0.61 s at 2^20.
+- **The openings' anatomy**: the public group's PCS fold+trees
+  1,175→331 ms, the PCS sum-check 271→152 ms, the grouped Fact-1
+  66→49 ms (`dot_vv`).
+- **The expansion phase (steps 15–16)**: 183→55 ms (the AVX-512 tile
+  transpose + one popcount walk over the hoisted row words).
+- **The ERC-20 state-transition core**: NEW — `mikros-bench erc20`,
+  2816 rows/transfer, 142–152 transfers/s single-core at every size
+  2^16..2^22, ~7.5K cycles/gate, ~21.5M cycles/transfer at 3.20 GHz
+  (TSC-bound). **A full 600-transfer Ethereum block's state-transition
+  core proves in 4.0 s — real time against the 12 s slot, 3.0×
+  headroom.** The extended stacks (keccak storage proofs, ECDSA, full
+  EVM) are quantified honestly in docs/BENCHMARKS.md — not real-time
+  on one core, with the levers named.
+
+### The batched-leaf PCS trees (magnetar-hash + magnetar-pcs)
+One BLAKE3 call now covers 8 codeword values (`width 8` once a fold
+level is ≥ 16 wide, pairs below that — the tail included, never
+width-1: an even `a_idx` always shares its group with the odd `b_idx`,
+so ONE group reveal + ONE path covers the fold pair). The
+fold-chain's Merkle work drops ~4× (the leaf stream amortizes the
+per-call fixed cost over 8 values); `MerkleTree` gained
+`build_batched`/`verify_batched`/`leaf_digest_of_batched` with a fresh
+`magnetar/leafN/v1` domain. The correlated queries reveal the a/b
+group + the c group (slightly SMALLER proofs than the old separate
+a/b paths). The ring and the zkVM wrap (the deep consistency opens)
+moved to the same group format; eval, ring, and ivc/zkvm all derive
+the width from the level length deterministically.
+
+### The single-message sum-check (magnetar-pcs eval.rs)
+`prove_eval`'s round loop called `prover.message()` and then
+`absorb_and_fold` — which computed the message a SECOND time. One
+message per round now (absorb in the identical byte format, fold via
+`fold_msg`): the public group's sum-check 271→152 ms.
+
+### The VPCLMULQDQ-laned Möbius shift (magnetar-pcs code.rs)
+`shift_monomials`' pair loop is the strided-axpy shape — now
+`avx::axpy_run` per block (bit-identical to the scalar fold): the
+codeword encode 127→~50 ms at the 2^20 public-group geometry.
+
+### The AVX-512 tile transpose (magnetar-mikros r1cs.rs)
+`transpose_ps` called the recursive scalar `planes::flip64` reference;
+it now calls the AVX-512 block-swap `simd::flip64_v`. The expansion
+phase's 69 per-plane transposes: 211→6 ms; the setup's pack+commit
+path got the same win for free (742→611 ms → with the encode kernel
+0.61 s).
+
+### The expansion rewrite (magnetar-mikros plonk.rs)
+Steps 15–16 walked `packed_row_word` per row per claim (78 passes ×
+m rows × 128 bit tests). Now: one transpose per plane (hoisted),
+one popcount walk per claim over the row words, and `dot_vv` for the
+value dots. A masked-gather AVX-512 kernel was tried for the operand
+build and LOST to the scalar popcount walk (219 vs 49 ms per 71
+claims) — the walk stays; the lesson is recorded in the code.
+
+### dot_vv (magnetar-field avx.rs)
+The vectorized inner product (one XOR-accumulating pass through the
+measured backend, horizontal-reduced 512→256→128) — Fact-1's dots,
+the cubic sum-checks' terminals, and the expansion's value dots now
+run on it (bit-identical; unit-gated against the scalar fold).
+
 ## 0.11.1 — the copy-layer kernel release: the AVX-512 probe fix + the flat tree + the streaming η pipeline
 
 Measured (single thread, the default dispatch):

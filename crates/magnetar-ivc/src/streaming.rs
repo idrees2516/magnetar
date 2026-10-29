@@ -415,7 +415,13 @@ pub fn prove_ivc_streaming(
         let cw = magnetar_pcs::code::Codeword::encode(&code_params, &packed);
         drop(_pt_enc);
         let _pt_mkl = magnetar_zkvm::PhaseTimer::new("root-merkle");
-        let tr = MerkleTree::build(&format!("{}/level/0", pcs.domain), &cw.values);
+        // the batched-leaf tree (the same fold-width rule as
+        // commit_table — the verifier's correlated queries derive it)
+        let tr = MerkleTree::build_batched(
+            &format!("{}/level/0", pcs.domain),
+            &cw.values,
+            magnetar_pcs::eval::fold_tree_width(cw.values.len()),
+        );
         drop(_pt_mkl);
         let root = tr.root();
         (Some(cw), Some(tr), root)

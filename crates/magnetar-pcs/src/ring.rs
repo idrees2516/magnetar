@@ -43,7 +43,7 @@
 //! the fold chain carry the packed claim `P̂(r̃)` with the standard
 //! FRI-style proximity analysis of the main PCS (crate docs).
 
-use crate::eval::{level_domain, LevelOpen, PathQuery, PcsParams, PcsStatement};
+use crate::eval::{level_domain, PcsParams, PcsStatement};
 use magnetar_field::{eq_coefficients, mul, EqBits, Gf128, PhiTab, ONE, ZERO};
 use magnetar_hash::{MerkleTree, Transcript, DIGEST};
 use magnetar_sumcheck::{
@@ -68,8 +68,8 @@ pub struct RingProof {
     pub terminal_claim: Gf128,
     /// Correlated path queries on the main codeword's chain.
     pub queries: Vec<PathQuery>,
-    /// The tail `D_n` (`2^k` values) with paths.
-    pub tail: Vec<(Gf128, Vec<[u8; DIGEST]>)>,
+    /// The tail `D_n` in per-group reveals (`w_tail` values each) with paths.
+    pub tail: Vec<(Vec<Gf128>, Vec<[u8; DIGEST]>)>,
 }
 
 /// The transparent row-batched eq-indicator
@@ -266,9 +266,10 @@ pub fn prove_ring_switch(
     values.push(cw.values.clone());
     for (i, &rc) in challenges.iter().enumerate() {
         cw = cw.fold(0, rc);
-        trees.push(MerkleTree::build(
+        trees.push(MerkleTree::build_batched(
             &level_domain(&params.domain, i + 1),
             &cw.values,
+            crate::eval::fold_tree_width(cw.values.len()),
         ));
         values.push(cw.values.clone());
     }
@@ -286,10 +287,11 @@ pub fn prove_ring_switch(
     // Tail.
     let tail_tree = trees.last().expect("n >= 1 for a real witness");
     let tail_vals = values.last().unwrap();
-    let tail: Vec<(Gf128, Vec<[u8; DIGEST]>)> = (0..tail_tree.n_leaves())
-        .map(|i| {
-            let (_, path) = tail_tree.open(i);
-            (tail_vals[i], path)
+    let w_tail = tail_tree.width();
+    let tail: Vec<(Vec<Gf128>, Vec<[u8; DIGEST]>)> = (0..tail_vals.len() / w_tail)
+        .map(|g| {
+            let (_, path) = tail_tree.open(g * w_tail);
+            (tail_vals[g * w_tail..g * w_tail + w_tail].to_vec(), path)
         })
         .collect();
     RingProof {
@@ -300,6 +302,31 @@ pub fn prove_ring_switch(
         queries,
         tail,
     }
+}
+
+/// One level's openings along a correlated query path — the batched
+/// group format: `a`/`b` are adjacent, one leaf group covers both; `c`'s
+/// group at the next level is revealed alongside (eval.rs's shape).
+#[derive(Clone, Debug)]
+pub struct LevelOpen {
+    /// Pair value at the fold bit = 0.
+    pub a: Gf128,
+    /// Pair value at the fold bit = 1.
+    pub b: Gf128,
+    /// Image value in the next level.
+    pub c: Gf128,
+    /// The leaf group covering `a`/`b` at this level.
+    pub a_vals: Vec<Gf128>,
+    /// The leaf group covering `c` at the next level.
+    pub c_vals: Vec<Gf128>,
+    pub a_path: Vec<[u8; DIGEST]>,
+    pub c_path: Vec<[u8; DIGEST]>,
+}
+
+/// A full correlated walk: level 0 → n (the ring's own per-value shape).
+#[derive(Clone, Debug)]
+pub struct PathQuery {
+    pub levels: Vec<LevelOpen>,
 }
 
 fn build_query(
@@ -315,23 +342,27 @@ fn build_query(
         let a_idx = idx & !1usize;
         let b_idx = idx | 1usize;
         let next_idx = idx >> 1;
-        let (a_path, b_path, c_path) = if i == 0 {
-            let (_, ap) = main_tree.open(a_idx);
-            let (_, bp) = main_tree.open(b_idx);
-            let (_, cp) = trees[0].open(next_idx);
-            (ap, bp, cp)
+        // Level i's tree: the main commitment's for i = 0, the fold
+        // chain's own (level i) for i ≥ 1; `values[i]` holds its codeword.
+        // c at level i+1 is always the chain's trees[i] (levels 1..=n).
+        let (tree_i, w_i) = if i == 0 {
+            (main_tree, main_tree.width())
         } else {
-            let (_, ap) = trees[i - 1].open(a_idx);
-            let (_, bp) = trees[i - 1].open(b_idx);
-            let (_, cp) = trees[i].open(next_idx);
-            (ap, bp, cp)
+            (&trees[i - 1], trees[i - 1].width())
         };
+        let tree_next = &trees[i];
+        let w_next = tree_next.width();
+        let g = a_idx / w_i;
+        let g_next = next_idx / w_next;
+        let (_, a_path) = tree_i.open(a_idx);
+        let (_, c_path) = tree_next.open(next_idx);
         levels.push(LevelOpen {
             a: values[i][a_idx],
             b: values[i][b_idx],
+            a_vals: values[i][g * w_i..g * w_i + w_i].to_vec(),
             a_path,
-            b_path,
             c: values[i + 1][next_idx],
+            c_vals: values[i + 1][g_next * w_next..g_next * w_next + w_next].to_vec(),
             c_path,
         });
         idx = next_idx;
@@ -421,24 +452,55 @@ pub fn verify_ring_switch(
             } else {
                 proof.level_roots[i - 1]
             };
-            let leaf = MerkleTree::leaf_digest_of(&dom_i, leaves_at(i) as usize, a_idx, lvl.a);
-            let ra = MerkleTree::verify(&dom_i, leaves_at(i) as usize, a_idx, leaf, &lvl.a_path)
-                .map_err(|_| "ring: query path a invalid")?;
+            let w_i = crate::eval::fold_tree_width(leaves_at(i) as usize);
+            if lvl.a_vals.len() != w_i {
+                return Err("ring: leaf group width mismatch (a)");
+            }
+            // The a/b pair group: one digest + one path covers both values.
+            let leaf = MerkleTree::leaf_digest_of_batched(
+                &dom_i,
+                leaves_at(i) as usize,
+                w_i,
+                a_idx,
+                &lvl.a_vals,
+            );
+            let ra = MerkleTree::verify_batched(
+                &dom_i,
+                leaves_at(i) as usize,
+                w_i,
+                a_idx,
+                leaf,
+                &lvl.a_path,
+            )
+            .map_err(|_| "ring: query path a invalid")?;
             if ra != expected_root {
                 return Err("ring: query root a mismatch");
             }
-            let leaf = MerkleTree::leaf_digest_of(&dom_i, leaves_at(i) as usize, b_idx, lvl.b);
-            let rb_ = MerkleTree::verify(&dom_i, leaves_at(i) as usize, b_idx, leaf, &lvl.b_path)
-                .map_err(|_| "ring: query path b invalid")?;
-            if rb_ != expected_root {
-                return Err("ring: query root b mismatch");
+            if lvl.a_vals[a_idx % w_i] != lvl.a {
+                return Err("ring: leaf group does not contain a");
+            }
+            if b_idx / w_i != a_idx / w_i {
+                return Err("ring: pair straddles leaf groups");
+            }
+            if lvl.a_vals[b_idx % w_i] != lvl.b {
+                return Err("ring: leaf group does not contain b");
             }
             let dom_next = level_domain(&main_stmt.domain, i + 1);
-            let leaf =
-                MerkleTree::leaf_digest_of(&dom_next, leaves_at(i + 1) as usize, next_idx, lvl.c);
-            let rc = MerkleTree::verify(
+            let w_next = crate::eval::fold_tree_width(leaves_at(i + 1) as usize);
+            if lvl.c_vals.len() != w_next {
+                return Err("ring: leaf group width mismatch (c)");
+            }
+            let leaf = MerkleTree::leaf_digest_of_batched(
                 &dom_next,
                 leaves_at(i + 1) as usize,
+                w_next,
+                next_idx,
+                &lvl.c_vals,
+            );
+            let rc = MerkleTree::verify_batched(
+                &dom_next,
+                leaves_at(i + 1) as usize,
+                w_next,
                 next_idx,
                 leaf,
                 &lvl.c_path,
@@ -446,6 +508,9 @@ pub fn verify_ring_switch(
             .map_err(|_| "ring: query path c invalid")?;
             if rc != proof.level_roots[i] {
                 return Err("ring: query root c mismatch");
+            }
+            if lvl.c_vals[next_idx % w_next] != lvl.c {
+                return Err("ring: leaf group does not contain c");
             }
             // Fold relation: (1+r)·a + r·b = c.
             let folded = lvl.a + mul(challenges[i], lvl.a + lvl.b);
@@ -456,19 +521,37 @@ pub fn verify_ring_switch(
         }
     }
     // ---- 6. Tail.
-    if proof.tail.len() != (1usize << params.k) {
+    let w_tail = crate::eval::fold_tree_width(1usize << params.k);
+    let n_tail_groups = (1usize << params.k) / w_tail;
+    if n_tail_groups == 0 || proof.tail.len() != n_tail_groups {
         return Err("ring: tail length mismatch");
     }
     let tail_dom = level_domain(&main_stmt.domain, n);
-    for (i, (val, path)) in proof.tail.iter().enumerate() {
-        let leaf = MerkleTree::leaf_digest_of(&tail_dom, 1usize << params.k, i, *val);
-        let root = MerkleTree::verify(&tail_dom, 1usize << params.k, i, leaf, path)
-            .map_err(|_| "ring: tail path invalid")?;
+    for (g, (vals, path)) in proof.tail.iter().enumerate() {
+        if vals.len() != w_tail {
+            return Err("ring: tail group width mismatch");
+        }
+        let leaf = MerkleTree::leaf_digest_of_batched(
+            &tail_dom,
+            1usize << params.k,
+            w_tail,
+            g * w_tail,
+            vals,
+        );
+        let root = MerkleTree::verify_batched(
+            &tail_dom,
+            1usize << params.k,
+            w_tail,
+            g * w_tail,
+            leaf,
+            path,
+        )
+        .map_err(|_| "ring: tail path invalid")?;
         if root != proof.level_roots[n - 1] {
             return Err("ring: tail root mismatch");
         }
     }
-    if proof.tail[0].0 != proof.terminal_claim {
+    if proof.tail[0].0[0] != proof.terminal_claim {
         return Err("ring: tail terminal entry mismatch");
     }
     Ok(())
@@ -558,7 +641,7 @@ mod tests {
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
         // Tampered tail entry.
         let mut p = proof.clone();
-        p.tail[1].0 += Gf128(1);
+        p.tail[1].0[0] += Gf128(1);
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
     }

@@ -388,13 +388,16 @@ fn pcs_size(p: &PcsProof) -> usize {
     total += 16; // terminal_claim
     for q in &p.queries {
         for lvl in &q.levels {
-            total += 16 * 3 + (lvl.a_path.len() + 32).max(lvl.b_path.len() + 32) * 32;
+            // a/b/c scalars + the two leaf-group reveals + the two paths.
+            total += 16 * 3
+                + (lvl.a_vals.len() + lvl.c_vals.len()) * 16
+                + (lvl.a_path.len() + lvl.c_path.len()) * 32;
         }
     }
     total += p
         .tail
         .iter()
-        .map(|(_, path)| 16 + path.len() * 32)
+        .map(|(vals, path)| vals.len() * 16 + path.len() * 32)
         .sum::<usize>();
     total
 }
@@ -545,6 +548,14 @@ fn main() {
             let seed = opts.get("--seed").map(|v| v.parse().unwrap()).unwrap_or(42);
             bench_plonk(log2_n, seed);
         }
+        "erc20" => {
+            let log2_n = opts
+                .get("--log2-n")
+                .map(|v| v.parse().unwrap())
+                .unwrap_or(16);
+            let seed = opts.get("--seed").map(|v| v.parse().unwrap()).unwrap_or(42);
+            bench_erc20(log2_n, seed);
+        }
         other => {
             eprintln!(
                 "unknown command {other:?}; usage: mikros-bench hadamard --log2-n 30 | hashes --batch 256 | perm --log2-n 20"
@@ -652,4 +663,171 @@ fn bench_plonk(log2_n: usize, seed: u64) {
         "paper ref:   Table 5 (N = 2^25, Xeon Gold 6342): 86.56 s prover / 24.43 ms verifier / 1,169 KiB — Mikros excl. perm. 6.72 s (1.51× vs Flock)"
     );
     assert!(ok, "the proof must verify");
+}
+
+// ---------------------------------------------------------------------------
+// The ERC-20 transfer benchmark (Algorithm 5 on the state-transition core)
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+fn rdtsc() -> u64 {
+    #[allow(unsafe_code)]
+    // SAFETY: _rdtsc is side-effect-free on x86-64 (invariant TSC on every
+    // Xeon since Nehalem; the calibration below re-derives the rate).
+    unsafe {
+        std::arch::x86_64::_rdtsc()
+    }
+}
+#[cfg(not(target_arch = "x86_64"))]
+fn rdtsc() -> u64 {
+    0
+}
+
+/// Calibrate the TSC rate against the wall clock (a 200 ms spin).
+fn tsc_hz() -> f64 {
+    let warm = rdtsc();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let _ = warm;
+    let t0 = Instant::now();
+    let c0 = rdtsc();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let c1 = rdtsc();
+    let t1 = Instant::now();
+    let secs = t1.duration_since(t0).as_secs_f64().max(1e-9);
+    ((c1.saturating_sub(c0)) as f64 / secs).max(1.0)
+}
+
+fn bench_erc20(log2_n: usize, seed: u64) {
+    use magnetar_mikros::plonk::{
+        erc20_circuit, setup_plonk, verify_plonk, ERC20_ROWS_PER_TRANSFER,
+    };
+    assert!(log2_n >= 14, "Theorem 1: N ≥ κ² = 2^14");
+    assert!(log2_n <= 22, "the container-bounded ladder tops at 2^22");
+    let n = 1usize << log2_n;
+    let transfers = (n / ERC20_ROWS_PER_TRANSFER).max(1);
+    println!(
+        "== Mikros Algorithm 5: ERC-20 transfer batch, N = 2^{log2_n} ({transfers} transfers, {} rows/transfer + 257 io bits) ==",
+        ERC20_ROWS_PER_TRANSFER
+    );
+    let t0 = Instant::now();
+    let (circuit, witness, placed) = erc20_circuit(transfers, n, seed);
+    println!(
+        "circuit built in {:.0} ms ({} gates, {} placed transfers, n_io = {}, L = {})",
+        t0.elapsed().as_secs_f64() * 1e3,
+        circuit.n,
+        placed,
+        circuit.n_io,
+        circuit.l_len()
+    );
+    assert!(circuit.gates_hold(
+        &witness.w[0..circuit.n],
+        &witness.w[circuit.n..2 * circuit.n],
+        &witness.w[2 * circuit.n..3 * circuit.n]
+    ));
+    assert!(circuit.copies_hold(&witness.w));
+    let d_l = circuit.d_l();
+    let io: Vec<bool> = witness.w[3 * circuit.n..3 * circuit.n + circuit.n_io].to_vec();
+
+    let t1 = Instant::now();
+    let params = PcsParams::default();
+    let setup = setup_plonk(&circuit, &witness, params);
+    println!(
+        "setup (pack + commit) in {:.0} ms: d_L = {d_l}",
+        t1.elapsed().as_secs_f64() * 1e3
+    );
+
+    let hz = tsc_hz();
+    let mut t = Transcript::new("mikros-plonk-bench", &[]);
+    let c0 = rdtsc();
+    let (proof, stats) = magnetar_mikros::plonk::prove_plonk(&circuit, &witness, &setup, &mut t);
+    let c1 = rdtsc();
+    let prove_secs = stats.total_ms / 1e3;
+    let gps = circuit.n as f64 / (stats.total_ms / 1000.0);
+    let cycles = c1.saturating_sub(c0);
+    let mut tv = Transcript::new("mikros-plonk-bench", &[]);
+    let v0 = Instant::now();
+    let ok = verify_plonk(&circuit, &setup, &io, &proof, &mut tv).is_ok();
+    let v_ms = v0.elapsed().as_secs_f64() * 1e3;
+    // the proof size (the plonk table's accounting)
+    let mut proof_bytes = 0usize;
+    proof_bytes += proof.c_claims.len() * 16;
+    for hp in proof
+        .gate_proofs
+        .iter()
+        .chain(std::iter::once(&proof.nested))
+    {
+        proof_bytes += hp.d.len() * 16 + hp.h.len() * 16;
+        proof_bytes += hp.fact1.rounds.len() * 3 * 16 + 2 * 16;
+    }
+    for unfold in proof.copy.unfolds.iter() {
+        for cub in unfold.e_tree.iter() {
+            proof_bytes += cub.rounds.len() * 4 * 16 + 2 * 16;
+        }
+        for ft in unfold.f_trans.iter() {
+            proof_bytes += ft.u.len() * 16 + ft.h.len() * 16;
+            proof_bytes += ft.cubic.rounds.len() * 4 * 16 + 2 * 16;
+        }
+    }
+    proof_bytes += proof.wire_values.len() * 3 * 16;
+    proof_bytes += proof.digit_values.len() * 3 * 16;
+    for g in [&proof.wit_open, &proof.pub_open] {
+        proof_bytes += g.v_msgs.len() * 128 * 16;
+        proof_bytes += g.fact1.rounds.len() * 3 * 16 + 2 * 16;
+        proof_bytes += 4096; // the FastChunk operating point (cf. Table 4)
+    }
+
+    println!(
+        "prover:      {:.1} ms total (gate {:.0} | hadamard {:.0} | copy {:.0} | open {:.0})",
+        stats.total_ms, stats.gate_ms, stats.hadamard_ms, stats.copy_ms, stats.open_ms
+    );
+    println!(
+        "  gates/s:   {gps:.0} over N = {} (single thread); {:.3} ms/transfer",
+        circuit.n,
+        stats.total_ms / transfers as f64
+    );
+    let tps = transfers as f64 / prove_secs;
+    println!("  transfers/s (prover):   {tps:.1}");
+    println!(
+        "  TSC:      {cycles} cycles ({:.2} GHz calibrated) → {:.0} cycles/s during prove | {:.1} cycles/gate | {:.0} cycles/transfer",
+        hz / 1e9,
+        if prove_secs > 0.0 { cycles as f64 / prove_secs } else { 0.0 },
+        cycles as f64 / circuit.n as f64,
+        cycles as f64 / transfers as f64
+    );
+    println!(
+        "verifier:    {:.1} ms (accepted: {ok}); proof size: {} (approx., FastChunk PCS share)",
+        v_ms,
+        fmt_bytes(proof_bytes as u64)
+    );
+    println!(
+        "peak RSS:    {:.0} MiB",
+        peak_rss_bytes() as f64 / (1 << 20) as f64
+    );
+    // ---- the Ethereum real-time verdict (the 12 s slot budget)
+    println!("---- Ethereum real-time analysis (single core, measured rate) ----");
+    // mainnet planning figures: ~30M gas target per 12 s slot; a standard
+    // ERC-20 transfer ≈ 50K gas (warm ~24K, fresh ~51K) → ~600 transfers/block
+    const SLOT_SECS: f64 = 12.0;
+    const GAS_LIMIT: f64 = 30.0e6;
+    const GAS_PER_TRANSFER: f64 = 50.0e3;
+    let block_tx = (GAS_LIMIT / GAS_PER_TRANSFER) as usize; // 600
+    let block_gates = block_tx * ERC20_ROWS_PER_TRANSFER; // the state-transition core
+    let block_secs = block_gates as f64 / gps;
+    println!(
+        "  full-block ERC-20 load: {block_tx} transfers ≈ {block_gates} gates (the state-transition core) → {block_secs:.2} s at {gps:.0} gates/s",
+    );
+    println!(
+        "  verdict:  {} — headroom {:.2}× vs the {SLOT_SECS:.0} s slot",
+        if block_secs <= SLOT_SECS {
+            "REAL-TIME"
+        } else {
+            "BEHIND"
+        },
+        SLOT_SECS / block_secs.max(1e-9)
+    );
+    // the extended stacks (the honest scope note): keccak storage proofs
+    // and ECDSA are not in this circuit — see docs/BENCHMARKS.md.
+    println!(
+        "  (state-transition core only: no keccak storage proofs, no ECDSA — the extended-stack analysis is in docs/BENCHMARKS.md)"
+    );
 }

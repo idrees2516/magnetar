@@ -187,16 +187,21 @@ fn values_to_monomials(values: &[Gf128], n: usize) -> Vec<Gf128> {
 /// Shift monomial coefficients by δ: `d_S = Σ_{S' ⊇ S} c_{S'} Π_{i∈S'∖S} δ_i`.
 fn shift_monomials(coeffs: &[Gf128], n: usize, delta: &[Gf128]) -> Vec<Gf128> {
     let mut d = coeffs.to_vec();
-    // Downward pass over variables: for each i, for each S containing i:
-    // d[S∖{i}] += δ_i · d[S].
+    // Downwards pass over variables: for each i, for each S containing i:
+    // d[S∖{i}] += δ_i · d[S]. The pair loop is the strided-axpy shape —
+    // the VPCLMULQDQ lane kernel (bit-identical to the scalar fold).
     for i in 0..n {
+        let r = delta[i];
         let block = 1usize << i;
         let mut s = 0usize;
         while s < d.len() {
-            for j in 0..block {
-                let with = s + j + block;
-                let without = s + j;
-                d[without] = d[without] + mul(delta[i], d[with]);
+            let (head, _tail) = d.split_at_mut(s + 2 * block);
+            let (pre, pair) = head.split_at_mut(s);
+            debug_assert_eq!(pre.len(), s);
+            let (lo, hi) = pair.split_at_mut(block);
+            let done = magnetar_field::avx::axpy_run(lo, hi, r, block);
+            for j in done..block {
+                lo[j] += mul(r, hi[j]);
             }
             s += 2 * block;
         }

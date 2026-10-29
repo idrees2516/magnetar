@@ -35,11 +35,8 @@ pub struct Fact1Proof {
 }
 
 fn dot(a: &[Gf128], b: &[Gf128]) -> Gf128 {
-    let mut acc = Gf128(0);
-    for i in 0..a.len() {
-        acc += mul(a[i], b[i]);
-    }
-    acc
+    // the VPCLMULQDQ-laned inner product (bit-identical to the scalar fold)
+    magnetar_field::avx::dot_vv(a, b, a.len())
 }
 
 /// Prove `v = 〈a, b〉` (the running claim must be supplied; the prover

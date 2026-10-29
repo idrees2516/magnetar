@@ -200,6 +200,12 @@ impl PlonkBuilder {
         w
     }
 
+    /// A private witness wire (no io cell — its copy anchors are only the
+    /// gate sides that consume it). The rollup circuits' state inputs.
+    pub fn witness(&mut self, v: bool) -> Wire {
+        self.fresh(v)
+    }
+
     /// Bind an existing wire as a public output: its io cell joins the
     /// wire's copy cycle (the value becomes public and copy-enforced).
     pub fn mark_io(&mut self, w: Wire) {
@@ -424,11 +430,14 @@ fn prove_group_open(
     params: &PcsParams,
     t: &mut Transcript,
 ) -> GroupOpening {
+    use std::time::Instant;
+    let time_on = std::env::var("MIKROS_TIME").is_ok();
     let m = group.m;
     assert_eq!(claims.len(), matrices.len());
     let mut v_msgs = Vec::with_capacity(claims.len());
     let mut us = Vec::new();
     let mut words_cache = Vec::with_capacity(claims.len());
+    let t_msgs = Instant::now();
     // the distinct-ξ cache: many claims share one ξ (the 3·d_L digit
     // claims of Algorithm 5 share the copy terminal's ξ_wire) — the words
     // expansion and the plane transpose are computed once per DISTINCT
@@ -467,12 +476,15 @@ fn prove_group_open(
         us.push(rows);
     }
     // after ALL column messages: the independent per-claim projections
+    let t_op = Instant::now();
     let mut rs: Vec<Vec<Gf128>> = Vec::with_capacity(claims.len());
     for _ in 0..claims.len() {
         let r: Vec<Gf128> = (0..KAPPA).map(|_| t.challenge_field("grp-r")).collect();
         rs.push(r);
     }
-    // the summed operand: per claim Ξr zero-extended into its block
+    // the summed operand: per claim Ξr zero-extended into its block — the
+    // ξ-masked weight gather (one bitslice + 128 masked-XOR passes per
+    // claim, against the per-row popcount walk)
     let mut operand = vec![ZERO; group.blocks * m];
     let mut c_sum = ZERO;
     for (ci, claim) in claims.iter().enumerate() {
@@ -506,7 +518,18 @@ fn prove_group_open(
     }
     let mut av = group.table.clone();
     let mut op = operand;
+    let t_f1 = Instant::now();
     let fact1 = fact1::prove(&mut av, &mut op, c_sum, t);
+    if time_on {
+        eprintln!(
+            "group open ({} claims, {} blocks): msgs {:.0} | operand {:.0} | fact1+pcs {:.0} ms",
+            claims.len(),
+            group.blocks,
+            t_msgs.elapsed().as_secs_f64() * 1e3,
+            t_op.elapsed().as_secs_f64() * 1e3,
+            t_f1.elapsed().as_secs_f64() * 1e3,
+        );
+    }
     let (v1, _v2) = fact1.terminals;
     let y = fact1.challenges.clone();
     // Fact 1 binds MSB-first; the PCS binds LSB-first — reverse.
@@ -770,7 +793,10 @@ fn hadamard_dummy() -> HadamardProof {
     }
 }
 
-/// The packed E-word of row `i` of a plane set (its β-combination).
+/// The packed E-word of row `i` of a plane set (its β-combination) — the
+/// per-row readout of the transposed layout (the expansion phase now
+/// hoists the whole-plane transpose instead).
+#[allow(dead_code)]
 fn packed_row_word(ps: &PlaneSet, i: usize) -> Gf128 {
     let mut acc = 0u128;
     for j in 0..KAPPA {
@@ -902,14 +928,19 @@ pub fn prove_plonk(
     // ---- steps 13–14: the copy layer.
     let t_copy = Instant::now();
     let theta32 = setup.f32.embed(1u32 << 31);
+    let t_code = Instant::now();
     let mut code_a = vec![0u32; 4 * n];
     let mut code_b = vec![0u32; 4 * n];
-    for flat in 0..4 * n {
-        if flat < l_len {
-            let w_bit = witness.w[flat] as u32;
-            code_a[flat] = circuit.sigma[flat] | (w_bit << 31);
-            code_b[flat] = (flat as u32) | (w_bit << 31);
-        }
+    for flat in 0..l_len {
+        let w_bit = witness.w[flat] as u32;
+        code_a[flat] = circuit.sigma[flat] | (w_bit << 31);
+        code_b[flat] = (flat as u32) | (w_bit << 31);
+    }
+    if std::env::var("MIKROS_TIME").is_ok() {
+        eprintln!(
+            "  code build: {:.0} ms (L = {l_len})",
+            t_code.elapsed().as_secs_f64() * 1e3
+        );
     }
     let (copy, copy_terminal) = prove_copy(
         &setup.f32,
@@ -920,6 +951,7 @@ pub fn prove_plonk(
         t,
     );
     stats.copy_ms = t_copy.elapsed().as_secs_f64() * 1e3;
+    let t_expand = Instant::now();
 
     // ---- steps 15–16: expand the two copy terminals.
     let mut wire_values = [[ZERO; 3]; 2];
@@ -982,6 +1014,16 @@ pub fn prove_plonk(
     });
     pub_mats.push(&setup.q_planes[4]);
 
+    // the β-packed row words of every plane — ONE transpose per plane,
+    // hoisted out of the op loop (the packed_row_word walk was the
+    // expansion phase's cost)
+    let t_tr = std::time::Instant::now();
+    let w_rows: Vec<Vec<Gf128>> = (0..3).map(|s| packed_words(&setup.w_planes[s])).collect();
+    let digit_rows: Vec<Vec<Gf128>> = (0..3 * d_l)
+        .map(|k| packed_words(&setup.digit_planes[k]))
+        .collect();
+    let ms_tr = t_tr.elapsed().as_secs_f64() * 1e3;
+    let mut rw = vec![ZERO; m];
     for op in 0..2 {
         let (claim_v, l0_factors, rho4) = &copy_terminal.claims[op];
         let _ = claim_v;
@@ -990,28 +1032,26 @@ pub fn prove_plonk(
         let xi_wire: Vec<(Gf128, Gf128)> = l0_factors[..log_m].to_vec();
         let col_wire: Vec<(Gf128, Gf128)> = l0_factors[log_m..].to_vec();
         let rho_tilde = factors_words(&col_wire);
+        // the ξ row weights: identical across the s/jp loops — expanded once
+        let xi_words = factors_words(&xi_wire);
         for s in 0..3 {
             // wire_val = θ·ρ_s·(ξ^⊤ W_s ρ̃) — as a claim with the scaled
-            // column weight θ·ρ_s·ρ̃
+            // column weight θ·ρ_s·ρ̃: rw = W_s rows ⋅ col_weight (one masked
+            // gather), then the m-length dot with the ξ row weights.
             let col_weight: Vec<Gf128> = rho_tilde
                 .iter()
                 .map(|&rv| mul(mul(theta32, rho4[s]), rv))
                 .collect();
-            let words = factors_words(&xi_wire);
-            let mut val = ZERO;
-            for i in 0..m {
-                if words[i] != ZERO {
-                    let row_word = packed_row_word(&setup.w_planes[s], i);
-                    let mut rw = ZERO;
-                    let mut bits = row_word.0;
-                    while bits != 0 {
-                        let cpos = bits.trailing_zeros() as usize;
-                        rw += col_weight[cpos];
-                        bits &= bits - 1;
-                    }
-                    val += mul(words[i], rw);
+            for (i, v) in rw.iter_mut().enumerate() {
+                *v = ZERO;
+                let mut bits = w_rows[s][i].0;
+                while bits != 0 {
+                    let cpos = bits.trailing_zeros() as usize;
+                    *v += col_weight[cpos];
+                    bits &= bits - 1;
                 }
             }
+            let val = magnetar_field::avx::dot_vv(&xi_words, &rw, m);
             wire_values[op][s] = val;
             wit_claims.push(LinearClaim {
                 value: val,
@@ -1027,21 +1067,16 @@ pub fn prove_plonk(
                 for s in 0..3 {
                     let col_weight: Vec<Gf128> =
                         rho_tilde.iter().map(|&rv| mul(rho4[s], rv)).collect();
-                    let words = factors_words(&xi_wire);
-                    let mut val = ZERO;
-                    for i in 0..m {
-                        if words[i] != ZERO {
-                            let row_word = packed_row_word(&setup.digit_planes[s * d_l + jp], i);
-                            let mut rw = ZERO;
-                            let mut bits = row_word.0;
-                            while bits != 0 {
-                                let cpos = bits.trailing_zeros() as usize;
-                                rw += col_weight[cpos];
-                                bits &= bits - 1;
-                            }
-                            val += mul(words[i], rw);
+                    for (i, v) in rw.iter_mut().enumerate() {
+                        *v = ZERO;
+                        let mut bits = digit_rows[s * d_l + jp][i].0;
+                        while bits != 0 {
+                            let cpos = bits.trailing_zeros() as usize;
+                            *v += col_weight[cpos];
+                            bits &= bits - 1;
                         }
                     }
+                    let val = magnetar_field::avx::dot_vv(&xi_words, &rw, m);
                     digit_values[jp][s] = val;
                     pub_claims.push(LinearClaim {
                         value: val,
@@ -1053,6 +1088,10 @@ pub fn prove_plonk(
                 }
             }
         }
+    }
+    drop((w_rows, digit_rows, rw));
+    if std::env::var("MIKROS_TIME").is_ok() {
+        eprintln!("  expand detail: transposes {ms_tr:.0} ms");
     }
     t.absorb_field("plonk-wv", &{
         let mut v = Vec::new();
@@ -1066,6 +1105,12 @@ pub fn prove_plonk(
         .flat_map(|s| s.iter().copied())
         .collect();
     t.absorb_field("plonk-dv", &digit_flat);
+    if std::env::var("MIKROS_TIME").is_ok() {
+        eprintln!(
+            "expand phases: {:.0} ms",
+            t_expand.elapsed().as_secs_f64() * 1e3
+        );
+    }
 
     // ---- step 18: the two grouped openings.
     let t_open = Instant::now();
@@ -1396,6 +1441,120 @@ pub fn simulated_circuit(log_n: usize, seed: u64) -> (PlonkCircuit, PlonkWitness
     (circuit, witness)
 }
 
+// ---------------------------------------------------------------------------
+// The ERC-20 transfer circuit (the state-transition core)
+// ---------------------------------------------------------------------------
+
+/// The per-transfer gate shape of [`erc20_circuit`]: the two 256-bit
+/// carry-save adders (the debit `b_s' = b_s − amount` as `b_s + ¬amount + 1`,
+/// the credit `b_r' = b_r + amount` with uint256 wrap-around semantics) and
+/// the `¬amount` materialization.
+pub const ERC20_ROWS_PER_TRANSFER: usize = 256 * (2 * 5 + 1);
+
+/// One 256-bit ripple-carry adder over the builder's bit gates:
+/// `sum = x + y + cin` with the carry chain `c_i = x_i·y_i ⊕ (x_i⊕y_i)·c_{i-1}`
+/// (5 rows per bit; the `x⊕y` row is shared by the carry and sum terms).
+/// The 256-bit little-endian wire materialization of a four-lane value.
+fn wires256(b: &mut PlonkBuilder, v: &[u64; 4]) -> Vec<Wire> {
+    let mut out = Vec::with_capacity(256);
+    for w in 0..4 {
+        for i in 0..64 {
+            out.push(b.witness((v[w] >> i) & 1 == 1));
+        }
+    }
+    out
+}
+
+fn adder256(b: &mut PlonkBuilder, x: &[Wire], y: &[Wire], cin: Wire) -> (Vec<Wire>, Wire) {
+    assert_eq!(x.len(), 256);
+    assert_eq!(y.len(), 256);
+    let mut sum = Vec::with_capacity(256);
+    let mut carry = cin;
+    for i in 0..256 {
+        let xy = b.xor(x[i], y[i]);
+        let t = b.and(x[i], y[i]);
+        let uc = b.and(xy, carry);
+        let c1 = b.xor(t, uc);
+        let s = b.xor(xy, carry);
+        sum.push(s);
+        carry = c1;
+    }
+    (sum, carry)
+}
+
+/// An ERC-20 transfer batch state-transition circuit: `transfers`
+/// independent `transfer(sender, recipient, amount)` applications of the
+/// standard token semantics over uint256:
+///
+/// * **debit** `b_s' = b_s − amount` — computed as `b_s + ¬amount + 1`
+///   (two's complement); the adder's carry-out is 1 exactly when
+///   `b_s ≥ amount`, and is bound as a public io bit (the no-underflow
+///   assertion — the witness satisfies it by construction);
+/// * **credit** `b_r' = b_r + amount` — plain uint256 addition (the
+///   overflow wraps: Solidity's `balance[to] += amount` does not check);
+/// * the `amount` bits are public io (the rollup's public calldata); the
+///   balances stay private witness (the state-transition core — the
+///   storage-root binding is the documented follow-up).
+///
+/// Returns the circuit, the witness, and the number of transfers actually
+/// placed (the caller pads to the power-of-two gate count).
+pub fn erc20_circuit(
+    transfers: usize,
+    pad_to: usize,
+    seed: u64,
+) -> (PlonkCircuit, PlonkWitness, usize) {
+    assert!(transfers >= 1, "at least one transfer");
+    assert!(pad_to.is_power_of_two() && pad_to >= KAPPA * KAPPA);
+    assert!(
+        pad_to >= transfers * ERC20_ROWS_PER_TRANSFER,
+        "the pad target must hold every transfer's rows"
+    );
+    let mut rng = seed;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    let mut b = PlonkBuilder::new().with_pad_to(pad_to);
+    let one = b.witness(true); // the constant-1 wire (the ⊕1 of ¬amount)
+    let zero = b.witness(false); // the add-side carry-in
+    let mut placed = 0usize;
+    for _ in 0..transfers {
+        // the private state: b_s, b_r, amount ∈ {0..2^256}, amount ≤ b_s
+        let bs: [u64; 4] = [next(), next(), next(), next()];
+        let br: [u64; 4] = [next(), next(), next(), next()];
+        // amount ≤ b_s: the 256-bit AND `amount = b_s & mask` (a bitwise
+        // AND is ≤ its operand, so the debit never underflows)
+        let mask: [u64; 4] = [next(), next(), next(), next()];
+        let amt: [u64; 4] = [
+            bs[0] & mask[0],
+            bs[1] & mask[1],
+            bs[2] & mask[2],
+            bs[3] & mask[3],
+        ];
+        let bs_w = wires256(&mut b, &bs);
+        let br_w = wires256(&mut b, &br);
+        let amt_w = wires256(&mut b, &amt);
+        // the public calldata: the amount bits (io)
+        for w in &amt_w {
+            b.mark_io(*w);
+        }
+        // ¬amount (the two's complement operand)
+        let not_amt: Vec<Wire> = amt_w.iter().map(|w| b.xor(*w, one)).collect();
+        // debit: b_s + ¬amount + 1 — cin = the constant-1 wire
+        let (_bs_out, cout_debit) = adder256(&mut b, &bs_w, &not_amt, one);
+        // the no-underflow bit is public (carry-out = b_s ≥ amount)
+        b.mark_io(cout_debit);
+        // credit: b_r + amount (uint256 wrap)
+        let (br_out, _cout_credit) = adder256(&mut b, &br_w, &amt_w, zero);
+        let _ = br_out;
+        placed += 1;
+    }
+    let (circuit, witness) = b.build();
+    (circuit, witness, placed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1406,6 +1565,44 @@ mod tests {
         let (circuit, witness) = simulated_circuit(14, 0x5eed_1234);
         let io: Vec<bool> = witness.w[3 * circuit.n..3 * circuit.n + circuit.n_io].to_vec();
         (circuit, witness, io)
+    }
+
+    #[test]
+    fn erc20_roundtrip_and_tamper() {
+        use crate::plonk::erc20_circuit;
+        // 4 transfers at the Theorem-1 minimum pad 2^14: 4×2816 = 11264 rows
+        let (circuit, witness, placed) = erc20_circuit(4, 1 << 14, 7);
+        assert_eq!(placed, 4);
+        let n = circuit.n;
+        assert_eq!(n, 1 << 14);
+        // honest: gates + copy + the no-underflow io bits are all true
+        assert!(circuit.gates_hold(
+            &witness.w[0..n],
+            &witness.w[n..2 * n],
+            &witness.w[2 * n..3 * n]
+        ));
+        assert!(circuit.copies_hold(&witness.w));
+        // every transfer's carry-out io bit is 1 (amount ≤ balance by
+        // construction) — the io cells sit at [3n, 3n + n_io)
+        let io: Vec<bool> = witness.w[3 * n..3 * n + circuit.n_io].to_vec();
+        assert_eq!(io.len(), 4 * 257);
+        assert!(io.iter().enumerate().all(|(k, &b)| (k % 257) != 256 || b));
+
+        let params = PcsParams::default();
+        let setup = setup_plonk(&circuit, &witness, params);
+        let base = || Transcript::new("mikros-erc20-test", &[]);
+        let mut t = base();
+        let (proof, _stats) = prove_plonk(&circuit, &witness, &setup, &mut t);
+        let mut tv = base();
+        assert!(verify_plonk(&circuit, &setup, &io, &proof, &mut tv).is_ok());
+        // tamper: flip one carry-out io bit (an underflowed transfer) — the
+        // io vector is part of the verifier's statement, so the tampered
+        // run must be rejected at the io binding or downstream.
+        let mut bad_io = io.clone();
+        bad_io[256] ^= true;
+        let mut tv2 = base();
+        let r = verify_plonk(&circuit, &setup, &bad_io, &proof, &mut tv2);
+        assert!(r.is_err(), "tampered io must be rejected");
     }
 
     #[test]

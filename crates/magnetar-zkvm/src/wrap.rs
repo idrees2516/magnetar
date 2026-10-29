@@ -54,13 +54,14 @@ pub const WRAP_CONSISTENCY_QUERIES: usize = 14;
 /// authenticated against the chunk tree and the deep tree.
 #[derive(Clone, Debug)]
 pub struct ConsistencyOpen {
-    /// The packed-leaf index (a codeword `(x, 0)` position).
+    /// The sampled packed position.
     pub index: usize,
-    /// The packed word.
     pub value: Gf128,
-    /// The chunk tree's sibling path.
+    /// The chunk tree's leaf group covering `index` (its width values).
+    pub chunk_vals: Vec<Gf128>,
+    /// The deep tree's leaf group covering `index` (its width values).
+    pub deep_vals: Vec<Gf128>,
     pub chunk_path: Vec<[u8; DIGEST]>,
-    /// The deep tree's sibling path.
     pub deep_path: Vec<[u8; DIGEST]>,
 }
 
@@ -84,6 +85,7 @@ pub struct WrapProof {
 pub fn prove_wrap(
     deep_params: &PcsParams,
     chunk_tree: &MerkleTree,
+    chunk_codeword: &magnetar_pcs::code::Codeword,
     chunk_domain: &str,
     packed: &[Gf128],
     r_block: &[Gf128],
@@ -113,11 +115,24 @@ pub fn prove_wrap(
     for i in 0..WRAP_CONSISTENCY_QUERIES {
         let pos = t.challenge_index(&format!("wrap-pos-{i}"), n_packed as u64) as usize;
         let value = packed[pos];
+        // the batched group reveals: the leaf group covering `pos` in each
+        // tree (the (x, 0) slice — the low codeword range — holds the
+        // packed table, so the groups come straight off the codewords).
+        let w_c = chunk_tree.width();
+        let g_c = pos / w_c;
+        let chunk_vals = chunk_codeword.values[g_c * w_c..g_c * w_c + w_c].to_vec();
+        debug_assert_eq!(chunk_vals[pos % w_c], value);
+        let w_d = tree.width();
+        let g_d = pos / w_d;
+        let deep_vals = codeword.values[g_d * w_d..g_d * w_d + w_d].to_vec();
+        debug_assert_eq!(deep_vals[pos % w_d], value);
         let (_, chunk_path) = chunk_tree.open(pos);
         let (_, deep_path) = tree.open(pos);
         consistency.push(ConsistencyOpen {
             index: pos,
             value,
+            chunk_vals,
+            deep_vals,
             chunk_path,
             deep_path,
         });
@@ -162,21 +177,52 @@ pub fn verify_wrap(
     let deep_dom = level_domain(&wrap.deep.domain, 0);
     let chunk_leaves = 1usize << (chunk_stmt.n + chunk_stmt.k);
     let deep_leaves = 1usize << (wrap.deep.n + wrap.deep.k);
+    let chunk_w = magnetar_pcs::eval::fold_tree_width(chunk_leaves);
+    let deep_w = magnetar_pcs::eval::fold_tree_width(deep_leaves);
     for (i, c) in wrap.consistency.iter().enumerate() {
         if c.index >= n_packed {
             return Err("wrap: position out of packed range");
         }
-        let ld = MerkleTree::leaf_digest_of(&chunk_dom, chunk_leaves, c.index, c.value);
-        let root = MerkleTree::verify(&chunk_dom, chunk_leaves, c.index, ld, &c.chunk_path)
-            .map_err(|_| "wrap: chunk opening rejected")?;
+        if c.chunk_vals.len() != chunk_w || c.deep_vals.len() != deep_w {
+            return Err("wrap: group width mismatch");
+        }
+        let ld = MerkleTree::leaf_digest_of_batched(
+            &chunk_dom,
+            chunk_leaves,
+            chunk_w,
+            c.index,
+            &c.chunk_vals,
+        );
+        let root = MerkleTree::verify_batched(
+            &chunk_dom,
+            chunk_leaves,
+            chunk_w,
+            c.index,
+            ld,
+            &c.chunk_path,
+        )
+        .map_err(|_| "wrap: chunk opening rejected")?;
         if root != chunk_stmt.root {
             return Err("wrap: chunk root mismatch");
         }
-        let ld2 = MerkleTree::leaf_digest_of(&deep_dom, deep_leaves, c.index, c.value);
-        let root2 = MerkleTree::verify(&deep_dom, deep_leaves, c.index, ld2, &c.deep_path)
-            .map_err(|_| "wrap: deep opening rejected")?;
+        if c.chunk_vals[c.index % chunk_w] != c.value {
+            return Err("wrap: chunk group does not contain the value");
+        }
+        let ld2 = MerkleTree::leaf_digest_of_batched(
+            &deep_dom,
+            deep_leaves,
+            deep_w,
+            c.index,
+            &c.deep_vals,
+        );
+        let root2 =
+            MerkleTree::verify_batched(&deep_dom, deep_leaves, deep_w, c.index, ld2, &c.deep_path)
+                .map_err(|_| "wrap: deep opening rejected")?;
         if root2 != wrap.deep.root {
             return Err("wrap: deep root mismatch");
+        }
+        if c.deep_vals[c.index % deep_w] != c.value {
+            return Err("wrap: deep group does not contain the value");
         }
         t.absorb_field(&format!("wrap-val-{i}"), &[c.value]);
     }

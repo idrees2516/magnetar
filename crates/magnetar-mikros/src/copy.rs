@@ -530,7 +530,6 @@ fn f_samples_copy(
     let level = &tree.levels[tau];
     let rows_total = tree.level_rows[tau];
     const BLK: usize = 2048;
-    let mut enc: Vec<u32> = vec![0; BLK];
     let mut ebuf: Vec<Gf128> = vec![ZERO; BLK];
     let mut gu: Vec<Gf128> = vec![ZERO; BLK];
     let mut gd: Vec<Gf128> = vec![ZERO; BLK];
@@ -558,9 +557,11 @@ fn f_samples_copy(
                 for half in 0..2 {
                     let dst = if half == 0 { &mut gu } else { &mut gd };
                     let base = CopyTree::idx(rows_total, d, b0 + half * rows_half, 0);
-                    // enc (the hoisted-lane dot4) + embed fused per row
+                    // enc (the hoisted-lane dot4) + embed FUSED: one pass
+                    // per row — the code lands directly in ebuf (the old
+                    // two-pass enc→embed route touched every row twice).
                     #[cfg(target_arch = "x86_64")]
-                    for (r, e) in enc[..blen].iter_mut().enumerate() {
+                    for r in 0..blen {
                         let c4 = &level[base + r * KPOS..][..KPOS];
                         let w = [psi[0], psi[1], psi[2], psi[3]];
                         let c = [c4[0], c4[1], c4[2], c4[3]];
@@ -581,15 +582,13 @@ fn f_samples_copy(
                         } else {
                             f.mul4(w, c)
                         };
-                        *e = (p[0] ^ p[1]) ^ (p[2] ^ p[3]);
+                        let code = (p[0] ^ p[1]) ^ (p[2] ^ p[3]);
+                        ebuf[r] = f.embed(code);
                     }
                     #[cfg(not(target_arch = "x86_64"))]
-                    for (r, e) in enc[..blen].iter_mut().enumerate() {
+                    for r in 0..blen {
                         let c4 = &level[base + r * KPOS..][..KPOS];
-                        *e = f.dot4(psi, [c4[0], c4[1], c4[2], c4[3]]);
-                    }
-                    for (r, &c) in enc[..blen].iter().enumerate() {
-                        ebuf[r] = f.embed(c);
+                        ebuf[r] = f.embed(f.dot4(psi, [c4[0], c4[1], c4[2], c4[3]]));
                     }
                     magnetar_field::avx::axpy_run(&mut dst[..blen], &ebuf[..blen], zd, blen);
                 }
@@ -673,6 +672,15 @@ pub fn prove_copy(
     m_pos: usize,
     t: &mut Transcript,
 ) -> (CopyProof, CopyTerminal) {
+    use std::time::Instant;
+    let time_on = std::env::var("MIKROS_TIME").is_ok();
+    let mut ph_tree = 0.0f64;
+    let mut ph_flat = 0.0f64;
+    let mut ph_evecs = 0.0f64;
+    let mut ph_eunfold = 0.0f64;
+    let mut ph_u = 0.0f64;
+    let mut ph_eta = 0.0f64;
+    let mut ph_g = 0.0f64;
     let z = challenge_nonzero(t);
     let mut zp = Vec::with_capacity(6);
     let mut p = ONE;
@@ -691,10 +699,19 @@ pub fn prove_copy(
     }
     let mut sides: Vec<Side> = Vec::with_capacity(2);
     for operand in [a, b] {
+        let tt = Instant::now();
         let tree = CopyTree::build(f, operand, m_pos);
+        if time_on {
+            ph_tree += tt.elapsed().as_secs_f64() * 1e3;
+        }
+        let tt = Instant::now();
         let c2 = tree.flatten_top(f, z);
+        if time_on {
+            ph_flat += tt.elapsed().as_secs_f64() * 1e3;
+        }
         let mut e_vecs: Vec<Vec<Gf128>> = Vec::with_capacity(log_m);
         let mut cur = c2.clone();
+        let tt = Instant::now();
         for _ in 0..log_m {
             let half = cur.len() / 2;
             let mut next = vec![ZERO; half];
@@ -704,6 +721,9 @@ pub fn prove_copy(
             }
             e_vecs.push(next.clone());
             cur = next;
+        }
+        if time_on {
+            ph_evecs += tt.elapsed().as_secs_f64() * 1e3;
         }
         let theta = cur[0];
         sides.push(Side {
@@ -727,6 +747,7 @@ pub fn prove_copy(
         let mut e_proofs = Vec::with_capacity(log_m);
         let mut cur_pt: Vec<Gf128> = Vec::new();
         let mut cur_v = side.theta;
+        let tt = Instant::now();
         for level in 0..log_m {
             let l_len = m_pos >> (log_m - level);
             let vec: &Vec<Gf128> = if level == log_m - 1 {
@@ -749,6 +770,9 @@ pub fn prove_copy(
             cur_pt = pt;
             e_proofs.push(cubic);
         }
+        if time_on {
+            ph_eunfold += tt.elapsed().as_secs_f64() * 1e3;
+        }
         // ---- factor the final E-tree point: the first 2 coords are the
         // column bits, the rest the row bits.
         debug_assert_eq!(cur_pt.len(), log_m);
@@ -767,19 +791,31 @@ pub fn prove_copy(
             debug_assert_eq!(l_next.len(), rows_half);
 
             // u_{τ+1}
+            let tt = Instant::now();
             let u = column_claims_u(f, &side.tree, tau + 1, &l_next, &zp, &mut scratch);
             debug_assert_eq!(dot_gf(&u, &r_next), v_next, "v_{{τ+1}} = 〈u, r_{{τ+1}}〉");
             t.absorb_field("copy-u", &u);
+            if time_on {
+                ph_u += tt.elapsed().as_secs_f64() * 1e3;
+            }
 
             // the η samples → h
+            let tt = Instant::now();
             let f_samples = f_samples_copy(f, interp, &side.tree, tau, &l_next, &u, &zp);
             let h = interp.h_from_samples(f, &f_samples);
+            if time_on {
+                ph_eta += tt.elapsed().as_secs_f64() * 1e3;
+            }
             t.absorb_field("copy-h", &h);
 
             // x ←$ E \ H, then g_τ(z,x) and the cubic
+            let tt = Instant::now();
             let x = challenge_outside_h(f, interp, t);
             let rho = interp.rho_at_e(f, x);
             let g = contract_g_copy(f, &side.tree, tau, &rho, &zp);
+            if time_on {
+                ph_g += tt.elapsed().as_secs_f64() * 1e3;
+            }
             let c_x = dot_gf(&u, &rho);
             let psi_x = interp.psi_at_e(f, x);
             let mut hv = ZERO;
@@ -830,6 +866,11 @@ pub fn prove_copy(
         });
     }
 
+    if time_on {
+        eprintln!(
+            "copy phases: tree {ph_tree:.0} | flat {ph_flat:.0} | evecs {ph_evecs:.0} | e-unfold {ph_eunfold:.0} | u-claims {ph_u:.0} | eta {ph_eta:.0} | g {ph_g:.0} ms"
+        );
+    }
     let claim_b = claims.pop().expect("two operands");
     let claim_a = claims.pop().expect("two operands");
     let unfold_b = unfolds.pop().expect("two operands");

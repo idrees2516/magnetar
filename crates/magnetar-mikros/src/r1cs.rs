@@ -181,7 +181,9 @@ pub fn transpose_ps(ps: &PlaneSet) -> PlaneSet {
                     tile[i] = ps.plane(p)[rblk / 64];
                 }
             }
-            crate::planes::flip64(&mut tile);
+            // the AVX-512 block-swap network (bit-identical to the
+            // recursive planes::flip64 reference)
+            crate::simd::flip64_v(&mut tile);
             // after the flip: tile[j] = the i-bits (planes pblk..) of row rblk+j
             for j in 0..64 {
                 let r = rblk + j;
