@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.11.0 — Algorithm 5 (the single-instance PLONK SNARK) + the copy layer over K_pos; the Mikros stack complete
+
+The last protocol piece of ePrint 2026/2646: the end-to-end
+single-instance composition (§5.1–§5.2, Algorithm 5) on this stack's
+fields — the gate layer, the §5.1 copy-constraint encoding over
+`K_pos = GF(2^32)` at width `κ_pos = 4`, and the two grouped PCS
+openings (Appendix C.6). With this, all six algorithms of the paper are
+implemented, cross-validated, tamper-gated, and benchmarked.
+
+### The new modules
+- **`gf32`** — the position-encoding field `K_pos = GF(2^32)` (the unique
+  order-2^32 subfield of `E`): the GF(2)-power-basis code representation
+  (so the joint value–position label of position `n` with witness bit `w`
+  is *literally* `code = n | (w << 31)` — Lemma 2's injectivity for free),
+  PCLMULQDQ multiplication with a **two-CLMUL Barrett reduction** (valid
+  for any modulus shape — no sparse-polynomial search), the 4-lane
+  VPCLMULQDQ batch kernel (`mul4`/`dot4`), and byte-table E-embedding.
+- **`copy`** — Algorithm 3 at the §5.1 geometry: the packed permutation
+  proof over `K_pos` at width 4 (the coefficient tree as u32 codes over
+  VPCLMULQDQ lanes, the width-4 Lagrange interpolation data, the E-tree
+  on the shared cubic engine, two coefficient transitions, the terminal
+  packed claims) — plus **Proposition 5** (the verifier's identity-label
+  evaluation in O(κ_pos + log L + n_io): the column/row label split with
+  the public-I/O partial column).
+- **`plonk`** — Definition 1 (the constraint system + a builder with
+  wiring-cycle σ), the full Algorithm 5 driver: the five gate claims
+  (Eq. 12–13), four Algorithm-2 reductions + the nested `w_M` discharge,
+  the copy layer with the **terminal expansion** (the column=segment
+  structure regrouping `l₀`'s tensor factors to the witness packing
+  width), the six wire values + `3·d_L` permuted-digit values with both
+  recombinations, and the **two grouped openings** (witness group 3m /
+  public group `(5+3·d_L)m`): per-claim `U^⊤β` column messages,
+  independent `r ← E^κ` projections after all messages are fixed, ONE
+  Fact-1 per group, one PCS opening per group — the paper's
+  `16 + 3·d_L` batched-terminal structure.
+
+### The Table-5 benchmark (`mikros-bench plonk --log2-n K`)
+Simulated binary circuits (the paper's own Table-5 workload), the
+`d = 32 / κ_pos = 4` geometry the Theorem-1 interface forces for every
+`N ≥ 2^14` (`d_L + 1 ≤ 28`), single-threaded on this 2-vCPU container:
+
+| N | prover | gates/s | verifier | approx. proof | peak RSS |
+|---|---|---|---|---|---|
+| 2^16 | 267 ms | 245,677 | 91 ms | 193 KiB | 29 MiB |
+| 2^18 | 1.17 s | 56,246 | 161 ms | 251 KiB | 134 MiB |
+| 2^20 | 4.61 s | 227,680 | 361 ms | 361 KiB | 524 MiB |
+| 2^21 | 10.1 s | 207,091 | 615 ms | 437 KiB | 922 MiB |
+| 2^22 | 21.2 s | 197,895 | 1.13 s | 585 KiB | 1.79 GiB |
+
+The anatomy matches the paper's shape: the copy argument dominates
+(62% at 2^22 — the paper's Table 5: 92% perm share at 2^25 on their
+GFNI Xeon, whose per-core throughput this container's shared vCPU does
+not match), the gate layer (the GFNI-accelerated Algorithm 2) is the
+small share the paper's "excl. perm." column reports, and the grouped
+openings carry the preprocessed public commitment.
+
+### Fixed (found by the composed protocol)
+- The copy tree's row pairing must be the **contiguous halves** (the
+  cubic engine's U/D convention) — the interleaved draft produced a
+  grand product that was accidentally correct but structurally
+  inconsistent with the transition invariants.
+- The Barrett constant's missing `t_hi` term (`q̂ = t_hi ^ ((t_hi·μ_low)
+  >> 32)`, not the bare product half) — caught by the loop-reference
+  cross-test.
+- The verifier's group opening must fix **all** column messages before
+  sampling any projection (the paper's explicit ordering — an
+  interleaved absorb/sample silently forked the duplex).
+- The PCS opening point reversal at the group boundary (the Fact-1
+  MSB-first vs PCS LSB-first convention — the batch.rs lesson applied).
+
+Gate: 42 mikros tests green (the new gf32/copy/plonk suites with dense
+E-arithmetic references and six tamper classes), cargo fmt clean,
+clippy --workspace --all-targets clean, the full workspace suite green.
+
 ## 0.10.0 — Mikros (ePrint 2026/2646): the bitwidth-aware SNARK suite, complete and benchmarked
 
 The paper's full protocol stack on this repo's fields

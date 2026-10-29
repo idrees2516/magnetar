@@ -1013,16 +1013,6 @@ pub fn mulvv(dst: &mut [Gf128], a: &[Gf128], b: &[Gf128], count: usize) -> usize
     }
 }
 
-/// Elementwise multiply-accumulate over a run: `dst[k] += a[k] · b[k]` (the
-/// z-Horner and eta-pipeline accumulation). Returns the entries consumed.
-pub fn axpyvv_run(dst: &mut [Gf128], a: &[Gf128], b: &[Gf128], count: usize) -> usize {
-    let done = mulvv(dst, a, b, count);
-    for k in done..count {
-        dst[k] += crate::gf128::mul(a[k], b[k]);
-    }
-    count
-}
-
 /// 2-lane broadcast multiply for strided callers: `[r·t0, r·t1]` through
 /// the measured backend (scalar on non-x86 hosts).
 pub fn mul2_inline(r: Gf128, t: [Gf128; 2]) -> [Gf128; 2] {
@@ -1259,13 +1249,12 @@ fn mulvv_matches_scalar() {
             got[k] = crate::gf128::mul(a[k], b[k]);
         }
         assert_eq!(got, want, "n={n}");
-        // the accumulate form against a nonzero base
-        let mut acc: Vec<Gf128> = (0..n).map(|_| rg()).collect();
-        let mut want2 = acc.clone();
-        for k in 0..n {
-            want2[k] += crate::gf128::mul(a[k], b[k]);
+        // the in-place aliased form: dst = a ∘ b with dst == a
+        let mut aliased = a.clone();
+        let done = mulvv(&mut aliased, &a, &b, n);
+        for k in done..n {
+            aliased[k] = crate::gf128::mul(a[k], b[k]);
         }
-        axpyvv_run(&mut acc, &a, &b, n);
-        assert_eq!(acc, want2, "axpyvv n={n}");
+        assert_eq!(aliased, want, "aliased mulvv n={n}");
     }
 }

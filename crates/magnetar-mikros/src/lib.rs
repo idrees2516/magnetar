@@ -35,7 +35,9 @@
 
 pub mod batch;
 pub mod circuits;
+pub mod copy;
 pub mod fact1;
+pub mod gf32;
 pub mod gf8;
 pub mod hadamard;
 pub mod innerprod;
@@ -43,5 +45,6 @@ pub mod interp;
 pub mod pcs_open;
 pub mod perm;
 pub mod planes;
+pub mod plonk;
 pub mod r1cs;
 pub mod simd;

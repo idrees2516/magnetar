@@ -10,6 +10,9 @@
 //! * `mikros-bench perm --log2-n 20` — the packed permutation argument
 //!   (§4.3/Algorithm 3, the Table-5 "excl.-perm." complement) with its
 //!   per-phase cost anatomy.
+//! * `mikros-bench plonk --log2-n 16 [--seed 42]` — the single-instance
+//!   PLONK SNARK (Algorithm 5, Table 5): a simulated binary circuit, the
+//!   full gate + copy + grouped-opening stack with its cost anatomy.
 //!
 //! All runs are single-threaded, matching the paper's protocol.
 
@@ -534,6 +537,14 @@ fn main() {
                 .unwrap_or(20);
             bench_perm(log2_n);
         }
+        "plonk" => {
+            let log2_n = opts
+                .get("--log2-n")
+                .map(|v| v.parse().unwrap())
+                .unwrap_or(16);
+            let seed = opts.get("--seed").map(|v| v.parse().unwrap()).unwrap_or(42);
+            bench_plonk(log2_n, seed);
+        }
         other => {
             eprintln!(
                 "unknown command {other:?}; usage: mikros-bench hadamard --log2-n 30 | hashes --batch 256 | perm --log2-n 20"
@@ -541,4 +552,104 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Algorithm 5 — the single-instance PLONK SNARK (Table 5)
+// ---------------------------------------------------------------------------
+
+fn bench_plonk(log2_n: usize, seed: u64) {
+    assert!(log2_n >= 14, "Theorem 1: N ≥ κ² = 2^14");
+    assert!(log2_n <= 22, "the container-bounded ladder tops at 2^22");
+    let n = 1usize << log2_n;
+    println!(
+        "== Mikros Algorithm 5: single-instance PLONK, N = 2^{log2_n} (κ = 128, m = {}, κ_pos = 4, d = 32) ==",
+        n / 128
+    );
+    let t0 = Instant::now();
+    let (circuit, witness) = magnetar_mikros::plonk::simulated_circuit(log2_n, seed);
+    println!(
+        "circuit built in {:.0} ms ({} gates, n_io = {}, L = {})",
+        t0.elapsed().as_secs_f64() * 1e3,
+        circuit.n,
+        circuit.n_io,
+        circuit.l_len()
+    );
+    // sanity: the witness satisfies the circuit
+    assert!(circuit.gates_hold(
+        &witness.w[0..n],
+        &witness.w[n..2 * n],
+        &witness.w[2 * n..3 * n]
+    ));
+    assert!(circuit.copies_hold(&witness.w));
+    let d_l = circuit.d_l();
+    let io: Vec<bool> = witness.w[3 * n..3 * n + circuit.n_io].to_vec();
+
+    let t1 = Instant::now();
+    let params = PcsParams::default();
+    let setup = magnetar_mikros::plonk::setup_plonk(&circuit, &witness, params);
+    println!(
+        "setup (pack + commit) in {:.0} ms: witness 3m = {}, public m_pub = {} words (d_L = {d_l})",
+        t1.elapsed().as_secs_f64() * 1e3,
+        3 * n / 128,
+        (5 + 3 * d_l) * n / 128,
+    );
+
+    let mut t = Transcript::new("mikros-plonk-bench", &[]);
+    let (proof, stats) = magnetar_mikros::plonk::prove_plonk(&circuit, &witness, &setup, &mut t);
+    println!(
+        "prover:      {:.1} ms total (gate {:.1} | hadamard {:.1} | copy {:.1} | openings {:.1})",
+        stats.total_ms, stats.gate_ms, stats.hadamard_ms, stats.copy_ms, stats.open_ms
+    );
+    println!(
+        "  gates/s:   {:.0} over N = {n} (single thread)",
+        n as f64 / (stats.total_ms / 1e3)
+    );
+
+    let mut tv = Transcript::new("mikros-plonk-bench", &[]);
+    let tv0 = Instant::now();
+    let ok = magnetar_mikros::plonk::verify_plonk(&circuit, &setup, &io, &proof, &mut tv).is_ok();
+    let verify_ms = tv0.elapsed().as_secs_f64() * 1e3;
+    println!("verifier:    {verify_ms:.1} ms  (accepted: {ok})");
+
+    // the proof size (every Gf128 is 16 bytes; the PCS share at the
+    // FastChunk profile, cf. the Table-4 accounting)
+    let mut proof_bytes = 0usize;
+    proof_bytes += proof.c_claims.len() * 16;
+    for hp in proof
+        .gate_proofs
+        .iter()
+        .chain(std::iter::once(&proof.nested))
+    {
+        proof_bytes += hp.d.len() * 16 + hp.h.len() * 16;
+        proof_bytes += hp.fact1.rounds.len() * 3 * 16 + 2 * 16;
+    }
+    for unfold in proof.copy.unfolds.iter() {
+        for cub in unfold.e_tree.iter() {
+            proof_bytes += cub.rounds.len() * 4 * 16 + 2 * 16;
+        }
+        for ft in unfold.f_trans.iter() {
+            proof_bytes += ft.u.len() * 16 + ft.h.len() * 16;
+            proof_bytes += ft.cubic.rounds.len() * 4 * 16 + 2 * 16;
+        }
+    }
+    proof_bytes += proof.wire_values.len() * 3 * 16;
+    proof_bytes += proof.digit_values.len() * 3 * 16;
+    for g in [&proof.wit_open, &proof.pub_open] {
+        proof_bytes += g.v_msgs.len() * 128 * 16;
+        proof_bytes += g.fact1.rounds.len() * 3 * 16 + 2 * 16;
+        proof_bytes += 4096; // the FastChunk operating point (cf. Table 4)
+    }
+    println!(
+        "proof size:  {} (approx., the PCS share at the FastChunk profile)",
+        fmt_bytes(proof_bytes as u64)
+    );
+    println!("peak RSS:    {}", {
+        let kb = peak_rss_bytes() / 1024;
+        format!("{kb} KiB")
+    });
+    println!(
+        "paper ref:   Table 5 (N = 2^25, Xeon Gold 6342): 86.56 s prover / 24.43 ms verifier / 1,169 KiB — Mikros excl. perm. 6.72 s (1.51× vs Flock)"
+    );
+    assert!(ok, "the proof must verify");
 }

@@ -106,11 +106,38 @@ Prover anatomy: the η off-domain sampling pipeline ~86% (the per-node
 Lagrange encodings z-evaluated then row-dotted — the interchange that
 saved 3.6× over the per-pair bucket route), the `g` contractions ~9%,
 the coefficient-tree build + E-tree + cubic sum-checks the rest. The
-paper's Table-5 geometry runs the same algorithm at κ_pos = 16 over the
+paper's Table-5 geometry runs the same algorithm over the
 position-encoded wires (§5.1) — the single-instance PLONK composition
-(Algorithm 5) is the remaining unimplemented protocol piece, with the
-copy-constraint reduction (Lemma 2's joint value/position encoding)
-specified in `perm.rs`'s module doc.
+(Algorithm 5) is implemented in `plonk.rs` on top of the `copy.rs`
+instantiation (K_pos = GF(2^32), κ_pos = 4 — the geometry the Theorem-1
+interface forces for every N ≥ 2^14); see the Algorithm-5 section below.
+
+## Algorithm 5 — the single-instance PLONK SNARK (Table 5)
+
+`mikros-bench plonk --log2-n K` — simulated binary circuits (the paper's
+own Table-5 workload) through the full stack: the five gate claims, four
+packed Hadamard proofs plus the nested `w_M` discharge, the §5.1
+copy-constraint encoding over `K_pos = GF(2^32)` at width `κ_pos = 4`,
+the terminal expansion (six wire values + `3·d_L` permuted-digit
+values), and the two grouped openings (witness 3m / public
+`(5+3·d_L)m`). Single-threaded, this 2-vCPU container:
+
+| N | prover | gates/s | verifier | approx. proof | peak RSS |
+|---|---|---|---|---|---|
+| 2^16 | 267 ms | 245,677 | 91 ms | 193 KiB | 29 MiB |
+| 2^18 | 1.17 s | 56,246 | 161 ms | 251 KiB | 134 MiB |
+| 2^20 | 4.61 s | 227,680 | 361 ms | 361 KiB | 524 MiB |
+| 2^21 | 10.1 s | 207,091 | 615 ms | 437 KiB | 922 MiB |
+| 2^22 | 21.2 s | 197,895 | 1.13 s | 585 KiB | 1.79 GiB |
+
+Prover anatomy at 2^22: copy 13.0 s (62%), openings 7.1 s (33%), gates
+0.19 s (1%) — the same shape as the paper's Table 5 (perm 92% at 2^25 on
+their Xeon Gold 6342), with the gate layer (the GFNI-accelerated
+Algorithm 2) an even smaller share here and the public-group commitment
+(the preprocessed selector + digit tables) carried in the openings. The
+κ_pos = 4 geometry is forced: `d_L` position coordinates plus the
+witness coordinate need `d = 32` basis elements (`2d ≤ κ = 128`), so
+`[E : K_pos] = 4` for every admissible N ≥ 2^14.
 
 ### Implementation notes (the bugs the cross-validation caught)
 
