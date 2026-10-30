@@ -285,8 +285,14 @@ pub fn verify_packed_open(
         }
     }
     let (y, v1, v2) = fact1::verify(c, &proof.fact1, t)?;
-    // the W-recursion check: w = ts(y)^⊤ Ξ r
-    let w_check = w_recursion(xi_factors, &y, &r);
+    // the W-recursion check: w = ts(y)^⊤ Ξ r — the recursion pairs the
+    // little-endian ξ factors with the point in little-endian bit order,
+    // and the Fact-1 bind order is MSB-first, so the point reverses (the
+    // same convention as the prove side's PCS opening below — the first
+    // end-to-end caller, the spartan module, found this: the un-reversed
+    // list failed every honest proof at exactly this check).
+    let y_bits: Vec<Gf128> = y.iter().rev().copied().collect();
+    let w_check = w_recursion(xi_factors, &y_bits, &r);
     if w_check != v2 {
         return Err("packed-open: W-recursion mismatch");
     }
@@ -294,7 +300,11 @@ pub fn verify_packed_open(
     if proof.w_pub != v2 {
         return Err("packed-open: w_pub binding");
     }
-    verify_eval(stmt, params, &y, v1, &proof.pcs, t)
+    // Fact 1 binds the MSB first; the PCS binds LSB-first — reverse (the
+    // prove side's `point` construction, which the verify side previously
+    // skipped).
+    let point: Vec<Gf128> = y.iter().rev().copied().collect();
+    verify_eval(stmt, params, &point, v1, &proof.pcs, t)
 }
 
 /// Expose the packed witness words (`a = Aβ`) from the transposed layout.

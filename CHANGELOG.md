@@ -1,5 +1,119 @@
 # Changelog
 
+## 0.12.0 — BinarySpartan on the Mikros stack: the production SNARK path for R1CS
+
+*BinarySpartan* (Setty, *BinarySpartan: Spartan over binary fields*, IACR
+ePrint 2026/1656) instantiated on this repo's packed multi-instance
+layout: **Spartan's outer + inner shape** for the bit-level R1CS with the
+witness committed through the fold-chain PCS (Ligerito's role), the
+matrices as verifier-side public factors at the real-Spartan operating
+point (direct sparse-MLE evaluation, O(nnz)), and the witness claim
+opened through Algorithm 4's packed opening. Transparent, hash-secure,
+polylog proofs, a linear-work prover, constant-extra-memory.
+
+### The protocol (`magnetar-mikros::spartan`)
+1. **The public-I/O bind** — Algorithm 6's steps 3–5 verbatim (the
+   masked-eq Fact-1 → a plain PCS opening).
+2. **The outer sum-check** — `0 = Σ_{(j,i)} eq(τ_j,j)·eq(τ_i,i)·[L·R + O]`
+   over the joint (instance ‖ constraint-row) cube, in two phases:
+   - **The instance phase** (7 rounds, degree-3 messages): the prover
+     never materializes an E-valued cube — per free plane it forms the
+     challenge-weighted combinations of the *original* GF(2) planes
+     (XOR-selects) and takes the `l = eq(τ_i,·)`-weighted dots; the bound
+     coordinates' `eq(τ_j, ρ)` products ride the running claim. Constant
+     memory, work halving per round.
+   - **The row phase** (log N rounds): the images fold once at
+     `eq(j*,·)` into E-valued row tables and the engine finishes the
+     sum-check — the public `eq(τ_i,·)` factor rides the never-folded
+     eq-slab discipline; the term coefficients carry `eq(τ_j, j*)`.
+3. **The inner sum-check** — `⋆̂(j*,i*) = Σ_y Ŝ⋆(i*,y)·Ŵ(y,j*)`: an
+   α-batched Fact-1 over the witness columns; the verifier
+   direct-evaluates the matrix MLEs (O(nnz)), the witness side is the
+   `eq(j*,·)`-folded packed table.
+4. **The openings** — the io claim through the plain fold-chain
+   evaluation; `Ŵ(y_in, j*)` through Algorithm 4's packed opening (the U
+   coordinate claims + the char-2 W recursion).
+
+### Three bugs found by the composed protocols (the repo's discipline)
+- **`pcs_open`'s verify-side point order** (the first end-to-end caller):
+  the W-recursion and the terminal PCS opening paired the *un-reversed*
+  Fact-1 challenge list — the prove side had the reversals, the verify
+  side skipped both, and no earlier test ever drove `verify_packed_open`
+  (plonk carries its own grouped opening). Every honest proof failed at
+  exactly the W-recursion check.
+- **The missing accumulated eq factor**: each instance-round message must
+  carry `Π_{m<k} eq(τ_j[m], ρ_m)`; the first draft dropped it, and the
+  toy circuit validated *trivially zero on both sides* of the round-sum
+  identity — only the N = 2^17 SHA differential caught it (round 1's sum
+  disagreed with the chain while round 0's message matched the
+  reference).
+- **The bound-pattern bit order**: the c-tensor update shifted the old
+  bits up (`nc[2b]`), reversing the bound pattern from round 2 on; the
+  new variable must land at the *top* bit (`nc[b]`, `nc[b+half]`). Also
+  invisible at the toy's 2-row circuit, decisive at round 2 of the SHA
+  differential.
+
+### The BinarySpartan technique map (2026/1656 on this stack)
+| BinarySpartan | Here |
+|---|---|
+| Spartan over binary fields (outer + inner) | `magnetar-mikros::spartan` (this release) |
+| Ligerito + DP24 ring switching | `magnetar-pcs` (the fold-chain backend every opening uses) |
+| Phalanx SIMD R1CS | the packed `S⋆W` planes (Algorithm 6's layout) |
+| eq/sum-check optimizations (Gruen 2023; Dao–Thaler 2024/1210; BDDT) | the engine's never-folded eq slabs + `gf8`'s 64K byte tables (landed in earlier releases; this protocol routes its row phase through them) |
+| Binius64 byte lookup tables | `gf8::mul_tab` — the T16 bucket route (0.10.0) |
+| SuperSpartan's next multilinear extension | **not implemented** — the paper text was not retrievable (eprint PDF access is Cloudflare-gated this session); documented in `docs/STATUS.md` rather than guessed at |
+
+### Measured (the Table-4 workloads, both paths on the same instances)
+Single-threaded, this 2-vCPU container (the GFNI host comparison is the
+usual honest hardware-gap anatomy — `docs/BENCHMARKS.md`):
+
+| SHA-256 (N = 2^17) | Algorithm 6 | BinarySpartan |
+|---|---|---|
+| prover | 907 ms | 1657 ms |
+| verifier | 57.8 ms | **31.7 ms** |
+| proof | 1865 KiB | 1858 KiB |
+
+| Keccak (N = 2^18) | Algorithm 6 | BinarySpartan |
+|---|---|---|
+| prover | 1905 ms | 2456 ms |
+| verifier | 91.5 ms | **61.7 ms** |
+| proof | 1996 KiB | 1990 KiB |
+
+| BLAKE3 (N = 2^16) | Algorithm 6 | BinarySpartan |
+|---|---|---|
+| prover | 436 ms | 896 ms |
+| verifier | 41.6 ms | **20.6 ms** |
+| proof | 1736 KiB | 1729 KiB |
+
+The verifier wins 1.5–2× (the direct sparse-MLE route replaces the U⋆
+coordinate messages and the per-matrix public-value scans); the proof
+size is a hair smaller. **The prover is 1.3–2× slower in this first,
+deliberately plain form** — the instance phase's per-free-plane dots are
+scalar E-multiplies; the levers (the VPCLMULQDQ lane kernels on the
+combinations, the fused dot3, the l-weight folded once into the images)
+are the same class the 0.11.x releases pulled on Algorithm 5, and the
+per-phase anatomy is the next release's material. RSS at Keccak: 260 MiB
+(the same envelope as Algorithm 6).
+
+### Tests
+- `spartan_roundtrip_and_tamper` — the honest verify + seven tamper
+  classes (the io words, an instance-round coefficient, a row message,
+  the terminal claims, the inner Fact-1, the packed opening's v_msg, the
+  witness claim) + the unsatisfiable-batch rejection.
+- `spartan_dense_reference_and_inner_identity` — the lazy instance-round
+  messages byte-matched against a materialized joint-cube reference; the
+  terminal claims brute-forced against the direct joint MLEs; the
+  Spartan inner identity asserted brute-force on both sides.
+- `spartan_sha256_dense_differential` (`--ignored`, ~6 s) — the same
+  machinery at N = 2^17 with a per-round chain oracle (the true
+  remaining sum from the folded state): the invariant that caught two
+  of the three bugs.
+- `spartan_cross_check_algorithm6` — the same instances verify through
+  both SNARKs.
+- `engine_finish_vs_manual_fold` — the engine's terminal claims vs the
+  plain interleaved fold (the cross-crate regression guard).
+
+# Changelog
 ## 0.11.2 — the remaining-parts release: the batched-leaf PCS + the ERC-20 real-time benchmark
 
 Measured on the AVX-512 host (2 vCPU, single-threaded, before → after):

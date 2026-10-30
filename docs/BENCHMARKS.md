@@ -89,6 +89,31 @@ carries full Merkle paths per query; the paper's Ligerito-Fast openings
 are ~10× more compact. The repo's size profiles (the `magnetar profiles`
 command: FastChunk → DeepWrap) trade exactly this axis.
 
+### Table 4 bis — BinarySpartan on the same instances (the production SNARK path)
+
+`magnetar-mikros::spartan` (ePrint 2026/1656): Spartan's outer + inner
+for the packed R1CS — the eq-weighted satisfaction over the joint
+(instance ‖ row) cube, the matrix-MLE inner with the real-Spartan
+verifier (direct sparse evaluation, O(nnz)), Algorithm 4's packed
+openings. Both paths run on the same instances and the same commitment
+(`mikros-bench hashes --batch 128`), single-threaded on the dev
+container:
+
+| workload (128 inst.) | A6 prover | BS prover | A6 verifier | BS verifier | A6 proof | BS proof |
+|---|---|---|---|---|---|---|
+| SHA-256 (2^17) | 907 ms | 1657 ms | 57.8 ms | **31.7 ms** | 1865 KiB | 1858 KiB |
+| Keccak (2^18) | 1905 ms | 2456 ms | 91.5 ms | **61.7 ms** | 1996 KiB | 1990 KiB |
+| BLAKE3 (2^16) | 436 ms | 896 ms | 41.6 ms | **20.6 ms** | 1736 KiB | 1729 KiB |
+
+The verifier wins 1.5–2× (the direct matrix-MLE route replaces the
+U⋆ coordinate messages and the per-matrix public-value scans); the
+proof is a hair smaller. The prover is 1.3–2× slower in this first,
+deliberately plain form — the instance phase's per-free-plane dots are
+scalar E-multiplies; the levers (the VPCLMULQDQ lanes on the
+combinations, the fused dot3, the l-weight folded once into the images)
+are the 0.12.x material. Peak RSS at Keccak: 260 MiB — the same
+envelope as Algorithm 6.
+
 ### The permutation argument (Algorithm 3, the Table-5 complement)
 
 The grand-product proof over committed planes (the component the

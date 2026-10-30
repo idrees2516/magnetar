@@ -30,6 +30,7 @@ use magnetar_mikros::hadamard::{prove_hadamard_timed, verify_hadamard};
 use magnetar_mikros::interp::InterpData;
 use magnetar_mikros::perm::{prove_perm, verify_perm};
 use magnetar_mikros::planes::{PlaneSet, RowWeightTensor};
+use magnetar_mikros::spartan::{prove_spartan, verify_spartan, SpartanProof};
 use magnetar_pcs::eval::{PcsParams, PcsProof};
 
 fn peak_rss_bytes() -> u64 {
@@ -312,6 +313,10 @@ fn bench_one_hash(name: &str, batch: usize) {
     let mut verify_ms = 0.0f64;
     let mut setup_ms = 0.0f64;
     let mut proof_bytes = 0usize;
+    // BinarySpartan (the production SNARK path) on the same instances.
+    let mut sp_prove_ms = 0.0f64;
+    let mut sp_verify_ms = 0.0f64;
+    let mut sp_proof_bytes = 0usize;
     for block in 0..blocks {
         // κ witnesses by replay
         let witnesses: Vec<Vec<bool>> = (0..128).map(|j| make_witness(block * 128 + j)).collect();
@@ -337,12 +342,26 @@ fn bench_one_hash(name: &str, batch: usize) {
         verify_ms += tv0.elapsed().as_secs_f64() * 1e3;
 
         proof_bytes += batch_proof_size(&proof);
+
+        // BinarySpartan: the outer (instance + row phases) + the inner +
+        // the openings, on the SAME packed block and commitment.
+        let mut ts2 = Transcript::new(&format!("{tag}-spartan"), &[&(block as u64).to_le_bytes()]);
+        let tsp = Instant::now();
+        let sp = prove_spartan(&cs, &setup, &params, &packed_io, &mut ts2);
+        sp_prove_ms += tsp.elapsed().as_secs_f64() * 1e3;
+        let mut tvs = Transcript::new(&format!("{tag}-spartan"), &[&(block as u64).to_le_bytes()]);
+        let tvs0 = Instant::now();
+        verify_spartan(&cs, &params, &packed_io, &sp, &mut tvs)
+            .unwrap_or_else(|e| panic!("spartan verify failed: {e}"));
+        sp_verify_ms += tvs0.elapsed().as_secs_f64() * 1e3;
+        sp_proof_bytes += spartan_proof_size(&sp);
     }
     println!(
         "  batch:    {} instances = {} packed block(s) of κ = 128",
         blocks * 128,
         blocks
     );
+    println!("  -- Algorithm 6 (the Table-4 benchmark setting: public wiring)");
     println!(
         "  prover:   {:.2} ms total ({:.2} ms/instance) [commit+preproc {:.0} ms]",
         prove_ms + setup_ms,
@@ -355,6 +374,18 @@ fn bench_one_hash(name: &str, batch: usize) {
         proof_bytes,
         proof_bytes as f64 / 1024.0
     );
+    println!("  -- BinarySpartan (the production path: outer + inner, packed openings)");
+    println!(
+        "  prover:   {:.2} ms total ({:.2} ms/instance)",
+        sp_prove_ms,
+        sp_prove_ms / (blocks * 128) as f64
+    );
+    println!("  verifier: {:.2} ms total", sp_verify_ms);
+    println!(
+        "  proof:   {} ({:.1} KiB)",
+        sp_proof_bytes,
+        sp_proof_bytes as f64 / 1024.0
+    );
     println!("  peak RSS: {}", fmt_bytes(peak_rss_bytes()));
     let paper = match name {
         "sha256" => "79.54 ms prover / 37.47 ms verifier / 367.71 KiB proof / 606.79 MiB RSS",
@@ -363,6 +394,22 @@ fn bench_one_hash(name: &str, batch: usize) {
         _ => "",
     };
     println!("  paper ref (Xeon Gold 6342, GFNI): {paper}");
+}
+
+fn spartan_proof_size(p: &SpartanProof) -> usize {
+    let f1 = |f: &magnetar_mikros::fact1::Fact1Proof| f.rounds.len() * 3 * 16 + 32;
+    let mut total = 16 // io_claim
+        + f1(&p.fact1_io)
+        + p.outer_inst.len() * 4 * 16
+        + p.outer_row.iter().map(|m| m.len() * 16).sum::<usize>()
+        + 3 * 16 // terminals
+        + f1(&p.inner)
+        + p.w_claim.0.len() * 16 + 16; // the witness claim (point, value)
+                                       // the packed opening (Algorithm 4)
+    total += p.po.v_msg.len() * 16 + f1(&p.po.fact1) + 16 + pcs_size(&p.po.pcs);
+    // the io claim's plain opening
+    total += pcs_size(&p.pcs_io);
+    total
 }
 
 fn batch_proof_size(p: &BatchProof) -> usize {

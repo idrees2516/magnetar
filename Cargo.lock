@@ -799,6 +799,7 @@ dependencies = [
  "magnetar-field",
  "magnetar-hash",
  "magnetar-pcs",
+ "magnetar-sumcheck",
  "rand",
 ]
 

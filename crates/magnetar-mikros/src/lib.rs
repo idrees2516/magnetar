@@ -21,6 +21,7 @@
 //! | Packed permutation proof, Algorithm 3 (§4.3) | [`perm`] | grand products from Hadamard products |
 //! | Copy-constraint permutation over K_pos (§5.1) | [`copy`] | Algorithm 3 at width κ_pos over GF(2^32) |
 //! | Single-instance PLONK SNARK, Algorithm 5 (§5.2) | [`plonk`] | the gate layer + the copy layer + the grouped openings |
+//! | BinarySpartan on the packed stack (ePrint 2026/1656) | [`spartan`] | Spartan's outer + inner for R1CS: the production SNARK path — the eq-weighted satisfaction over the joint cube, the matrix-MLE inner, Algorithm 4's packed openings |
 //! | Batched-instance R1CS, Algorithm 6 (§5.3) | [`batch`] | the Table-4 hash benchmarks (public wiring) |
 //! | Binary hash circuits | [`circuits`] | SHA-256 compression, Keccak-f[1600], BLAKE3 compression |
 //!
@@ -48,3 +49,4 @@ pub mod planes;
 pub mod plonk;
 pub mod r1cs;
 pub mod simd;
+pub mod spartan;

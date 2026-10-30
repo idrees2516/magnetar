@@ -10,6 +10,7 @@ description = "Mikros: bitwidth-aware SNARK components over extensions of small 
 magnetar-field = { path = "../magnetar-field" }
 magnetar-hash = { path = "../magnetar-hash" }
 magnetar-pcs = { path = "../magnetar-pcs" }
+magnetar-sumcheck = { path = "../magnetar-sumcheck" }
 
 [dev-dependencies]
 rand = "0.10"

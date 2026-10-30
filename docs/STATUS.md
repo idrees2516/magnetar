@@ -42,6 +42,7 @@ The reference is the Magnetar paper (eprint 2026-2423). Sections marked
 | **ZK masking, recovered and wired** (`magnetar_sumcheck::zk`: per-round mask polynomials, perfect HVZK of the round messages, O(degree) randomness/round; `finish_offset` on the verifier) — wired into the Mosaic batching discharge behind `KeyGen::enable_zk` | roadmap H1 | `magnetar-sumcheck::zk`, `magnetar-zkvm::mosaic` | `end_to_end_zk_masked_batching` (+ offset and round tampers) |
 | **The dual-rate PCS profiles** (`PcsProfile::{FastChunk, Balanced, CompactWrap, DeepWrap}`) and the `magnetar profiles` measurement (tails 62.8 → 27.3 KiB) | roadmap H1/H2 | `magnetar-pcs::eval`, `magnetar-cli` | `end_to_end_wrapped_deep`; the CLI harness |
 | **The dual-rate wrap** (roadmap H2): the chunk side keeps its fast profile; the public evaluation tail is discharged at `DeepWrap` with transcript-sampled consistency spot-checks binding the deep commitment to the chunk commitment (the bounded-depth spot-check accumulation shape; ARC's distance-preserving fold documented as the unbounded-depth follow-on) | roadmap H2 / RECURSION §1 | `magnetar-zkvm::wrap`, `prove_with_wrap` | `end_to_end_wrapped_deep` (roundtrip + 3 tamper classes + the size assertion) |
+| **BinarySpartan on the Mikros stack** (ePrint 2026/1656): Spartan's outer (7 instance rounds in the packed discipline + the row phase through the engine's eq slabs) + inner (the α-batched matrix-MLE Fact-1), the io bind and the openings through Algorithm 4's packed opening — cross-validated against Algorithm 6 on the same instances, the dense joint-cube reference at toy and N = 2^17 scale, seven tamper classes; the verifier 1.5–2× faster, the prover's first plain form measured with its lever inventory | 2026/1656 | `magnetar-mikros::spartan` | `spartan_roundtrip_and_tamper`, `spartan_dense_reference_and_inner_identity`, `spartan_sha256_dense_differential`, `spartan_cross_check_algorithm6` |
 | **The phase instrumentation** (`MAGNETAR_TIME=1`): the per-phase wall clock of the full prover | engineering | `magnetar-zkvm::protocol::PhaseTimer` | the BENCHMARKS anatomy table |
 
 ## Explicitly not implemented
@@ -123,7 +124,13 @@ Everything else in RV64I (including `JAL`, all branches, all loads and
 stores, register shifts via stage expansion) is proven with the full
 cross-step chain. Fail-closed beats silent unsoundness.
 
-### 8. The paper's 15-workload benchmark suite
+### 8. SuperSpartan's *next multilinear extension* (BinarySpartan's list)
+The one BinarySpartan technique not carried onto this stack: the eprint
+PDF is Cloudflare-gated this session and the technique's precise form is
+not recoverable from the abstract alone. Not implemented rather than
+guessed at; revisit when the paper text is accessible.
+
+### 9. The paper's 15-workload benchmark suite
 We benchmark four representative programs (fibonacci-style ALU chains,
 load/store with sub-word lanes, shifts, a running-sum loop with branches)
 at multiple trace lengths, plus the tree-IVC configuration. Porting the
