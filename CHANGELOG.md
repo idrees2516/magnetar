@@ -69,25 +69,29 @@ usual honest hardware-gap anatomy — `docs/BENCHMARKS.md`):
 
 | SHA-256 (N = 2^17) | Algorithm 6 | BinarySpartan |
 |---|---|---|
-| prover | 907 ms | 1657 ms |
-| verifier | 57.8 ms | **31.7 ms** |
-| proof | 1865 KiB | 1858 KiB |
+| prover | 468 ms | 1362 ms |
+| verifier | 53.7 ms | **27.6 ms** |
+| proof | 960 KiB | 953 KiB |
 
 | Keccak (N = 2^18) | Algorithm 6 | BinarySpartan |
 |---|---|---|
-| prover | 1905 ms | 2456 ms |
-| verifier | 91.5 ms | **61.7 ms** |
-| proof | 1996 KiB | 1990 KiB |
+| prover | 942 ms | 1807 ms |
+| verifier | 83.8 ms | **47.9 ms** |
+| proof | 1061 KiB | 1055 KiB |
 
 | BLAKE3 (N = 2^16) | Algorithm 6 | BinarySpartan |
 |---|---|---|
-| prover | 436 ms | 896 ms |
-| verifier | 41.6 ms | **20.6 ms** |
-| proof | 1736 KiB | 1729 KiB |
+| prover | 239 ms | 769 ms |
+| verifier | 33.2 ms | **17.5 ms** |
+| proof | 863 KiB | 856 KiB |
 
-The verifier wins 1.5–2× (the direct sparse-MLE route replaces the U⋆
+(The 0.11.2 batched-leaf PCS halves every proof and speeds both provers;
+these are the re-measured numbers on the rebased base — the first draft
+of this entry carried the pre-rebase figures.)
+
+The verifier wins 1.7–1.95× (the direct sparse-MLE route replaces the U⋆
 coordinate messages and the per-matrix public-value scans); the proof
-size is a hair smaller. **The prover is 1.3–2× slower in this first,
+size is a hair smaller. **The prover is 1.9–3.2× slower in this first,
 deliberately plain form** — the instance phase's per-free-plane dots are
 scalar E-multiplies; the levers (the VPCLMULQDQ lane kernels on the
 combinations, the fused dot3, the l-weight folded once into the images)

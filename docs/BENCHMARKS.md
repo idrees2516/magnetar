@@ -101,14 +101,15 @@ container:
 
 | workload (128 inst.) | A6 prover | BS prover | A6 verifier | BS verifier | A6 proof | BS proof |
 |---|---|---|---|---|---|---|
-| SHA-256 (2^17) | 907 ms | 1657 ms | 57.8 ms | **31.7 ms** | 1865 KiB | 1858 KiB |
-| Keccak (2^18) | 1905 ms | 2456 ms | 91.5 ms | **61.7 ms** | 1996 KiB | 1990 KiB |
-| BLAKE3 (2^16) | 436 ms | 896 ms | 41.6 ms | **20.6 ms** | 1736 KiB | 1729 KiB |
+| SHA-256 (2^17) | 468 ms | 1362 ms | 53.7 ms | **27.6 ms** | 960 KiB | 953 KiB |
+| Keccak (2^18) | 942 ms | 1807 ms | 83.8 ms | **47.9 ms** | 1061 KiB | 1055 KiB |
+| BLAKE3 (2^16) | 239 ms | 769 ms | 33.2 ms | **17.5 ms** | 863 KiB | 856 KiB |
 
-The verifier wins 1.5–2× (the direct matrix-MLE route replaces the
-U⋆ coordinate messages and the per-matrix public-value scans); the
-proof is a hair smaller. The prover is 1.3–2× slower in this first,
-deliberately plain form — the instance phase's per-free-plane dots are
+(Re-measured on the 0.11.2 base — the batched-leaf PCS halves every
+proof and speeds both provers.) The verifier wins 1.7–1.95× (the direct
+matrix-MLE route replaces the U⋆ coordinate messages and the per-matrix
+public-value scans); the proof is a hair smaller. The prover is
+1.9–3.2× slower in this first, deliberately plain form — the instance phase's per-free-plane dots are
 scalar E-multiplies; the levers (the VPCLMULQDQ lanes on the
 combinations, the fused dot3, the l-weight folded once into the images)
 are the 0.12.x material. Peak RSS at Keccak: 260 MiB — the same
