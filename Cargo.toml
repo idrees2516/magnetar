@@ -41,7 +41,7 @@ magnetar-mikros = { path = "crates/magnetar-mikros" }
 
 # NVlabs cuTile GPU kernel DSL (optional; built only with magnetar-bitsum's
 # `cutile` feature — requires the CUDA 13.x toolkit at build time).
-cutile = { version = "0.4" }
+cutile = { version = "0.5" }
 
 # Standard, well-scrutinized hash implementations (RustCrypto / BLAKE3 team).
 sha3 = { version = "0.12", default-features = false }
