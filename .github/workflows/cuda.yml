@@ -23,7 +23,7 @@ jobs:
     name: cutile build + parity gate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: CUDA 13.x toolkit
         uses: Jimver/cuda-toolkit@v2
         with:
