@@ -38,7 +38,10 @@ fn profile_window_erc20_shape() {
     let spec = magnetar_cpu::build_circuit();
     let row_vars_fld = spec.a_fld.rows.trailing_zeros() as usize;
     let joint_vars_fld = s + row_vars_fld;
-    println!("fld geometry: rows_fld={} joint_vars_fld={}", spec.a_fld.rows, joint_vars_fld);
+    println!(
+        "fld geometry: rows_fld={} joint_vars_fld={}",
+        spec.a_fld.rows, joint_vars_fld
+    );
     let rel = DualRelation {
         m,
         a_bin: spec.a_bin.clone(),
@@ -104,8 +107,16 @@ fn profile_window_erc20_shape() {
         dense: vec![Vec::new(), Vec::new(), Vec::new()],
         public: vec![Box::new(EqFactor::new(tau.clone()))],
         terms: vec![
-            Term { coeff: ONE, dense: vec![0, 1], public: vec![0] },
-            Term { coeff: ONE, dense: vec![2], public: vec![0] },
+            Term {
+                coeff: ONE,
+                dense: vec![0, 1],
+                public: vec![0],
+            },
+            Term {
+                coeff: ONE,
+                dense: vec![2],
+                public: vec![0],
+            },
         ],
         claim: ZERO,
     };
@@ -162,8 +173,16 @@ fn profile_window_erc20_shape() {
         dense: vec![az_fld, bz_fld, cz_fld],
         public: vec![Box::new(EqFactor::new(tau_fld.clone()))],
         terms: vec![
-            Term { coeff: ONE, dense: vec![0, 1], public: vec![0] },
-            Term { coeff: ONE, dense: vec![2], public: vec![0] },
+            Term {
+                coeff: ONE,
+                dense: vec![0, 1],
+                public: vec![0],
+            },
+            Term {
+                coeff: ONE,
+                dense: vec![2],
+                public: vec![0],
+            },
         ],
         claim: ZERO,
     };

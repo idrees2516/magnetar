@@ -371,7 +371,9 @@ impl SparseMatrix {
         };
         let mut masks = vec![0u64; stride];
         if q >= 64 {
-            let chunk = (q / (rayon::current_num_threads().max(1) * 4)).max(1).min(q);
+            let chunk = (q / (rayon::current_num_threads().max(1) * 4))
+                .max(1)
+                .min(q);
             let combined = (0..q)
                 .into_par_iter()
                 .chunks(chunk)

@@ -156,7 +156,14 @@ impl SumcheckProver {
             })
             .collect();
         let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
-        w.run_pass_masks(&masks[0], &masks[1], &masks[2], &public_tables[0], &tau, true);
+        w.run_pass_masks(
+            &masks[0],
+            &masks[1],
+            &masks[2],
+            &public_tables[0],
+            &tau,
+            true,
+        );
         let window = Some(w);
         SumcheckProver {
             spec_terms: spec.terms.clone(),
@@ -179,10 +186,7 @@ impl SumcheckProver {
     /// `eq(τ,·)·(D0·D1 + D2)` with the eq as the single public factor
     /// covering the joint cube, bound high-bits-first. Returns
     /// `(window size v, τ)` on match. Shared by both window modes.
-    fn window_geometry(
-        spec: &SumcheckSpec,
-        order: BindOrder,
-    ) -> Option<(usize, Vec<Gf128>)> {
+    fn window_geometry(spec: &SumcheckSpec, order: BindOrder) -> Option<(usize, Vec<Gf128>)> {
         let high = match order {
             BindOrder::HighBitsFirst { high } => high,
             _ => return None,
@@ -216,7 +220,14 @@ impl SumcheckProver {
     ) -> Option<crate::window::WindowState> {
         let (v, tau) = Self::window_geometry(spec, order)?;
         let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
-        w.run_pass_masks(&masks[0], &masks[1], &masks[2], &public_tables[0], &tau, true);
+        w.run_pass_masks(
+            &masks[0],
+            &masks[1],
+            &masks[2],
+            &public_tables[0],
+            &tau,
+            true,
+        );
         Some(w)
     }
 
@@ -232,15 +243,12 @@ impl SumcheckProver {
         // bit-flagged). On match, the eq factor materializes as the
         // suffix-only sub-table (never the full cube) — see
         // [`Self::with_mask_window`].
-        let geo = if auto_window
-            && spec.dense.len() == 3
-            && bits.len() == 3
-            && bits.iter().all(|&b| b)
-        {
-            Self::window_geometry(spec, order)
-        } else {
-            None
-        };
+        let geo =
+            if auto_window && spec.dense.len() == 3 && bits.len() == 3 && bits.iter().all(|&b| b) {
+                Self::window_geometry(spec, order)
+            } else {
+                None
+            };
         let public_tables: Vec<Vec<Gf128>> = spec
             .public
             .iter()
@@ -262,8 +270,7 @@ impl SumcheckProver {
             })
             .collect();
         let window = geo.map(|(v, tau)| {
-            let mut w =
-                crate::window::WindowState::new(spec.num_vars, v, &tau);
+            let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
             w.run_pass(
                 &spec.dense[0],
                 &spec.dense[1],
