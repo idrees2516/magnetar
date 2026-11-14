@@ -3,6 +3,7 @@
                                            // mid-file tests module
 
 use magnetar_field::{mul, Gf128, ONE, ZERO};
+use rayon::prelude::*;
 
 /// A sparse matrix over `K` in (row, col, value) entry form.
 ///
@@ -148,19 +149,42 @@ impl SparseMatrix {
             }
         }
         let _ = has_bits;
-        for u in 0..q {
-            let out_u = &mut out[u * self.rows..(u + 1) * self.rows];
-            let row = &w_packed[u * w128..(u + 1) * w128];
-            for &(r, c, v) in &self.entries {
-                if c < w_cols {
-                    // branchless select: v & mask where mask = -(bit)
-                    let bit = (row[c >> 7] >> (c & 127)) & 1;
-                    out_u[r].0 ^= v.0 & bit.wrapping_neg();
+        // R7.1: instances are independent (disjoint out ranges) — run
+        // them in parallel. The per-instance writes never overlap, so
+        // the result is schedule-independent (R1) and bit-identical to
+        // the sequential loop.
+        if q >= 64 {
+            out.par_chunks_mut(self.rows)
+                .enumerate()
+                .for_each(|(u, out_u)| {
+                    let row = &w_packed[u * w128..(u + 1) * w128];
+                    for &(r, c, v) in &self.entries {
+                        if c < w_cols {
+                            // branchless select: v & mask where mask = -(bit)
+                            let bit = (row[c >> 7] >> (c & 127)) & 1;
+                            out_u[r].0 ^= v.0 & bit.wrapping_neg();
+                        }
+                    }
+                    // Fold the shared x-part in (XOR per position).
+                    for (o, xp) in out_u.iter_mut().zip(xpart.iter()) {
+                        o.0 ^= xp.0;
+                    }
+                });
+        } else {
+            for u in 0..q {
+                let out_u = &mut out[u * self.rows..(u + 1) * self.rows];
+                let row = &w_packed[u * w128..(u + 1) * w128];
+                for &(r, c, v) in &self.entries {
+                    if c < w_cols {
+                        // branchless select: v & mask where mask = -(bit)
+                        let bit = (row[c >> 7] >> (c & 127)) & 1;
+                        out_u[r].0 ^= v.0 & bit.wrapping_neg();
+                    }
                 }
-            }
-            // Fold the shared x-part in (XOR per position).
-            for (o, xp) in out_u.iter_mut().zip(xpart.iter()) {
-                o.0 ^= xp.0;
+                // Fold the shared x-part in (XOR per position).
+                for (o, xp) in out_u.iter_mut().zip(xpart.iter()) {
+                    o.0 ^= xp.0;
+                }
             }
         }
         (out, all_bits)
@@ -304,37 +328,73 @@ impl SparseMatrix {
         let rows_log2 = self.rows.trailing_zeros() as usize;
         let stride = 1usize << (rows_log2 + s - v);
         let low_mask = (1usize << (s - v)) - 1;
-        let mut masks = vec![0u64; stride];
-        for u in 0..q {
-            let row_words = &w_packed[u * w128..(u + 1) * w128];
-            // The row-parity bitset: one XOR per entry with a set witness
-            // bit (a word op, not a 16-byte accumulate).
-            let mut parity = vec![0u64; self.rows.div_ceil(64)];
-            for &(r, c, val) in &self.entries {
-                if val.0 & 1 == 0 {
-                    continue;
-                }
-                if c < w_cols {
-                    if (row_words[c >> 7] >> (c & 127)) & 1 == 1 {
+        // R7.1/R8: different instances OR their parity bits into the
+        // SAME mask words (different bit planes of one u64), so the
+        // sequential scatter is replaced by per-worker local masks
+        // combined by `|` — order-free and therefore schedule-independent
+        // (R1): the masks are bit-identical to the sequential loop.
+        let build = |u0: usize, u1: usize, masks: &mut [u64]| {
+            for u in u0..u1 {
+                // FRESH per instance (the parity is consumed by the
+                // scatter below; reusing it across instances would
+                // XOR unrelated rows together).
+                let mut parity = vec![0u64; self.rows.div_ceil(64)];
+                let row_words = &w_packed[u * w128..(u + 1) * w128];
+                // The row-parity bitset: one XOR per entry with a set
+                // witness bit (a word op, not a 16-byte accumulate).
+                for &(r, c, val) in &self.entries {
+                    if val.0 & 1 == 0 {
+                        continue;
+                    }
+                    if c < w_cols {
+                        if (row_words[c >> 7] >> (c & 127)) & 1 == 1 {
+                            parity[r >> 6] ^= 1u64 << (r & 63);
+                        }
+                    } else {
+                        // The constant-1 column: a fixed row flip.
                         parity[r >> 6] ^= 1u64 << (r & 63);
                     }
-                } else {
-                    // The constant-1 column: a fixed row flip.
-                    parity[r >> 6] ^= 1u64 << (r & 63);
+                }
+                let t = u >> (s - v);
+                let x_base = (u & low_mask) << rows_log2;
+                let mut pr = 0usize;
+                for blk in &parity {
+                    let mut bits = *blk;
+                    while bits != 0 {
+                        let r = pr + bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        masks[x_base + r] |= 1u64 << t;
+                    }
+                    pr += 64;
                 }
             }
-            let t = u >> (s - v);
-            let x_base = (u & low_mask) << rows_log2;
-            let mut pr = 0usize;
-            for blk in &parity {
-                let mut bits = *blk;
-                while bits != 0 {
-                    let r = pr + bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    masks[x_base + r] |= 1u64 << t;
-                }
-                pr += 64;
-            }
+        };
+        let mut masks = vec![0u64; stride];
+        if q >= 64 {
+            let chunk = (q / (rayon::current_num_threads().max(1) * 4)).max(1).min(q);
+            let combined = (0..q)
+                .into_par_iter()
+                .chunks(chunk)
+                .fold(
+                    || vec![0u64; stride],
+                    |mut local, us| {
+                        let (u0, u1) = (us[0], *us.last().expect("nonempty") + 1);
+                        build(u0, u1, &mut local);
+                        local
+                    },
+                )
+                .reduce(
+                    || vec![0u64; stride],
+                    |mut a, b| {
+                        for (x, y) in a.iter_mut().zip(b.iter()) {
+                            *x |= *y;
+                        }
+                        a
+                    },
+                );
+            masks.copy_from_slice(&combined);
+        } else {
+            build(0, q, &mut masks);
         }
         Some(masks)
     }

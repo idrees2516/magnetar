@@ -69,7 +69,12 @@ impl PublicFactor for EqFactor {
         self.point.len()
     }
     fn materialize(&self) -> Vec<Gf128> {
-        magnetar_field::EqBits::build(&self.point).values
+        // The fused build — byte-identical to EqBits::build at half the
+        // multiplications (one broadcast multiply per entry per level,
+        // the x = 0 side derived by XOR): eq materializations were the
+        // measured dominant cost of full-cube eq sites (67 ms at 2^21
+        // on the profiling host); this halves them all.
+        magnetar_field::eq_build_fused(&self.point)
     }
     fn eval_at(&self, point: &[Gf128]) -> Gf128 {
         let mut acc = ONE;

@@ -169,7 +169,7 @@ fn main() {
         let t1 = Instant::now();
         let ok = verify(&vk, &pub_in, &proof);
         let verify_ms = t1.elapsed().as_secs_f64() * 1e3;
-        assert!(ok.is_ok(), "erc20 at T=2^{log2_t} must verify");
+        assert!(ok.is_ok(), "erc20 at T=2^{log2_t} must verify: {ok:?}");
         let stats = proof_stats(&pk, &proof);
         println!(
             "{:>7} {:>10} {:>10.0} {:>10.1} {:>12.0} {:>10.0} {:>12.1} {:>11.1}",

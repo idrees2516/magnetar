@@ -68,6 +68,17 @@ enum Path {
     Bit2DensePub,
 }
 
+/// The **suffix-only** eq sub-table `eq(τ[0..ell−v], ·)` — the eq-tensor
+/// discipline (2026/587 §C.5.2): a windowed prover never materializes the
+/// full-cube eq table. The window pass reads `eq(τ_s, x)` per suffix;
+/// `finish_window` scales this table by the s-slice constant, which is
+/// byte-identical to the state `v` slab gathers of the full table would
+/// produce. Built with the fused kernel (half the multiplications of
+/// the naive build).
+fn eq_suffix_table(tau: &[Gf128], ell: usize, v: usize) -> Vec<Gf128> {
+    magnetar_field::eq_build_fused(&tau[..ell - v])
+}
+
 impl SumcheckProver {
     pub fn new(spec: &SumcheckSpec, order: BindOrder) -> Self {
         Self::with_dense_bits(spec, order, vec![false; spec.dense.len()])
@@ -120,7 +131,19 @@ impl SumcheckProver {
             "the mask window binds high-bits-first"
         );
         let bits = vec![true; 3];
-        let public_tables: Vec<Vec<Gf128>> = spec.public.iter().map(|f| f.materialize()).collect();
+        let (v, tau) = Self::window_geometry(spec, order)
+            .expect("the mask window requires the windowable shape");
+        // The eq factor materializes as the **suffix-only** sub-table
+        // `eq(τ[0..ell−v], ·)` (the eq-tensor discipline of 2026/587
+        // §C.5.2): the pass reads `eq(τ_s, x)` per suffix and the
+        // post-window state is the scaled suffix table (`finish_window`)
+        // — the full-cube eq table (`2^ell` entries, `O(2^ell)` field
+        // multiplications, `2^ell·16` bytes) is **never built**. At the
+        // erc20 shape (joint = 2^21) this deletes the dominant cost of
+        // the window construction (measured 67 ms → 1.1 ms on this host)
+        // while leaving every round message byte-identical.
+        let eq_suffix = eq_suffix_table(&tau, spec.num_vars, v);
+        let public_tables: Vec<Vec<Gf128>> = vec![eq_suffix];
         let slab_profile: Vec<Option<SlabProfile>> = spec
             .public
             .iter()
@@ -132,10 +155,9 @@ impl SumcheckProver {
                 }
             })
             .collect();
-        let window = Some(
-            Self::try_window_masks(spec, order, &masks, &public_tables)
-                .expect("the mask window requires the windowable shape"),
-        );
+        let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
+        w.run_pass_masks(&masks[0], &masks[1], &masks[2], &public_tables[0], &tau, true);
+        let window = Some(w);
         SumcheckProver {
             spec_terms: spec.terms.clone(),
             dense: vec![Vec::new(); 3],
@@ -153,14 +175,14 @@ impl SumcheckProver {
         }
     }
 
-    /// The mask-mode window build: identical shape checks to
-    /// [`Self::try_window`], then the packed pass.
-    fn try_window_masks(
+    /// The windowable-geometry check (shape only — no tables needed):
+    /// `eq(τ,·)·(D0·D1 + D2)` with the eq as the single public factor
+    /// covering the joint cube, bound high-bits-first. Returns
+    /// `(window size v, τ)` on match. Shared by both window modes.
+    fn window_geometry(
         spec: &SumcheckSpec,
         order: BindOrder,
-        masks: &[Vec<u64>],
-        public_tables: &[Vec<Gf128>],
-    ) -> Option<crate::window::WindowState> {
+    ) -> Option<(usize, Vec<Gf128>)> {
         let high = match order {
             BindOrder::HighBitsFirst { high } => high,
             _ => return None,
@@ -169,9 +191,7 @@ impl SumcheckProver {
         if v == 0 || spec.num_vars < 2 {
             return None;
         }
-        let shape = spec.dense.len() == 3
-            && spec.dense.iter().all(|d| d.is_empty())
-            && spec.terms.len() == 2
+        let shape = spec.terms.len() == 2
             && spec.terms[0].dense == vec![0, 1]
             && spec.terms[0].public == vec![0]
             && spec.terms[1].dense == vec![2]
@@ -183,8 +203,20 @@ impl SumcheckProver {
         }
         let tau = spec.public[0].eq_point()?;
         debug_assert_eq!(tau.len(), spec.num_vars);
+        Some((v.min(spec.num_vars - 1), tau))
+    }
+
+    /// The mask-mode window build (geometry + the packed pass).
+    #[allow(dead_code)]
+    fn try_window_masks(
+        spec: &SumcheckSpec,
+        order: BindOrder,
+        masks: &[Vec<u64>],
+        public_tables: &[Vec<Gf128>],
+    ) -> Option<crate::window::WindowState> {
+        let (v, tau) = Self::window_geometry(spec, order)?;
         let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
-        w.run_pass_masks(&masks[0], &masks[1], &masks[2], &public_tables[0], &tau);
+        w.run_pass_masks(&masks[0], &masks[1], &masks[2], &public_tables[0], &tau, true);
         Some(w)
     }
 
@@ -196,7 +228,28 @@ impl SumcheckProver {
     ) -> Self {
         spec.validate().expect("invalid sumcheck spec");
         assert_eq!(bits.len(), spec.dense.len(), "dense bit flags arity");
-        let public_tables: Vec<Vec<Gf128>> = spec.public.iter().map(|f| f.materialize()).collect();
+        // The window geometry for the tables mode (shape + all-three
+        // bit-flagged). On match, the eq factor materializes as the
+        // suffix-only sub-table (never the full cube) — see
+        // [`Self::with_mask_window`].
+        let geo = if auto_window
+            && spec.dense.len() == 3
+            && bits.len() == 3
+            && bits.iter().all(|&b| b)
+        {
+            Self::window_geometry(spec, order)
+        } else {
+            None
+        };
+        let public_tables: Vec<Vec<Gf128>> = spec
+            .public
+            .iter()
+            .enumerate()
+            .map(|(pi, f)| match (&geo, pi) {
+                (Some((v, tau)), 0) => eq_suffix_table(tau, spec.num_vars, *v),
+                _ => f.materialize(),
+            })
+            .collect();
         let slab_profile: Vec<Option<SlabProfile>> = spec
             .public
             .iter()
@@ -208,12 +261,19 @@ impl SumcheckProver {
                 }
             })
             .collect();
-        // The window: shape-checked, then the one-pass state build.
-        let window = if auto_window {
-            Self::try_window(spec, order, &bits, &public_tables)
-        } else {
-            None
-        };
+        let window = geo.map(|(v, tau)| {
+            let mut w =
+                crate::window::WindowState::new(spec.num_vars, v, &tau);
+            w.run_pass(
+                &spec.dense[0],
+                &spec.dense[1],
+                &spec.dense[2],
+                &public_tables[0],
+                &tau,
+                true,
+            );
+            w
+        });
         SumcheckProver {
             spec_terms: spec.terms.clone(),
             dense: spec.dense.clone(),
@@ -229,50 +289,6 @@ impl SumcheckProver {
             round: 0,
             challenges: Vec::new(),
         }
-    }
-
-    /// The windowable shape: `eq(τ,·) · (D0·D1 + D2)` with all three
-    /// dense tables bit-flagged, bound high-bits-first. The window covers
-    /// the first `min(v, high)` rounds (the top joint variables — the
-    /// strided sub-cube structure).
-    fn try_window(
-        spec: &SumcheckSpec,
-        order: BindOrder,
-        bits: &[bool],
-        public_tables: &[Vec<Gf128>],
-    ) -> Option<crate::window::WindowState> {
-        let high = match order {
-            BindOrder::HighBitsFirst { high } => high,
-            _ => return None,
-        };
-        let v = crate::window::window_size(high);
-        if v == 0 || spec.num_vars < 2 {
-            return None;
-        }
-        let shape = spec.dense.len() == 3
-            && bits.len() == 3
-            && bits.iter().all(|&b| b)
-            && spec.terms.len() == 2
-            && spec.terms[0].dense == vec![0, 1]
-            && spec.terms[0].public == vec![0]
-            && spec.terms[1].dense == vec![2]
-            && spec.terms[1].public == vec![0]
-            && spec.public.len() == 1
-            && spec.public[0].num_vars() == spec.num_vars;
-        if !shape {
-            return None;
-        }
-        let tau = spec.public[0].eq_point()?;
-        debug_assert_eq!(tau.len(), spec.num_vars);
-        let mut w = crate::window::WindowState::new(spec.num_vars, v, &tau);
-        w.run_pass(
-            &spec.dense[0],
-            &spec.dense[1],
-            &spec.dense[2],
-            &public_tables[0],
-            &tau,
-        );
-        Some(w)
     }
 
     /// Number of remaining variables.
@@ -780,24 +796,45 @@ impl SumcheckProver {
                 self.dense_bits[k] = false;
             }
         }
-        // 2. The eq factor: v slab gathers + the combined delta
-        //    (exactly what v rounds of fold_msg's slab path do).
+        // 2. The eq factor: the suffix table stands in for the full cube.
+        //    The v slab gathers of the full table are equivalent to ONE
+        //    broadcast scale by the s-slice constant `eq(τ_w, s*)` (the
+        //    gather at slice s_i keeps exactly the `eq(τ_i, s_i)` factor
+        //    and drops the other slice), so
+        //      public_tables[0] := eq(τ_w, s*) · eq_suffix
+        //    is byte-identical to the gathered state — and the
+        //    coefficients absorb the per-round `eq(τ, r)/eq(τ, s)`
+        //    deltas exactly as before.
         let mut delta_total = ONE;
+        let mut slice_const = ONE;
         for i in 0..w.v {
             let orig_var = self.order.round_var(self.num_vars, i);
-            let bit = self.order.current_bit(self.num_vars, i);
             let r_i = self.challenges[i];
-            match self.slab_profile[0].as_ref().map(|p| p[orig_var].clone()) {
-                Some(EqSlabInfo::Covered(tau_v)) => {
-                    let slice = tau_v == ONE; // eq(τ, s) ≠ 0 at s = 1 iff τ = 1
-                    par_gather_bit_at(&mut self.public_tables[0], bit, slice);
-                    let eq_r_v = ONE + tau_v + r_i;
-                    let eq_s = if slice { tau_v } else { ONE + tau_v };
-                    delta_total = mul(delta_total, mul(eq_r_v, inv(eq_s)));
-                }
-                _ => {
-                    par_gather_bit_at(&mut self.public_tables[0], bit, false);
-                }
+            if let Some(EqSlabInfo::Covered(tau_v)) =
+                self.slab_profile[0].as_ref().map(|p| p[orig_var].clone())
+            {
+                let slice = tau_v == ONE; // eq(τ, s) ≠ 0 at s = 1 iff τ = 1
+                let eq_r_v = ONE + tau_v + r_i;
+                let eq_s = if slice { tau_v } else { ONE + tau_v };
+                delta_total = mul(delta_total, mul(eq_r_v, inv(eq_s)));
+                // The s-slice value this round's gather would keep.
+                slice_const = mul(slice_const, eq_s);
+            }
+            // Uncovered (constant in this variable): the gather is
+            // scale-free — no contribution to either constant.
+        }
+        if slice_const != ONE {
+            // One broadcast-multiply pass (a scratch copy keeps the two
+            // borrows distinct; the suffix table is at most 2^{ell−v}
+            // entries, a fraction of the full-cube table it replaces).
+            // `mul_run` consumes only whole SIMD lanes — the scalar tail
+            // completes it (the same discipline as eq_build_fused_into).
+            let src = self.public_tables[0].clone();
+            let t0 = &mut self.public_tables[0];
+            let n = t0.len();
+            let done = magnetar_field::avx::mul_run(t0, &src, slice_const, n);
+            for k in done..n {
+                t0[k] = mul(src[k], slice_const);
             }
         }
         if delta_total != ONE {
@@ -826,6 +863,13 @@ impl SumcheckProver {
     /// Current running claim.
     pub fn running(&self) -> Gf128 {
         self.running
+    }
+
+    /// Test-only view of the public-factor tables and term coefficients
+    /// (cross-validation of prover-internal state transitions).
+    #[doc(hidden)]
+    pub fn debug_public_state(&self) -> (&[Vec<Gf128>], &[Gf128]) {
+        (&self.public_tables, &self.coeffs)
     }
 
     /// The challenges sampled so far (in binding order) — for protocols

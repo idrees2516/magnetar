@@ -833,6 +833,7 @@ dependencies = [
  "magnetar-hash",
  "magnetar-sumcheck",
  "rand",
+ "rayon",
 ]
 
 [[package]]

@@ -697,3 +697,27 @@ cargo run --release --bin magnetar profiles    # the dual-rate tails + wrap
 
 All numbers above are from single runs on the development container;
 treat ±10% as noise for the prove times and exact for the byte counts.
+
+## The 0.13.0 re-measurement (the eq-tensor release)
+
+The eq-tensor suffix item (2026/587 §C.5.2) deleted the full-cube eq
+materialization from every windowed outer. Re-measured on the 2-vCPU
+development container (this is a *smaller* host than the 4-vCPU EPYC of
+the sections above — compare the ratios, not the absolute times),
+`erc20-mixed-block`, cpi=1, three runs per row, every proof verified:
+
+| T | tx | prove before | prove after | cycles/s before | cycles/s after | RSS before | RSS after |
+|---|---|---|---|---|---|---|---|
+| 2^10 | 85 | 138 ms | 116 ms | 7,443 | 8,823 | 45.9 MiB | 45.1 MiB |
+| 2^11 | 170 | 246 ms | 216 ms | 8,321 | 9,492 | 85.0 MiB | 70.4 MiB |
+| 2^12 | 341 | 492 ms | 410 ms | 8,321 | 9,987 | 156.6 MiB | 116.5 MiB |
+
+Phase-level (MAGNETAR_TIME=1, 2^12): `vs-win-build` 83.2 → 10.7 ms
+(the windowed outer's eq materialize — a 2^21-entry, 32 MiB table —
+replaced by the 2^15-entry suffix table), `3-prove_inner` 344.8 →
+256.0 ms, `7-mosaic-discharge` 100.8 → 99.3 ms (unchanged path). The
+microbench (the real circuit matrices, the erc20 shape, single run):
+eq full-cube materialize 66.9 ms → suffix build 1.1 ms; mask build
+48.6 → 24.6 ms (parallel); fld tables 36.1 → 22.8 ms (parallel);
+window construction (materialize + pass) 98.1 → 36.9 ms.
+

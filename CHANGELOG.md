@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.13.0 — the eq-tensor release: suffix-only eq in the round window, fused eq materialization, parallel SIMD applications
+
+The first Phase-0 engine-algebra item of the deep-research report II
+(2026/587 §C.5.2 — "precompute the suffix weights, never the full-cube
+eq"), landed with the byte-identity discipline: every round message is
+bit-identical to the previous release's, cross-validated by the window
+state-comparison tests (200 random draws across shapes incl. v == high)
+and the full 222-test suite.
+
+### The eq-tensor suffix discipline (`magnetar-sumcheck`)
+* **Suffix-only eq tables in the round window**: the windowed prover
+  (both modes — packed masks and bit tables) materializes
+  `eq(τ[0..ell−v], ·)` over the *suffix* variables only (2^{ell−v}
+  entries) instead of the full-cube eq (2^ell entries, O(2^ell) field
+  multiplications, 2^ell·16 bytes resident). The pass reads
+  `eq(τ_s, x)` per suffix directly (no 1/eq(τ_w, m*) post-scale).
+* **The scaled-suffix fast-forward**: `finish_window` replaces the v
+  slab gathers of the full table with ONE broadcast multiply by the
+  s-slice constant `eq(τ_w, s*)` — provably the gathered state
+  (`public_tables[0] := eq(τ_w, s*) · eq_suffix`, byte-identical; the
+  scalar tail after `mul_run`'s SIMD lanes is completed in-pass).
+* **Fused eq materialization everywhere** (`EqFactor::materialize` now
+  goes through `eq_build_fused` — one broadcast multiply per entry per
+  level, half the reference build's multiplications).
+* Measured at the erc20 shape (joint 2^21): the bin-outer window
+  construction 98.1 ms → 36.9 ms on the profiling host; the eq
+  materialize itself 66.9 ms → 1.1 ms (the suffix build).
+
+### Parallel SIMD applications (`magnetar-spartan`)
+* `apply_simd_bit_masks` (the packed mask build) and
+  `apply_simd_packed` (the field-table build) now run rayon-parallel
+  across instances — disjoint output ranges for the field tables
+  (R7.1), per-worker local masks OR-combined for the shared mask words
+  (order-free, R1). Bit-identical to the sequential loops.
+
+### Measured (the 2-vCPU development container, cpi=1, three runs)
+| T | before | after | cycles/s before → after | RSS before → after |
+|---|---|---|---|---|
+| 2^10 | 138 ms | 116 ms | 7,443 → 8,823 (+18.5%) | 45.9 → 45.1 MiB |
+| 2^11 | 246 ms | 216 ms | 8,321 → 9,492 (+14.1%) | 85.0 → 70.4 MiB |
+| 2^12 | 492 ms | 410 ms | 8,321 → 9,987 (+20.0%) | 156.6 → 116.5 MiB (−26%) |
+
+The phase anatomy at 2^12: `vs-win-build` 83.2 → 10.7 ms (the eq
+materialize deleted; the pass now dominates), `3-prove_inner`
+344.8 → 256.0 ms, the eq suffix table replacing a 32 MiB resident
+table per windowed outer.
+
+
 ## 0.12.0 — BinarySpartan on the Mikros stack: the production SNARK path for R1CS
 
 *BinarySpartan* (Setty, *BinarySpartan: Spartan over binary fields*, IACR

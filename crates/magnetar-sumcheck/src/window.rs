@@ -167,6 +167,7 @@ impl WindowState {
         d2: &[Gf128],
         eq_table: &[Gf128],
         tau: &[Gf128],
+        suffix_mode: bool,
     ) {
         let stride = self.stride;
         let v = self.v;
@@ -176,6 +177,7 @@ impl WindowState {
             |x| mobius_mask(d2, x, stride, v),
             eq_table,
             tau,
+            suffix_mode,
         );
     }
 
@@ -192,6 +194,7 @@ impl WindowState {
         m2: &[u64],
         eq_table: &[Gf128],
         tau: &[Gf128],
+        suffix_mode: bool,
     ) {
         let v = self.v;
         self.run_pass_inner(
@@ -200,11 +203,20 @@ impl WindowState {
             |x| mobius_from_packed(m2[x], v),
             eq_table,
             tau,
+            suffix_mode,
         );
     }
 
     /// The generic pass core: `f_i(x)` returns table `i`'s Möbius mask
     /// at suffix `x`.
+    ///
+    /// `suffix_mode`: `eq_table` is the **suffix-only** eq sub-table
+    /// `eq(τ[0..ell−v], ·)` (the paper's C.5.2 discipline — never
+    /// materialize the full-cube eq): the per-suffix weight is read
+    /// directly at `eq_table[x]` and the `1/eq(τ_w, m*)` post-scale is
+    /// skipped (the accumulators land suffix-weighted, exactly the
+    /// values the full-table stripe read + post-scale produces — the
+    /// states, and therefore every round message, are byte-identical).
     #[allow(clippy::too_many_arguments)]
     fn run_pass_inner(
         &mut self,
@@ -213,6 +225,7 @@ impl WindowState {
         f2: impl Fn(usize) -> u64 + Send + Sync,
         eq_table: &[Gf128],
         tau: &[Gf128],
+        suffix_mode: bool,
     ) {
         let v = self.v;
         let stride = self.stride;
@@ -234,8 +247,16 @@ impl WindowState {
                 eq_hi = mul(eq_hi, ONE + tau_t);
             }
         }
-        let eq_base = m_star * stride;
-        let eq_hi_inv = inv(eq_hi);
+        let eq_base = if suffix_mode { 0 } else { m_star * stride };
+        let eq_hi_inv = if suffix_mode { ONE } else { inv(eq_hi) };
+        debug_assert!(
+            if suffix_mode {
+                eq_table.len() == stride
+            } else {
+                eq_table.len() >= eq_base + stride
+            },
+            "eq table geometry"
+        );
 
         // The dense-mask complement form. The pair convolution is
         // GF(2)-bilinear in the two masks, so with `a`/`b` the SPARSER of
@@ -290,8 +311,9 @@ impl WindowState {
                     let m0 = f0(x);
                     let m1 = f1(x);
                     let m2 = f2(x);
-                    // The eq-weighted pack: eq(τ_s, x') = the stripe entry
-                    // scaled by 1/eq(τ_w, m*) (applied once at the end).
+                    // The eq-weighted pack: full mode reads the stripe
+                    // entry (scaled by 1/eq(τ_w, m*) once at the end);
+                    // suffix mode reads eq(τ_s, x) directly.
                     let w = eq_table[eq_base + x];
                     if w == ZERO {
                         continue;
@@ -666,7 +688,7 @@ mod tests {
             .collect();
         let eqt = magnetar_field::EqBits::build(&tau).values;
         let mut w = WindowState::new(ell, v, &tau);
-        w.run_pass(&d0t, &d1t, &d2t, &eqt, &tau);
+        w.run_pass(&d0t, &d1t, &d2t, &eqt, &tau, false);
         // Brute-force the pre-bind state: Qhat[(e2,e1,e0)] = Σ_{x'} eq_s(x')
         // · chat[(e2,e1,e0)](x') where chat = the monomial coefficients of
         // the product over the window sub-cube.

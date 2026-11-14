@@ -47,7 +47,7 @@ fn run_collect(
 #[test]
 fn window_matches_generic_messages() {
     let mut rng = rand::rng();
-    for num_vars in [7usize, 9, 12] {
+    for (num_vars, high) in [(7usize, 6usize), (9, 6), (12, 6), (13, 4), (11, 3), (9, 2)] {
         let n = 1usize << num_vars;
         let az: Vec<Gf128> = (0..n).map(|_| bit(&mut rng)).collect();
         let bz: Vec<Gf128> = (0..n).map(|_| bit(&mut rng)).collect();
@@ -184,5 +184,83 @@ fn window_proof_verifies() {
         assert_eq!(dense_claims[0], eval(&az));
         assert_eq!(dense_claims[1], eval(&bz));
         assert_eq!(dense_claims[2], eval(&cz));
+    }
+}
+
+
+#[test]
+fn window_state_matches_generic_state() {
+    let mut rng = rand::rng();
+    for _trial in 0..200 {
+    let num_vars = 7usize;
+    let n = 1usize << num_vars;
+    let az: Vec<Gf128> = (0..n).map(|_| bit(&mut rng)).collect();
+    let bz: Vec<Gf128> = (0..n).map(|_| bit(&mut rng)).collect();
+    let cz: Vec<Gf128> = (0..n).map(|_| bit(&mut rng)).collect();
+    let tau: Vec<Gf128> = (0..num_vars)
+        .map(|i| {
+            if i % 3 == 0 {
+                bit(&mut rng)
+            } else {
+                rg(&mut rng)
+            }
+        })
+        .collect();
+    let spec = SumcheckSpec {
+        num_vars,
+        dense: vec![az.clone(), bz.clone(), cz.clone()],
+        public: vec![Box::new(EqFactor::new(tau.clone()))],
+        terms: vec![
+            Term { coeff: ONE, dense: vec![0, 1], public: vec![0] },
+            Term { coeff: ONE, dense: vec![2], public: vec![0] },
+        ],
+        claim: ZERO,
+    };
+    let order = BindOrder::HighBitsFirst { high: 6 };
+    let bits = vec![true, true, true];
+    let mk = |window: bool| {
+        let mut p = if window {
+            SumcheckProver::with_dense_bits_auto_window(&spec, order, bits.clone())
+        } else {
+            SumcheckProver::with_dense_bits(&spec, order, bits.clone())
+        };
+        for _ in 0..6 {
+            let m = p.message();
+            let mut x = 0x9E3779B97F4A7C15u64;
+            for &c in &m.0[..=1.min(m.0.len() - 1)] {
+                x ^= c.0 as u64;
+            }
+            let r = Gf128((x as u128) << 64 | (x.rotate_left(17) as u128));
+            p.fold_msg(&m, r);
+        }
+        p
+    };
+    let pw = mk(true);
+    let pg = mk(false);
+    for (k, (w, g)) in pw
+        .dense_tables()
+        .iter()
+        .zip(pg.dense_tables().iter())
+        .enumerate()
+    {
+        assert_eq!(w.len(), g.len(), "table {k} length (trial {_trial})");
+        for (i, (a, b)) in w.iter().zip(g.iter()).enumerate() {
+            assert_eq!(a, b, "table {k} entry {i} (trial {_trial}): windowed {:032x} vs generic {:032x}", a.0, b.0);
+        }
+    }
+    let (wp, wc) = pw.debug_public_state();
+    let (gp, gc) = pg.debug_public_state();
+    for (k, (w, g)) in wp.iter().zip(gp.iter()).enumerate() {
+        for (i, (a, b)) in w.iter().zip(g.iter()).enumerate() {
+            assert_eq!(a, b, "PUBLIC table {k} entry {i} (trial {_trial}): windowed {:032x} vs generic {:032x}", a.0, b.0);
+        }
+    }
+    for (ti, (a, b)) in wc.iter().zip(gc.iter()).enumerate() {
+        assert_eq!(a, b, "coeff {ti} (trial {_trial}): windowed {:032x} vs generic {:032x}", a.0, b.0);
+    }
+    // And the message right after the window.
+    let m7w = pw.message();
+    let m7g = pg.message();
+    assert_eq!(m7w, m7g, "post-window message (trial {_trial})");
     }
 }
