@@ -422,26 +422,34 @@ impl<'a> LocalDischarge<'a> {
     fn window_message(&self) -> RoundMsg {
         let j = self.round;
         let coord = self.v - 1 - j;
+        let fmask = (1usize << coord) - 1;
         let mut c0 = ZERO;
         let mut c1 = ZERO;
         let mut c2 = ZERO;
         for (item, q) in self.q.iter().enumerate() {
             let mut a0 = ZERO;
             let mut a1 = ZERO;
+            // The future-coordinate τ products, hoisted per item per round
+            // (the many-multilinear-products discipline): one subset-product
+            // table `ftp[s] = Π_{t ∈ s} τ_t` over the 2^coord future patterns
+            // (≤ 2^5 = 32 muls), then every entry's weight is a LOOKUP —
+            // not an inner mul loop (the per-entry cost was popcount(m)
+            // muls ≈ 3-4; now 1). Byte-identical: the products are the same.
+            let mut ftp = Vec::with_capacity(1usize << coord);
+            ftp.push(ONE);
+            for t in 0..coord {
+                let tau_t = self.tau_w[item][self.v - 1 - t];
+                let half = ftp.len();
+                for s in 0..half {
+                    ftp.push(mul(ftp[s], tau_t));
+                }
+            }
             for (m, &val) in q.iter().enumerate() {
                 if val == ZERO {
                     continue;
                 }
-                // The future coordinates (t < coord) each contribute their
-                // item-specific τ when the monomial covers them
-                // (`Σ_b eq(τ,b)·b^e = τ` for `e ≥ 1`, `1` for `e = 0`).
-                let mut fw = ONE;
-                for t in 0..coord {
-                    if (m >> t) & 1 == 1 {
-                        fw = mul(fw, self.tau_w[item][self.v - 1 - t]);
-                    }
-                }
-                let w = mul(val, fw);
+                // fw = the future τ-product over m's covered future coords.
+                let w = mul(val, ftp[m & fmask]);
                 if (m >> coord) & 1 == 1 {
                     a1 += w;
                 } else {

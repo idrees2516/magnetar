@@ -47,7 +47,7 @@
 
 use crate::twist::PortRun;
 use crate::{AddressComponent, TwistInstance};
-use magnetar_field::{bind_var, mul, par_bind_var, Gf128, ONE, ZERO};
+use magnetar_field::{bind_var, mul, par_bind_var, square, Gf128, ONE, ZERO};
 use magnetar_hash::Transcript;
 
 /// `eq(c, b) = 1 + c + b` for a Boolean `b` (branch-free, char 2).
@@ -984,6 +984,144 @@ pub fn prove_selector_linear(
 
 use crate::cross_step::CrossStepSpec;
 
+// ---------------------------------------------------------------------------
+// The linear Δ* one-hotness sum-check (shout::prove_onehot's core).
+// ---------------------------------------------------------------------------
+
+use crate::OneHotProof;
+
+/// The linear Δ* one-hotness sum-check (the 587 many-multilinear-products
+/// discipline, char-2 form): prove
+/// `Σ_j eq(ρ, j)·[Â(r, j)³ + C·Â(r', j)] = 0` over the cycle cube,
+/// binding the cycle variables in increasing order.
+///
+/// The summand is a product of four multilinear factors (eq × R × R × R)
+/// plus the eq × R' term. Instead of the dense engine's per-position outer
+/// product (`generic_n`, ~20 CLMULs/position), the rounds run on
+/// **weight-hoisted pair arithmetic**:
+///
+/// * the eq factor splits per round as `(1+ρ_b) + X` over the round
+///   variable and `w_i = eq(ρ_{b+1..}, i)` over the still-Boolean
+///   positions — the `(1+ρ_b)`/`1` parts apply at message assembly, so
+///   only the **suffix eq table** multiplies the per-position products
+///   (4 weighted products for the cube, 2 for the C·R' term);
+/// * the cube's pair products use the char-2 fresh trinomial
+///   `(a0 + X·(a0+a1))³ = a0³ + X·a0²s + X²·a0s² + X³·s³` — the four
+///   coefficients come from the P-products `[a0³, a0²·a1, a0·a1², a1³]`
+///   (6 CLMULs: two squarings and four products), with `s² = a0² + a1²`
+///   free (Frobenius);
+/// * the bound coordinates fold into the running constant
+///   `eqv = Π_{i<b} eq(ρ_i, c_i)`; the still-Boolean eq table is rebuilt
+///   per round (`O(2^{n-b})`, one tensor build — never a per-round eq
+///   materialization of the full cube).
+///
+/// ~12 CLMULs per position against the dense engine's ~21, messages
+/// byte-identical (cross-validated by `onehot_linear_matches_dense`); the
+/// verifier is unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_onehot_linear(
+    row_r: &[Gf128],
+    row_rp: &[Gf128],
+    rho: &[Gf128],
+    r: &[Gf128],
+    r_prime: &[Gf128],
+    c_product: Gf128,
+    label: &str,
+    t: &mut Transcript,
+) -> (OneHotProof, Vec<Gf128>) {
+    let n = rho.len();
+    debug_assert_eq!(row_r.len(), 1usize << n);
+    debug_assert_eq!(row_rp.len(), 1usize << n);
+    let mut r_tab = row_r.to_vec();
+    let mut rp_tab = row_rp.to_vec();
+    let mut rounds: Vec<Vec<Gf128>> = Vec::with_capacity(n);
+    let mut challenges: Vec<Gf128> = Vec::with_capacity(n);
+    let mut eqv = ONE;
+    let absorb = |t: &mut Transcript, coeffs: &[Gf128; 5]| -> Gf128 {
+        let mut buf = Vec::with_capacity(5 * 16);
+        for c in coeffs {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*c));
+        }
+        t.absorb_bytes(label, &buf);
+        t.challenge_field(label)
+    };
+    for b in 0..n {
+        let half = 1usize << (n - 1 - b);
+        // The suffix eq table over the still-Boolean bits b+1..n-1.
+        let w = magnetar_field::EqBits::build(&rho[b + 1..]).values;
+        debug_assert_eq!(w.len(), half);
+        let a_const = ONE + rho[b];
+        let mut sp = [ZERO; 4]; // Σ w·[a0³, a0²a1, a0a1², a1³]
+        let mut t0 = ZERO; // Σ w·r0
+        let mut t1 = ZERO; // Σ w·(r0+r1)
+        for i in 0..half {
+            // Increasing order: the round binds the table's variable 0 —
+            // the pair is (t[2i], t[2i+1]), the position i = bits b+1..n-1.
+            let a0 = r_tab[i << 1];
+            let a1 = r_tab[(i << 1) | 1];
+            let r0 = rp_tab[i << 1];
+            let r1 = rp_tab[(i << 1) | 1];
+            let wi = w[i];
+            // The char-2 pair-cube: 6 CLMULs for the four P-products.
+            let q0 = square(a0);
+            let q1 = square(a1);
+            let p0 = mul(a0, q0);
+            let p1 = mul(q0, a1);
+            let p2 = mul(a0, q1);
+            let p3 = mul(a1, q1);
+            sp[0] += mul(wi, p0);
+            sp[1] += mul(wi, p1);
+            sp[2] += mul(wi, p2);
+            sp[3] += mul(wi, p3);
+            t0 += mul(wi, r0);
+            t1 += mul(wi, r0 + r1);
+        }
+        // The cube's round-polynomial coefficients (the X-degree-3 part of
+        // (a0 + X·s)³), as sums: cube_0 = P0; cube_1 = P0+P1; cube_2 =
+        // P0+P2; cube_3 = P0+P1+P2+P3.
+        let s0 = sp[0];
+        let s1 = sp[0] + sp[1];
+        let s2 = sp[0] + sp[2];
+        let s3 = sp[0] + sp[1] + sp[2] + sp[3];
+        // m(X) = eqv·((1+ρ_b) + X)·[(cube part) + C·(R'0 + X·(R'0+R'1))]:
+        // c_k = eqv·[a_const·S_k + S_{k-1} + C·(the R' pair's k-th)].
+        let c = eqv;
+        let cp = c_product;
+        let coeffs = [
+            mul(c, mul(a_const, s0) + mul(cp, mul(a_const, t0))),
+            mul(c, mul(a_const, s1) + s0 + mul(cp, mul(a_const, t1) + t0)),
+            mul(c, mul(a_const, s2) + s1 + mul(cp, t1)),
+            mul(c, mul(a_const, s3) + s2),
+            mul(c, s3),
+        ];
+        if rounds.is_empty() {
+            // m(0) + m(1) = the claim (ZERO): c_0 cancels in char two.
+            debug_assert_eq!(
+                coeffs[1] + coeffs[2] + coeffs[3] + coeffs[4],
+                ZERO,
+                "onehot round 0 must sum to the claim"
+            );
+        }
+        let ch = absorb(&mut *t, &coeffs);
+        rounds.push(coeffs.to_vec());
+        challenges.push(ch);
+        eqv = mul(eqv, ONE + rho[b] + ch);
+        bind_var(&mut r_tab, 0, ch);
+        bind_var(&mut rp_tab, 0, ch);
+    }
+    (
+        OneHotProof {
+            rounds,
+            v_at_r: r_tab[0],
+            v_at_rp: rp_tab[0],
+            r: r.to_vec(),
+            r_prime: r_prime.to_vec(),
+            c_product,
+        },
+        challenges,
+    )
+}
+
 /// The linear S1 sum-check: `Σ_{k,k',t,h,j} A(k,j)·ASH(k',j)·L_t(t,j)·
 /// L_h(h,j)·eq(r_j,j)·(α₀ + γ·TT(k,k',t,h)) = α₀ + γ` over the joint
 /// `(k | k' | t | h | j)` layout, bound in increasing order. Round messages
@@ -1376,6 +1514,95 @@ mod st1_tests {
             }
             assert_eq!(pt, e_pt, "challenge point (ad={ad}, n={n})");
             assert_eq!(claim, e_claim, "component claim (ad={ad}, n={n})");
+        }
+    }
+}
+
+#[cfg(test)]
+mod onehot_tests {
+    use super::*;
+
+    /// The linear Δ* prover emits **byte-identical** round messages,
+    /// challenges, and terminal claims to the generic dense engine's for
+    /// the same statement — the cross-validation that gates its use in
+    /// the protocol (the verifier is unchanged).
+    #[test]
+    fn onehot_linear_matches_dense() {
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        for &(ad, n) in &[(3usize, 5usize), (5, 6), (8, 4), (4, 1)] {
+            let cycles = 1usize << n;
+            // A random one-hot component (exactly one set bit per cycle).
+            let mut b = vec![false; (1usize << ad) * cycles];
+            for j in 0..cycles {
+                b[rng.random_range(0..(1usize << ad)) + j * (1usize << ad)] = true;
+            }
+            let comp = crate::AddressComponent::from_bits(ad, n, &b);
+            let addr = addr_bits(std::slice::from_ref(&comp));
+            // Identically-seeded transcripts: the refined points and rho
+            // sampled the same way on both sides.
+            let (r, r_prime, c_product, rho) = {
+                let mut t = magnetar_hash::Transcript::new("oh", &[b"test"]);
+                let (r, rp, c) = crate::sample_refined_points(&mut t, ad);
+                let rho = t.challenge_field_vec("oh-rho", n);
+                (r, rp, c, rho)
+            };
+            let row_r = comp.row_at_sparse(&r, &addr);
+            let row_rp = comp.row_at_sparse(&r_prime, &addr);
+            // ---- the generic dense engine (the old path). ----
+            let (e_rounds, e_pt, e_vr, e_vrp) = {
+                use magnetar_sumcheck::public::EqFactor;
+                let spec = magnetar_sumcheck::SumcheckSpec {
+                    num_vars: n,
+                    dense: vec![row_r.clone(), row_rp.clone()],
+                    public: vec![Box::new(EqFactor::new(rho.clone()))],
+                    terms: vec![
+                        magnetar_sumcheck::Term {
+                            coeff: ONE,
+                            dense: vec![0, 0, 0],
+                            public: vec![0],
+                        },
+                        magnetar_sumcheck::Term {
+                            coeff: c_product,
+                            dense: vec![1],
+                            public: vec![0],
+                        },
+                    ],
+                    claim: ZERO,
+                };
+                let mut pr = magnetar_sumcheck::engine::SumcheckProver::new(
+                    &spec,
+                    magnetar_sumcheck::BindOrder::Increasing,
+                );
+                let mut rounds = Vec::new();
+                let mut t = magnetar_hash::Transcript::new("oh", &[b"test"]);
+                crate::sample_refined_points(&mut t, ad); // consume identically
+                t.challenge_field_vec("oh-rho", n);
+                for _ in 0..n {
+                    let msg = pr.message();
+                    rounds.push(msg.0.clone());
+                    pr.absorb_and_fold(&mut t, "oh");
+                }
+                let pt = pr.challenges();
+                let (claims, _) = pr.finish();
+                (rounds, pt, claims[0], claims[1])
+            };
+            // ---- the linear prover (same transcript schedule: the
+            // refined points and rho consumed first, then the rounds). ----
+            let mut t = magnetar_hash::Transcript::new("oh", &[b"test"]);
+            crate::sample_refined_points(&mut t, ad);
+            t.challenge_field_vec("oh-rho", n);
+            let (proof, pt) = prove_onehot_linear(
+                &row_r, &row_rp, &rho, &r, &r_prime, c_product, "oh", &mut t,
+            );
+            assert_eq!(proof.rounds.len(), e_rounds.len(), "round count (ad={ad}, n={n})");
+            for (m, e) in proof.rounds.iter().zip(e_rounds.iter()) {
+                assert_eq!(m, e, "round message (ad={ad}, n={n})");
+                assert_eq!(m.len(), 5, "degree-4 shape: 5 coefficients");
+            }
+            assert_eq!(pt, e_pt, "challenge point (ad={ad}, n={n})");
+            assert_eq!(proof.v_at_r, e_vr, "v_at_r (ad={ad}, n={n})");
+            assert_eq!(proof.v_at_rp, e_vrp, "v_at_rp (ad={ad}, n={n})");
         }
     }
 }

@@ -743,6 +743,172 @@ pub fn verify_leaf(
     }
 }
 
+// ---------------------------------------------------------------------------
+// The batched multi-opening (the Canopy-class opening compression): several
+// value indices authenticated against ONE root with the UNION copath —
+// every root-path sibling serialized once, digest-only, in canonical
+// (level, position) order the verifier recomputes from the indices.
+// ---------------------------------------------------------------------------
+
+/// A batched multi-opening of a set of VALUE indices.
+#[derive(Clone, Debug)]
+pub struct MultiOpen {
+    /// The deduplicated, ascending covering group indices (level 0
+    /// positions of the queried values' leaf groups).
+    pub groups: Vec<usize>,
+    /// The covering groups' leaf digests (parallel to `groups`).
+    pub group_digests: Vec<[u8; DIGEST]>,
+    /// The union copath positions `(level, position)`, ascending by level
+    /// then position — the serialization order of `siblings`; the
+    /// verifier recomputes this list from `groups`, so the proof carries
+    /// digests only, no per-node metadata.
+    pub copath: Vec<(usize, usize)>,
+    /// The sibling digests (parallel to `copath`).
+    pub siblings: Vec<[u8; DIGEST]>,
+}
+
+impl MerkleTree {
+    /// Open several VALUE indices at once: the union of their root-path
+    /// siblings. For `q` queries over a depth-`d` tree this serializes
+    /// `|copath| ≤ q·d` digests (the shared top levels counted once)
+    /// instead of `q·d` — the correlated-opening compression.
+    pub fn open_multi(&self, value_indices: &[usize]) -> MultiOpen {
+        assert!(!value_indices.is_empty(), "multi-open needs indices");
+        let mut groups: Vec<usize> = value_indices
+            .iter()
+            .map(|&i| {
+                assert!(i < self.n_leaves, "multi-open index out of range");
+                if self.width == 1 { i } else { i / self.width }
+            })
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let group_digests = groups.iter().map(|&g| self.levels[0][g]).collect();
+        let depth = self.levels.len() - 1;
+        let mut seen = std::collections::BTreeSet::new();
+        for &g in &groups {
+            let mut idx = g;
+            for lvl in 0..depth {
+                seen.insert((lvl, idx ^ 1));
+                idx >>= 1;
+            }
+        }
+        let copath: Vec<(usize, usize)> = seen.into_iter().collect();
+        let siblings = copath
+            .iter()
+            .map(|&(l, pos)| self.levels[l][pos])
+            .collect();
+        MultiOpen { groups, group_digests, copath, siblings }
+    }
+
+    /// Verify a batched multi-opening for VALUE indices: the caller
+    /// supplies each covering group's values (exactly `width` per group,
+    /// in ascending group order) and the union copath digests in the
+    /// canonical (level, position) order recomputed from the indices.
+    /// The leaf digests are hashed HERE from the revealed values, the
+    /// root is reconstructed by pairing known nodes level by level, and
+    /// the recomputed root is returned for the caller's comparison with
+    /// the commitment — the standard Merkle binding: any deviation of a
+    /// revealed group from the committed leaf breaks the reconstruction
+    /// exactly as an individual opening would.
+    pub fn verify_multi_batched(
+        domain: &str,
+        n_values: usize,
+        width: usize,
+        value_indices: &[usize],
+        group_values: &[Vec<magnetar_field::Gf128>],
+        copath: &[[u8; DIGEST]],
+    ) -> Result<[u8; DIGEST], &'static str> {
+        if !n_values.is_power_of_two() || n_values == 0 {
+            return Err("multi: bad value count");
+        }
+        if !(width == 1 || width.is_power_of_two()) {
+            return Err("multi: bad width");
+        }
+        if !n_values.is_multiple_of(width) {
+            return Err("multi: width does not tile");
+        }
+        if value_indices.is_empty() {
+            return Err("multi: no indices");
+        }
+        for &i in value_indices {
+            if i >= n_values {
+                return Err("multi: index out of range");
+            }
+        }
+        // The expected group set (ascending, dedup).
+        let mut want_groups: Vec<usize> =
+            value_indices.iter().map(|&i| i / width).collect();
+        want_groups.sort_unstable();
+        want_groups.dedup();
+        if group_values.len() != want_groups.len() {
+            return Err("multi: group value count mismatch");
+        }
+        // The expected union copath positions (the canonical order the
+        // digests must arrive in).
+        let n_groups = n_values / width;
+        let depth = if n_groups == 1 {
+            0
+        } else {
+            n_groups.trailing_zeros() as usize
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for &g in &want_groups {
+            let mut idx = g;
+            for lvl in 0..depth {
+                seen.insert((lvl, idx ^ 1));
+                idx >>= 1;
+            }
+        }
+        let want_copath: Vec<(usize, usize)> = seen.into_iter().collect();
+        if copath.len() != want_copath.len() {
+            return Err("multi: copath length mismatch");
+        }
+        // Hash the revealed groups into the leaf level.
+        let mut known: std::collections::BTreeMap<(usize, usize), [u8; DIGEST]> =
+            std::collections::BTreeMap::new();
+        for (gi, &g) in want_groups.iter().enumerate() {
+            if group_values[gi].len() != width {
+                return Err("multi: group width mismatch");
+            }
+            let d = if width == 1 {
+                LeafHashPrefix::new(domain, n_values).hash(g, group_values[gi][0])
+            } else {
+                BatchedLeafHashPrefix::new(domain, n_values, width)
+                    .hash_group(g, &group_values[gi])
+            };
+            known.insert((0, g), d);
+        }
+        for (k, &(l, pos)) in want_copath.iter().enumerate() {
+            known.insert((l, pos), copath[k]);
+        }
+        // Reconstruct upward.
+        for lvl in 0..depth {
+            let at_level: Vec<usize> = known
+                .keys()
+                .filter(|&&(l, _)| l == lvl)
+                .map(|&(_, p)| p)
+                .collect();
+            for p in at_level {
+                if p % 2 == 1 {
+                    continue; // handled from the even side
+                }
+                let sib = p + 1;
+                if let Some(&right) = known.get(&(lvl, sib)) {
+                    let node_pfx = NodeHashPrefix::new(domain, lvl as u64);
+                    let left = known[&(lvl, p)];
+                    let parent = node_pfx.hash(&left, &right);
+                    known.insert((lvl + 1, p >> 1), parent);
+                }
+            }
+        }
+        known
+            .get(&(depth, 0))
+            .copied()
+            .ok_or("multi: reconstruction did not reach the root")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The prefix-path digests must be bit-identical to the generic
@@ -854,5 +1020,134 @@ mod tests {
         for c in counts {
             assert!(c > 700, "distribution too skewed: {counts:?}");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod multi_open_tests {
+    use super::*;
+    use magnetar_field::Gf128;
+
+    fn build_tree(n: usize, width: usize) -> (MerkleTree, Vec<Gf128>) {
+        let mut rng_val = 0x9E3779B97F4A7C15u128;
+        let values: Vec<Gf128> = (0..n)
+            .map(|i| {
+                rng_val = rng_val.wrapping_mul(0x2545F4914F6DD1BE).wrapping_add(i as u128);
+                Gf128(rng_val)
+            })
+            .collect();
+        let tree = if width == 1 {
+            MerkleTree::build("multi-test", &values)
+        } else {
+            MerkleTree::build_batched("multi-test", &values, width)
+        };
+        (tree, values)
+    }
+
+    /// The multi-open's reconstruction must equal the individually verified
+    /// roots, and the union copath must be smaller than q separate paths.
+    #[test]
+    fn multi_open_matches_individual() {
+        for &(n, width, q) in &[
+            (1024usize, 8usize, 14usize),
+            (4096, 8, 14),
+            (1024, 1, 5),
+            (256, 8, 20),
+            (64, 8, 3),
+        ] {
+            let (tree, values) = build_tree(n, width);
+            // Deterministic pseudo-random query indices (distinct modulo n).
+            let mut acc = 0x1234_5678_9abc_def0u64;
+            let idx = |k: usize| -> usize {
+                acc = acc.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407 + k as u64);
+                (acc >> 33) as usize % n
+            };
+            let indices: Vec<usize> = (0..q).map(idx).collect();
+            let mo = tree.open_multi(&indices);
+            // The per-group values in ascending group order.
+            let group_values: Vec<Vec<Gf128>> = mo
+                .groups
+                .iter()
+                .map(|&g| values[g * width..g * width + width].to_vec())
+                .collect();
+            let root = MerkleTree::verify_multi_batched(
+                "multi-test", n, width, &indices, &group_values, &mo.siblings,
+            )
+            .expect("multi-open verifies");
+            assert_eq!(root, tree.root(), "root match (n={n})");
+            // Each individual opening verifies to the same root.
+            for &i in &indices {
+                let (dg, path) = tree.open(i);
+                let r2 = MerkleTree::verify_batched("multi-test", n, width, i, dg, &path)
+                    .expect("individual verify");
+                assert_eq!(r2, tree.root());
+            }
+            // The compression: union copath digests <= q * depth.
+            let depth = if n / width == 1 { 0 } else { (n / width).trailing_zeros() as usize };
+            let separate = q * depth;
+            assert!(
+                mo.siblings.len() <= separate,
+                "copath {} <= q*d {} (n={n})",
+                mo.siblings.len(),
+                separate
+            );
+            if q >= 8 && depth >= 8 {
+                assert!(
+                    mo.siblings.len() < separate,
+                    "strict compression at q={q}, depth={depth}: {} vs {}",
+                    mo.siblings.len(),
+                    separate
+                );
+            }
+        }
+    }
+
+    /// Tamper classes: a wrong group value, a wrong sibling digest, a
+    /// mismatched copath order, an out-of-range index.
+    #[test]
+    fn multi_open_tamper() {
+        let (tree, values) = build_tree(1024, 8);
+        let indices: Vec<usize> = vec![3, 100, 512, 999, 700];
+        let mo = tree.open_multi(&indices);
+        let group_values: Vec<Vec<Gf128>> = mo
+            .groups
+            .iter()
+            .map(|&g| values[g * 8..g * 8 + 8].to_vec())
+            .collect();
+        assert!(MerkleTree::verify_multi_batched("multi-test", 1024, 8, &indices, &group_values, &mo.siblings).is_ok());
+        // 1. A wrong group value.
+        let mut gv2 = group_values.clone();
+        gv2[0][0] += magnetar_field::ONE;
+        // A wrong revealed group derives a different root (not an error).
+        let rg2 = MerkleTree::verify_multi_batched("multi-test", 1024, 8, &indices, &gv2, &mo.siblings)
+            .expect("reconstruction completes");
+        assert_ne!(rg2, tree.root(), "the tampered root must differ");
+        // 2. A wrong sibling digest: the reconstruction still completes
+        // (every position accounted for) but derives a DIFFERENT root.
+        let mut copath2 = mo.siblings.clone();
+        copath2[0] = [7u8; DIGEST];
+        let r2 = MerkleTree::verify_multi_batched("multi-test", 1024, 8, &indices, &group_values, &copath2)
+            .expect("reconstruction completes");
+        assert_ne!(r2, tree.root(), "the tampered root must differ");
+        // 3. A reordered copath (positions recomputed — mismatch).
+        // 3. A wrong copath length.
+        let mut copath3 = mo.siblings.clone();
+        if copath3.len() >= 2 {
+            copath3.swap(0, 1); // same length, different order: the
+                                // positions are derived, so a swap changes
+                                // which digest lands where — a different root.
+            let r3 = MerkleTree::verify_multi_batched("multi-test", 1024, 8, &indices, &group_values, &copath3)
+                .expect("reconstruction completes");
+            assert_ne!(r3, tree.root(), "the swapped copath must derive a different root");
+        }
+        copath3.truncate(copath3.len() - 1);
+        assert!(MerkleTree::verify_multi_batched("multi-test", 1024, 8, &indices, &group_values, &copath3).is_err());
+        // 4. An out-of-range index.
+        let bad_idx: Vec<usize> = vec![3, 100, 5000];
+        assert!(MerkleTree::verify_multi_batched("multi-test", 1024, 8, &bad_idx, &group_values, &mo.siblings).is_err());
+        // 5. The multi-open of a DIFFERENT index set against this proof.
+        let other: Vec<usize> = vec![5, 200];
+        assert!(MerkleTree::verify_multi_batched("multi-test", 1024, 8, &other, &group_values, &mo.siblings).is_err());
     }
 }

@@ -119,11 +119,15 @@ fn cmd_profiles() {
     };
     let w = wrapped.mosaic.wrap.as_ref().expect("wrap");
     let mut tail = ring(&w.ring);
-    tail += w
-        .consistency
-        .iter()
-        .map(|c| 16 + (c.chunk_path.len() + c.deep_path.len()) * 32)
-        .sum::<usize>();
+    // The batched consistency: the covering groups' values plus the union
+    // copaths (digests only — no per-query paths).
+    {
+        let c = &w.consistency;
+        tail += c.values.iter().map(|_| 16).sum::<usize>();
+        tail += c.chunk_groups.iter().flat_map(|g| g.iter()).map(|_| 16).sum::<usize>();
+        tail += c.deep_groups.iter().flat_map(|g| g.iter()).map(|_| 16).sum::<usize>();
+        tail += (c.chunk_copath.len() + c.deep_copath.len()) * 32;
+    }
     println!(
         "{:<14} {:>7} {:>9} {:>12} {:>14}",
         "wrapped", "1/16", 14, "-", tail

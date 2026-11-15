@@ -47,6 +47,95 @@ materialize deleted; the pass now dominates), `3-prove_inner`
 344.8 → 256.0 ms, the eq suffix table replacing a 32 MiB resident
 table per windowed outer.
 
+## 0.13.0 — the discharge-and-memory pass: the Δ* pair-cube kernel, the Canopy-class batched multi-open, and the paper-retrieval audit
+
+Three items from the deep-research-II queue, each landing with the
+repo's byte-identity discipline (messages/roots byte-identical to the
+references; every change cross-validated by tests; the full 223-test
+suite green).
+
+### 1. The Δ* one-hotness kernel (the 587 many-multilinear-products discipline, char-2 form) — `magnetar-memory::linear`
+
+The one-hot Δ* sum-checks (`Σ_j eq(ρ,j)·[Â(r,j)³ + C·Â(r',j)] = 0`) were
+the memory layer's last **dense-engine holdout**: the 4-factor term
+(eq × R × R × R plus eq × R' × C) ran the engine's per-position
+`generic_n` outer product at ~21 CLMULs/position. The new
+`prove_onehot_linear` runs the rounds on **weight-hoisted pair
+arithmetic**:
+
+* the eq factor splits per round as `(1+ρ_b) + X` over the round
+  variable and `w_i = eq(ρ_{b+1..}, i)` over the still-Boolean
+  positions — the `(1+ρ_b)`/`1` parts apply at message assembly, so
+  only the suffix eq table multiplies the per-position products;
+* the cube's pair products use the char-2 fresh trinomial
+  `(a0 + X·(a0+a1))³` — the four P-products `[a0³, a0²·a1, a0·a1²,
+  a1³]` at 6 CLMULs (two squarings + four products; `s² = a0² + a1²`
+  free by Frobenius), then 6 weighted products (4 for the cube, 2 for
+  the C·R' term): ~12 CLMULs/position;
+* the bound coordinates fold into the running constant
+  `eqv = Π eq(ρ_i, c_i)`; the suffix eq table is rebuilt per round (a
+  tensor build, never a full-cube eq materialization).
+
+Messages **byte-identical** to the dense engine's (the cross-validation
+`onehot_linear_matches_dense` gates it; the verifier is unchanged —
+both the twist `tw-onehot` and bus-shout paths now run it). Measured at
+2^12: `tw-onehot` 24.7 → 7.9 ms (**3.1× on the sub-protocol**, above
+the 1.7–2.2× the 587 paper measured on Jolt's — the char-2 form
+saves more); the Δ* is ~5% of the e2e profile, so the end-to-end move
+sits at the noise floor (~440 → ~436 ms at 2^12 monolithic).
+
+### 2. The batched multi-open (the Canopy-class opening compression) — `magnetar-hash`, wired into the dual-rate wrap
+
+The wrap's `q' = 14` consistency spot-checks each serialized a FULL
+Merkle path pair (chunk + deep). The new `MerkleTree::open_multi` /
+`verify_multi_batched` authenticate all positions through the **union
+copath** — one sibling digest per distinct root-path node (the shared
+top levels counted once), digest-only, in the canonical (level,
+position) order the verifier recomputes from the indices — no
+per-node metadata. The reconstruction pairs known nodes level by
+level; the binding is the standard Merkle root check (a revealed group
+deviating from its commitment breaks the root exactly as an individual
+opening would — proven out by three new tamper classes: a tampered
+sampled value, a tampered revealed group, a tampered copath digest).
+
+Same transcript schedule (the `wrap-pos-i` challenges and `wrap-val-i`
+absorptions are unchanged). Measured on `magnetar profiles`: the
+wrapped artifact **23312 → 20560 B (−11.8%)** — the consistency block
+6496 → 3744 B (−42%); the verifier reconstructs with fewer hashes (the
+union pairs ≈ |copath| < q·d node hashes instead of q·d).
+
+### 3. The discharge lockstep τ-hoist — `magnetar-zkvm::discharge`
+
+`window_message`'s per-entry future-τ product loops (popcount(m) muls
+per entry) replaced by a per-item subset-product table
+`ftp[s] = Π_{t∈s} τ_t` (≤ 32 muls per item per round), every entry's
+weight a lookup. Byte-identical; below the e2e noise floor at 2^12
+(the lockstep is driver-dominated at this scale) — kept as strictly
+less work.
+
+### The paper-retrieval audit (the session's blocked items, recorded)
+
+The deep-research queue's retrieval session was attempted against the
+Cloudflare gate this session and held: **ePrint 2025/105 rev 8**
+(2026-10-17, "Twist and Shout" — the revision note states "additional
+details and corrections regarding one-hot checking in
+**small-characteristic fields**"), **2026/587** (the extended sum-check
+paper), **2026/2790** (VCR/Canopy), **2025/753** (WARP), and
+**2024/1843** (Khatam) — direct fetch, author-mirror, arXiv,
+Semantic Scholar, ACM/Springer, and a headless browser with JS + long
+waits all blocked at the managed challenge from this egress. The
+partial audit against our char-2 implementation: the Δ* form already
+uses the char-2-correct pieces the revision is expected to pin — the
+fresh trinomial `(x+y)³ = x³+x²y+xy²+y³` (3 ≡ 1; the prime-field
+`3x²y` vanishes in characteristic two), and the Frobenius refinement
+`c_h = 1+r_h+r_h², r'_h = r_h³/c_h, C = Π c_h` (`sample_refined_points`)
+— both cross-validated by the tamper suites. The **full** audit and the
+Canopy/WARP design imports stay open pending an unblocked host; the
+multi-open above is the compression derivable from our own machinery
+in the interim.
+
+# Changelog
+d3f318a (perf: the 0.13.0 discharge-and-memory pass - the Δ* pair-cube kernel (the 587 many-multilinear-products discipline, char-2: the eq factor weight-hoisted per round, the fresh-trinomial cube at ~12 CLMULs/position, byte-identical messages, the verifier unchanged; tw-onehot 24.7 -> 7.9 ms at 2^12, 3.1x on the sub-protocol), the Canopy-class batched multi-open (the wrap's consistency spot-checks through the union copath, digest-only, verifier-recomputed positions; the wrapped artifact 23312 -> 20560 B, -11.8%, the consistency block -42%, three new tamper classes), the discharge lockstep τ-hoist (below the e2e noise floor, kept as strictly less work), and the paper-retrieval audit record (the five gated papers - 2025/105 rev 8, 2026/587, 2026/2790, 2025/753, 2024/1843 - all held at the Cloudflare managed challenge; the partial char-2 audit: the fresh trinomial and the Frobenius refinement are already the corrected forms, tamper-pinned))
 
 ## 0.12.0 — BinarySpartan on the Mikros stack: the production SNARK path for R1CS
 

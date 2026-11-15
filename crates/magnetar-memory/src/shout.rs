@@ -200,6 +200,11 @@ pub fn prove_shout(
 /// `Σ_j eq(ρ, j)·[Â(r, j)³ + C·Â(r', j)] = 0`.
 /// Returns the proof and the final **cycle point** (for the caller to
 /// place the two evaluation claims on the component).
+///
+/// The sum-check core runs the **weight-hoisted pair-cube kernel**
+/// (`crate::linear::prove_onehot_linear`, the 587 many-multilinear-products
+/// discipline): round messages byte-identical to the dense engine's, at
+/// ~12 CLMULs per position instead of ~21.
 pub fn prove_onehot(
     comp: &AddressComponent,
     addr: &[usize],
@@ -210,43 +215,8 @@ pub fn prove_onehot(
     let rho = t.challenge_field_vec(&format!("{label}-rho"), comp.cycle_vars);
     let row_r = comp.row_at_sparse(&r, addr);
     let row_rp = comp.row_at_sparse(&r_prime, addr);
-    let spec = SumcheckSpec {
-        num_vars: comp.cycle_vars,
-        dense: vec![row_r, row_rp],
-        public: vec![Box::new(EqFactor::new(rho))],
-        terms: vec![
-            Term {
-                coeff: ONE,
-                dense: vec![0, 0, 0],
-                public: vec![0],
-            },
-            Term {
-                coeff: c_product,
-                dense: vec![1],
-                public: vec![0],
-            },
-        ],
-        claim: ZERO,
-    };
-    let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
-    let mut rounds = Vec::with_capacity(comp.cycle_vars);
-    for _ in 0..comp.cycle_vars {
-        let msg = prover.message();
-        rounds.push(msg.0.clone());
-        prover.absorb_and_fold(t, label);
-    }
-    let r_cycle = prover.challenges();
-    let (claims, _) = prover.finish();
-    (
-        OneHotProof {
-            rounds,
-            v_at_r: claims[0],
-            v_at_rp: claims[1],
-            r,
-            r_prime,
-            c_product,
-        },
-        r_cycle,
+    crate::linear::prove_onehot_linear(
+        &row_r, &row_rp, &rho, &r, &r_prime, c_product, label, t,
     )
 }
 

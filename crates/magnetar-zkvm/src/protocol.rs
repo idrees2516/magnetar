@@ -2525,10 +2525,13 @@ mod tests {
             let mut n = p.mosaic.ring.as_ref().map(ring).unwrap_or(0);
             if let Some(w) = &p.mosaic.wrap {
                 n += ring(&w.ring);
-                n += w.consistency.len()
-                    * (16
-                        + (w.consistency[0].chunk_path.len() + w.consistency[0].deep_path.len())
-                            * 32);
+                // The batched consistency: the covering groups' values plus
+                // the union copaths (digests only, no per-query paths).
+                let c = &w.consistency;
+                n += c.values.len() * 16;
+                n += c.chunk_groups.iter().map(|g| g.len() * 16).sum::<usize>();
+                n += c.deep_groups.iter().map(|g| g.len() * 16).sum::<usize>();
+                n += (c.chunk_copath.len() + c.deep_copath.len()) * 32;
             }
             n
         };
@@ -2538,10 +2541,25 @@ mod tests {
             wrapped_tail < plain_tail,
             "the deep tail ({wrapped_tail} B) must beat the chunk tail ({plain_tail} B)"
         );
-        // A tampered consistency value breaks the dual opening.
+        // A tampered consistency value breaks the dual opening (the
+        // revealed group no longer contains the sampled value).
         let mut p = wrapped.clone();
         if let Some(w) = p.mosaic.wrap.as_mut() {
-            w.consistency[0].value += magnetar_field::ONE;
+            w.consistency.values[0] += magnetar_field::ONE;
+        }
+        assert!(verify(&vk, &pub_in, &p).is_err());
+        // A tampered revealed group derives a different root.
+        let mut p = wrapped.clone();
+        if let Some(w) = p.mosaic.wrap.as_mut() {
+            w.consistency.chunk_groups[0][0] += magnetar_field::ONE;
+        }
+        assert!(verify(&vk, &pub_in, &p).is_err());
+        // A tampered copath digest derives a different root.
+        let mut p = wrapped.clone();
+        if let Some(w) = p.mosaic.wrap.as_mut() {
+            if !w.consistency.deep_copath.is_empty() {
+                w.consistency.deep_copath[0] = [7u8; 32];
+            }
         }
         assert!(verify(&vk, &pub_in, &p).is_err());
         // A tampered deep root breaks the ring switch.

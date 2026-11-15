@@ -605,6 +605,19 @@ new per-segment lockstep replay plus the segment stage.
 | 5-bus Shout + selectors + cross-step | 1 | 1% |
 | 7-Mosaic discharge (windowed local + ring switch) | 49 | 34% |
 
+## The 2^12 anatomy after the 0.13.0 pass (`MAGNETAR_TIME=1`, single
+runs on the development container — treat ±10% as noise; the host is
+2 cloud Xeon cores)
+
+| phase | before (ms) | after (ms) |
+|---|---|---|
+| 3-prove_inner (VS + twists + routers) | 299 | 284–302 |
+| — `tw-onehot` (the Δ* checks, both twist instances) | 24.7 | **7.9** (3.1×) |
+| 7-mosaic-discharge | 84.5 | 83–107 (noisy) |
+| — `hier-lockstep-rounds` | 41.5 | 44–58 (driver-dominated; the τ-hoist is below the floor) |
+| prove (e2e) | 440 | 436–472 (noise-bound; the Δ* gain ~17 ms ≈ 4% is inside it) |
+| verify | 14.1 | 14.4 (unchanged — the proofs are byte-identical) |
+
 The two remaining hot spots are the **memory-checking twists** (32% —
 the select-fold lever for their bit-valued one-hot tables is the next
 documented step) and the Mosaic ring switch's evaluation tail.
@@ -621,6 +634,12 @@ documented step) and the Mosaic ring switch's evaluation tail.
 ## What is comparable, and what is not
 
 **Proof size — directly comparable, and it matches the paper's shape.**
+The 0.13.0 pass lands the batched multi-open on the wrap's consistency
+spot-checks: the wrapped artifact measures **23312 → 20560 B (−11.8%**,
+the consistency block 6496 → 3744 B, −42%**)** at the `magnetar profiles`
+operating point, with the same transcript schedule and three new tamper
+classes (a tampered sampled value, a tampered revealed group, a tampered
+copath digest).
 Our proofs are 351 KiB at 2^8 and 442 KiB at 2^10, growing by ~50 KiB
 per 2× trace length; the paper's grow 377 → 596 KiB over a 64×
 trace-length increase. Both are dominated by the same term — the

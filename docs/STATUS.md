@@ -36,6 +36,8 @@ The reference is the Magnetar paper (eprint 2026-2423). Sections marked
 | **The parallelism rulebook + kernels** (R1–R10: rayon Merkle/encode/sum-check/join/segments, thresholds, batching, caching) | engineering | `docs/PERFORMANCE.md`, the crates' kernels | `par_bind_matches_seq`, `pack_tables_matches_assemble_and_pack`, `join_matches_sparse_prover` |
 | Proof-size instrumentation (committed-bit inventory, per-component bytes) | roadmap §7 | `magnetar-zkvm::stats` | CLI smoke |
 | **The linear-in-T memory provers** (Twist read/write ports, the bytecode Shout Φ, the Ψ checks, the selector checks, the cross-step S1 transition): cycle enumeration with the one-hot kill and the prefix-XOR cumulative sums — O(T) prover work, byte-identical round messages | §4.4 | `magnetar-memory::linear` | byte-identity cross-checks vs the dense engine (multiple shapes); the end-to-end tamper suite |
+| **The Δ* pair-cube kernel** (the one-hot Δ* sum-checks moved off the dense engine: the eq factor weight-hoisted per round, the char-2 cube `(a0+X·s)³` at ~12 CLMULs/position, the bound constants folded into `eqv`) — the 587 many-multilinear-products discipline, char-2 form; messages byte-identical, the verifier unchanged | 2026/587 T1/T2 | `magnetar-memory::linear::prove_onehot_linear` | `onehot_linear_matches_dense` + the full tamper suites |
+| **The batched multi-open** (the Canopy-class correlated-opening compression): several value indices authenticated through the **union copath** — one sibling digest per distinct root-path node, digest-only, positions recomputed by the verifier; wired into the wrap's consistency spot-checks (same transcript schedule) | 2026/2790 (the derivable core) | `magnetar-hash::MultiOpen`, `magnetar-zkvm::wrap::ConsistencyBatch` | `multi_open_matches_individual`, `multi_open_tamper`, `end_to_end_wrapped_deep` (+2 new tamper classes) |
 | **The fused sum-check kernel** (one traversal per round, zero per-point view allocations, specialized 1/2/3-factor products, no double message computation) | roadmap H1 | `magnetar-sumcheck::engine` | the engine roundtrips + the full protocol suite |
 | **The sparse-support batching factor** (the Mosaic α-combination over lifted claims with Boolean suffixes: Σ 2^{vars_i} work, not S·2^ℓ) | roadmap H1 | `magnetar-sumcheck::public::SumEqFactor` | `sum_eq_matches_sum_of_eq` + end-to-end |
 | **The structured verifier factors** (`EqProdFactor`, O(T) suffix-sum LT columns): the verifier's public-factor evaluation is polylogarithmic — no joint-cube materialization | roadmap H1 | `magnetar-sumcheck::public`, `magnetar-memory` | verify-time measurements (21 ms at 2^8); tamper suite |
@@ -82,7 +84,11 @@ documented in `docs/RECURSION.md`; (b) the hash-circuit verifier-guest
 (SHA3/BLAKE3 in-circuit) — the alternative wrap that removes the
 spot-check loss entirely; (c) cross-*proof* aggregation of independently
 stated proofs (batching exists **within** one execution via the tree-IVC
-root).
+root). **Landed since:** the wrap's consistency spot-checks now run
+through the **batched multi-open** (the union copath — the
+Canopy-class correlated-opening compression derivable from our own
+machinery): the wrapped artifact 23312 → 20560 B (−11.8%, the
+consistency block −42%) with three new tamper classes pinning it.
 
 ### 3. Recursion / verifier-as-guest — roadmap H2
 No recursive composition. The verifying key's verifier work is measured
@@ -133,7 +139,27 @@ PDF is Cloudflare-gated this session and the technique's precise form is
 not recoverable from the abstract alone. Not implemented rather than
 guessed at; revisit when the paper text is accessible.
 
-### 9. The paper's 15-workload benchmark suite
+### 9. The gated-paper queue (the retrieval session record)
+The deep-research-II queue names five papers whose full text is needed
+for the remaining design imports: **ePrint 2025/105 rev 8** (the
+Twist-and-Shout 2025 revision — the note states "additional details
+and corrections regarding one-hot checking in small-characteristic
+fields"; our char-2 Δ* already uses the fresh trinomial and the
+Frobenius refinement `c_h = 1+r_h+r_h²`, `r'_h = r_h³/c_h`, both
+tamper-pinned, but the revision's precise corrections could not be
+read), **2026/587** (the extended sum-check paper — the
+many-multilinear-products technique landed from the abstract's
+statement plus first-principles derivation, byte-identity-gated),
+**2026/2790** (VCR/Canopy — the proximity-claim opening reduction;
+the union-copath multi-open is the derivable core), **2025/753**
+(WARP — the unbounded-depth accumulation IOR), and **2024/1843**
+(Khatam — the multilinear-folding proximity gap over all linear
+codes, the soundness anchor WARP needs). All five held at the
+Cloudflare managed challenge this session (direct fetch, author
+mirrors, arXiv, Semantic Scholar, ACM/Springer, headless browser with
+JS + long waits); retry from an unblocked host.
+
+### 10. The paper's 15-workload benchmark suite
 We benchmark four representative programs (fibonacci-style ALU chains,
 load/store with sub-word lanes, shifts, a running-sum loop with branches)
 at multiple trace lengths, plus the tree-IVC configuration. Porting the

@@ -50,19 +50,31 @@ fn level_domain(base: &str, level: usize) -> String {
 /// of the deep ring's queries).
 pub const WRAP_CONSISTENCY_QUERIES: usize = 14;
 
-/// One dual opening of a packed-leaf position: the same packed word
-/// authenticated against the chunk tree and the deep tree.
+/// The batched consistency openings (the Canopy-class correlated-opening
+/// compression): all `q'` transcript-sampled packed positions opened in
+/// BOTH trees through the **union copath** — one sibling digest per
+/// distinct root-path node (the shared top levels counted once) instead
+/// of a full path per query. The verifier recomputes the copath
+/// positions from the indices, so the proof carries digests only; the
+/// binding is the standard Merkle root reconstruction (each deviation of
+/// a revealed group from its commitment breaks the root exactly as an
+/// individual opening would).
 #[derive(Clone, Debug)]
-pub struct ConsistencyOpen {
-    /// The sampled packed position.
-    pub index: usize,
-    pub value: Gf128,
-    /// The chunk tree's leaf group covering `index` (its width values).
-    pub chunk_vals: Vec<Gf128>,
-    /// The deep tree's leaf group covering `index` (its width values).
-    pub deep_vals: Vec<Gf128>,
-    pub chunk_path: Vec<[u8; DIGEST]>,
-    pub deep_path: Vec<[u8; DIGEST]>,
+pub struct ConsistencyBatch {
+    /// The sampled packed positions (the transcript challenges, in
+    /// sampling order).
+    pub indices: Vec<usize>,
+    /// The packed values at those positions.
+    pub values: Vec<Gf128>,
+    /// The chunk tree's covering groups (ascending), `width_c` values
+    /// each — the (x, 0) slice straight off the chunk codeword.
+    pub chunk_groups: Vec<Vec<Gf128>>,
+    /// The deep tree's covering groups (ascending), `width_d` values each.
+    pub deep_groups: Vec<Vec<Gf128>>,
+    /// The chunk-side union copath, canonical order (digests only).
+    pub chunk_copath: Vec<[u8; DIGEST]>,
+    /// The deep-side union copath, canonical order.
+    pub deep_copath: Vec<[u8; DIGEST]>,
 }
 
 /// The wrap artifact.
@@ -75,8 +87,8 @@ pub struct WrapProof {
     pub deep_params: PcsParams,
     /// The ring-switch discharge at the deep rate.
     pub ring: RingProof,
-    /// The consistency spot-checks.
-    pub consistency: Vec<ConsistencyOpen>,
+    /// The consistency spot-checks (batched multi-open).
+    pub consistency: ConsistencyBatch,
 }
 
 /// Prove the wrap: commit `packed` at the deep rate, discharge the
@@ -107,37 +119,52 @@ pub fn prove_wrap(
         terminal,
         t,
     );
-    // 3. The consistency spot-checks: transcript-sampled packed positions,
-    //    opened in both trees (the (x, 0) slice is the low leaf range of
-    //    both codewords).
+    // 3. The consistency spot-checks (batched): the SAME transcript
+    //    schedule (wrap-pos-i challenges, wrap-val-i absorptions), the
+    //    positions opened through the union copath in both trees — the
+    //    (x, 0) slice is the low leaf range of both codewords, so the
+    //    covering groups come straight off the codewords.
     let n_packed = packed.len();
-    let mut consistency = Vec::with_capacity(WRAP_CONSISTENCY_QUERIES);
+    let mut indices = Vec::with_capacity(WRAP_CONSISTENCY_QUERIES);
+    let mut values = Vec::with_capacity(WRAP_CONSISTENCY_QUERIES);
     for i in 0..WRAP_CONSISTENCY_QUERIES {
         let pos = t.challenge_index(&format!("wrap-pos-{i}"), n_packed as u64) as usize;
-        let value = packed[pos];
-        // the batched group reveals: the leaf group covering `pos` in each
-        // tree (the (x, 0) slice — the low codeword range — holds the
-        // packed table, so the groups come straight off the codewords).
-        let w_c = chunk_tree.width();
-        let g_c = pos / w_c;
-        let chunk_vals = chunk_codeword.values[g_c * w_c..g_c * w_c + w_c].to_vec();
-        debug_assert_eq!(chunk_vals[pos % w_c], value);
-        let w_d = tree.width();
-        let g_d = pos / w_d;
-        let deep_vals = codeword.values[g_d * w_d..g_d * w_d + w_d].to_vec();
-        debug_assert_eq!(deep_vals[pos % w_d], value);
-        let (_, chunk_path) = chunk_tree.open(pos);
-        let (_, deep_path) = tree.open(pos);
-        consistency.push(ConsistencyOpen {
-            index: pos,
-            value,
-            chunk_vals,
-            deep_vals,
-            chunk_path,
-            deep_path,
-        });
-        t.absorb_field(&format!("wrap-val-{i}"), &[value]);
+        indices.push(pos);
+        values.push(packed[pos]);
+        t.absorb_field(&format!("wrap-val-{i}"), &[packed[pos]]);
     }
+    let chunk_multi = chunk_tree.open_multi(&indices);
+    let deep_multi = tree.open_multi(&indices);
+    let w_c = chunk_tree.width();
+    let w_d = tree.width();
+    let chunk_groups: Vec<Vec<Gf128>> = chunk_multi
+        .groups
+        .iter()
+        .map(|&g| chunk_codeword.values[g * w_c..g * w_c + w_c].to_vec())
+        .collect();
+    let deep_groups: Vec<Vec<Gf128>> = deep_multi
+        .groups
+        .iter()
+        .map(|&g| codeword.values[g * w_d..g * w_d + w_d].to_vec())
+        .collect();
+    debug_assert!(
+        indices.iter().zip(values.iter()).all(|(&p, &v)| {
+            let cg: Vec<usize> = chunk_multi.groups.clone();
+            let dg: Vec<usize> = deep_multi.groups.clone();
+            let rc = cg.binary_search(&(p / w_c)).ok().expect("covered");
+            let rd = dg.binary_search(&(p / w_d)).ok().expect("covered");
+            chunk_groups[rc][p % w_c] == v && deep_groups[rd][p % w_d] == v
+        }),
+        "the revealed groups contain the sampled values"
+    );
+    let consistency = ConsistencyBatch {
+        indices,
+        values,
+        chunk_groups,
+        deep_groups,
+        chunk_copath: chunk_multi.siblings,
+        deep_copath: deep_multi.siblings,
+    };
     let _ = chunk_domain;
     WrapProof {
         deep: stmt,
@@ -158,9 +185,6 @@ pub fn verify_wrap(
     wrap: &WrapProof,
     t: &mut Transcript,
 ) -> Result<(), &'static str> {
-    if wrap.consistency.len() != WRAP_CONSISTENCY_QUERIES {
-        return Err("wrap: consistency count mismatch");
-    }
     t.absorb_digest("wrap-deep-root", &wrap.deep.root);
     verify_ring_switch(
         &wrap.deep,
@@ -179,52 +203,68 @@ pub fn verify_wrap(
     let deep_leaves = 1usize << (wrap.deep.n + wrap.deep.k);
     let chunk_w = magnetar_pcs::eval::fold_tree_width(chunk_leaves);
     let deep_w = magnetar_pcs::eval::fold_tree_width(deep_leaves);
-    for (i, c) in wrap.consistency.iter().enumerate() {
-        if c.index >= n_packed {
+    let c = &wrap.consistency;
+    if c.indices.len() != WRAP_CONSISTENCY_QUERIES {
+        return Err("wrap: consistency count mismatch");
+    }
+    for &i in &c.indices {
+        if i >= n_packed {
             return Err("wrap: position out of packed range");
         }
-        if c.chunk_vals.len() != chunk_w || c.deep_vals.len() != deep_w {
-            return Err("wrap: group width mismatch");
+    }
+    // The chunk side: the union copath reconstructs the chunk root.
+    let root = MerkleTree::verify_multi_batched(
+        &chunk_dom,
+        chunk_leaves,
+        chunk_w,
+        &c.indices,
+        &c.chunk_groups,
+        &c.chunk_copath,
+    )
+    .map_err(|_| "wrap: chunk multi-open rejected")?;
+    if root != chunk_stmt.root {
+        return Err("wrap: chunk root mismatch");
+    }
+    // The deep side.
+    let root2 = MerkleTree::verify_multi_batched(
+        &deep_dom,
+        deep_leaves,
+        deep_w,
+        &c.indices,
+        &c.deep_groups,
+        &c.deep_copath,
+    )
+    .map_err(|_| "wrap: deep multi-open rejected")?;
+    if root2 != wrap.deep.root {
+        return Err("wrap: deep root mismatch");
+    }
+    // Every sampled value must sit at its position in BOTH revealed
+    // groups (the sampled-position binding). The group lists are in
+    // ascending index order, so each value's covering group is found by
+    // its rank (binary search), not by its raw index.
+    let rank_of = |groups: &[usize], g: usize| -> Option<usize> {
+        groups.binary_search(&g).ok()
+    };
+    {
+        let mut gc: Vec<usize> = c.indices.iter().map(|&i| i / chunk_w).collect();
+        gc.sort_unstable();
+        gc.dedup();
+        let mut gd: Vec<usize> = c.indices.iter().map(|&i| i / deep_w).collect();
+        gd.sort_unstable();
+        gd.dedup();
+        for (&i, &v) in c.indices.iter().zip(c.values.iter()) {
+            let rg = rank_of(&gc, i / chunk_w).expect("group covered");
+            if c.chunk_groups[rg][i % chunk_w] != v {
+                return Err("wrap: chunk group does not contain the value");
+            }
+            let rd = rank_of(&gd, i / deep_w).expect("group covered");
+            if c.deep_groups[rd][i % deep_w] != v {
+                return Err("wrap: deep group does not contain the value");
+            }
         }
-        let ld = MerkleTree::leaf_digest_of_batched(
-            &chunk_dom,
-            chunk_leaves,
-            chunk_w,
-            c.index,
-            &c.chunk_vals,
-        );
-        let root = MerkleTree::verify_batched(
-            &chunk_dom,
-            chunk_leaves,
-            chunk_w,
-            c.index,
-            ld,
-            &c.chunk_path,
-        )
-        .map_err(|_| "wrap: chunk opening rejected")?;
-        if root != chunk_stmt.root {
-            return Err("wrap: chunk root mismatch");
-        }
-        if c.chunk_vals[c.index % chunk_w] != c.value {
-            return Err("wrap: chunk group does not contain the value");
-        }
-        let ld2 = MerkleTree::leaf_digest_of_batched(
-            &deep_dom,
-            deep_leaves,
-            deep_w,
-            c.index,
-            &c.deep_vals,
-        );
-        let root2 =
-            MerkleTree::verify_batched(&deep_dom, deep_leaves, deep_w, c.index, ld2, &c.deep_path)
-                .map_err(|_| "wrap: deep opening rejected")?;
-        if root2 != wrap.deep.root {
-            return Err("wrap: deep root mismatch");
-        }
-        if c.deep_vals[c.index % deep_w] != c.value {
-            return Err("wrap: deep group does not contain the value");
-        }
-        t.absorb_field(&format!("wrap-val-{i}"), &[c.value]);
+    }
+    for (i, &v) in c.values.iter().enumerate() {
+        t.absorb_field(&format!("wrap-val-{i}"), &[v]);
     }
     Ok(())
 }
