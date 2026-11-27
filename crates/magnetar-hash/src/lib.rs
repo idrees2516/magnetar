@@ -332,6 +332,52 @@ impl Transcript {
     pub fn state_digest(&self) -> [u8; DIGEST] {
         self.state
     }
+
+    // ------------------------------------------------------------------
+    // Proof-of-work grinding (the BEEP threshold discipline)
+    // ------------------------------------------------------------------
+    //
+    // A *probe* is a detached digest of the current state and a nonce —
+    // it never touches the transcript's own state, so a failed candidate
+    // leaves no trace. A nonce *passes* when its probe is strictly below
+    // `threshold`: a uniform probe passes with probability
+    // `threshold / 2^64`, and `threshold == u64::MAX` accepts every nonce
+    // (the no-grind degenerate case, one trivial hash of work).
+
+    /// The detached proof-of-work probe for `nonce`: the first 8 bytes
+    /// (little-endian) of a domain-separated digest of the current state,
+    /// the label, and the nonce.
+    pub fn pow_probe(&self, label: &str, nonce: u64) -> u64 {
+        let d = sha3_domain(&[
+            &self.state,
+            b"pow",
+            label.as_bytes(),
+            &nonce.to_le_bytes(),
+        ]);
+        u64::from_le_bytes(d[0..8].try_into().unwrap())
+    }
+
+    /// Prover-side grinding: find the least passing nonce and absorb it.
+    /// The accepted nonce enters the transcript, so every later draw is
+    /// bound to it; the verifier mirrors this exactly. Returns the nonce.
+    pub fn grind_pow(&mut self, label: &str, threshold: u64) -> u64 {
+        let mut nonce = 0u64;
+        if threshold != u64::MAX {
+            while self.pow_probe(label, nonce) >= threshold {
+                nonce = nonce.checked_add(1).expect("pow nonce space exhausted");
+            }
+        }
+        self.absorb_u64(label, nonce);
+        nonce
+    }
+
+    /// Verifier mirror of [`Self::grind_pow`]: check the nonce passes,
+    /// then absorb it so the following draws agree with the prover's.
+    pub fn verify_pow(&mut self, label: &str, nonce: u64, threshold: u64) -> bool {
+        let ok = threshold == u64::MAX || self.pow_probe(label, nonce) < threshold;
+        self.absorb_u64(label, nonce);
+        ok
+    }
 }
 
 /// A Merkle tree over 16-byte field-element leaves, built with BLAKE3.

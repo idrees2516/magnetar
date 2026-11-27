@@ -65,6 +65,26 @@ with the level-0 `(x, eps=0)` slice anchored to the *main* commitment by
 exact `phi_c` bit-extraction openings at random positions. The prover's
 work is one extra fold chain (linear); the verifier's is the anchors.
 
+## The BEEP layer (`deep.rs`)
+
+Every fold round of both ring switches takes `m` **DEEP samples before
+its challenge** (BEEP — "Better Elimination of Pretenders", 2026, the
+worldfnd/BEEP artifact): the verifier samples `m` points over the next
+level's layout, the prover answers the two halves' multilinear extensions
+at them, the round message `[h(0), h_2]` follows, and the ground
+challenge squeeze `(rho, zetas)` lands behind a threshold proof of work
+(`numerator·T < 2^(64+128−target)`). The samples' eq-weights fold into a
+running weight table `W`, and the verifier rebuilds `W_final` over the
+fully revealed tail and checks `<tail, W_final> = v_final`. The level-0
+committed table is first bound out-of-domain. The fold rounds' soundness
+then rests on the code's **list decodability** with exponentially small
+error (falling exponentially in `m`; folding error `(dn+1)/|F|`) — not on
+MCA. `deep_ladder` derives the least-work `(m, t, grind)` for the
+round-by-round target at each profile rate; `DeepParams::off()` reproduces
+the legacy protocol byte-identically. Full accounting: the BEEP
+integration report (`../BEEP_INTEGRATION.md`).
+
+
 ## The dual-rate schedule (roadmap H1/H2, measured by `cost-model.md`)
 
 `PcsParams` now names two profiles:

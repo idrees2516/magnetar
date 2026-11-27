@@ -48,6 +48,12 @@
 //! via the c-folded table `C(u) = φ_c(P(u))` with `c = eq(r_B, ·)`, to a
 //! fold chain on `C`'s codeword whose level-0 `(x, 0)` slice is anchored to
 //! the *main* commitment by exact `φ_c` bit-extraction checks.
+//!
+//! *The BEEP layer* (see [`deep`]): every fold round of both ring switches
+//! takes `m` DEEP samples before its challenge (ground, behind a threshold
+//! proof of work), and the level-0 committed table is bound out-of-domain —
+//! the fold rounds' soundness then rests on the code's list decodability
+//! with exponentially small error, without MCA.
 
 #![forbid(unsafe_code)]
 // Proof-system style: loops indexed over Boolean-cube coordinates and
@@ -56,6 +62,7 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod code;
+pub mod deep;
 pub mod eval;
 pub mod ring;
 pub mod ring_split;
@@ -65,6 +72,7 @@ pub use eval::{
     commit_table, prove_eval, verify_eval, LevelOpen, PathQuery, PcsParams, PcsProfile, PcsProof,
     PcsStatement,
 };
+pub use deep::{deep_ladder, DeepParams, Grind};
 pub use ring::{prove_ring_switch, verify_ring_switch, RingProof};
 pub use ring_split::{
     prove_ring_switch_split, verify_ring_switch_split, SplitGeometry, SplitRingProof,

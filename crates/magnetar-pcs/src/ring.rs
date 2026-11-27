@@ -43,6 +43,7 @@
 //! the fold chain carry the packed claim `P̂(r̃)` with the standard
 //! FRI-style proximity analysis of the main PCS (crate docs).
 
+use crate::deep::{DeepChain, DeepLayerProof, DeepVerify};
 use crate::eval::{level_domain, PcsParams, PcsStatement};
 use magnetar_field::{eq_coefficients, mul, EqBits, Gf128, PhiTab, ONE, ZERO};
 use magnetar_hash::{MerkleTree, Transcript, DIGEST};
@@ -58,18 +59,20 @@ use rayon::prelude::*;
 pub struct RingProof {
     /// The 128 per-plane partial evaluations `s_b = ŵ_b(r_A)`.
     pub partials: Vec<Gf128>,
-    /// Sum-check round messages over the word cube (degree 2, 3
-    /// coefficients per round).
+    /// The sum-check round messages (the packed-cube sum-check).
     pub rounds: Vec<Vec<Gf128>>,
-    /// Fold-level roots of the main codeword's chain, levels `1..=n`
-    /// (level 0 is the commitment itself).
+    /// Merkle roots of fold levels `1..=n` (level 0 is the commitment).
     pub level_roots: Vec<[u8; DIGEST]>,
-    /// The claimed `P̂(r̃)` (equals the tail entry `D_n(0)`).
+    /// `D_n(0)`: the level-n terminal at ε = 0.
     pub terminal_claim: Gf128,
-    /// Correlated path queries on the main codeword's chain.
+    /// The correlated query walks.
     pub queries: Vec<PathQuery>,
-    /// The tail `D_n` in per-group reveals (`w_tail` values each) with paths.
+    /// The fully revealed tail (groups covering the `2^k` level-n values).
     pub tail: Vec<(Vec<Gf128>, Vec<[u8; DIGEST]>)>,
+    /// The BEEP layer (present iff the DEEP parameters are on).
+    pub deep: Option<DeepLayerProof>,
+    /// The proof-of-work nonce gating the query draws (0 when off).
+    pub query_nonce: u64,
 }
 
 /// The transparent row-batched eq-indicator
@@ -250,34 +253,87 @@ pub fn prove_ring_switch(
     let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(n);
     let mut challenges = Vec::with_capacity(n);
+    // ---- 3b. The BEEP layer's state: one DEEP chain on the main
+    //     codeword's fold chain, bound out-of-domain before round 0.
+    let deep_on = params.deep.is_on();
+    let mut chain = deep_on.then(|| DeepChain::new(main_codeword.values.len()));
+    let mut deep_proof = if deep_on {
+        let mut dlp = DeepLayerProof::default();
+        if params.deep.bind_points > 0 {
+            let (answers, _zetas, nonce) = chain.as_mut().unwrap().bind(
+                t,
+                &main_codeword.values,
+                params.deep.bind_points,
+                params.deep.bind_grind,
+                "ring",
+            );
+            dlp.bind_answers = vec![answers];
+            dlp.bind_nonce = nonce;
+        }
+        dlp
+    } else {
+        DeepLayerProof::default()
+    };
+    // The fold chain now runs *inside* the round loop: the DEEP answers
+    // must be answered before each fold challenge is drawn. Level 0 is
+    // the commitment itself; the trees are built after the rounds.
+    let mut cw = main_codeword.clone();
+    let mut values = Vec::with_capacity(n + 1);
+    values.push(cw.values.clone());
     for _ in 0..n {
         let msg = prover.message();
         rounds.push(msg.0.clone());
-        challenges.push(prover.absorb_and_fold(t, "ring-eval"));
+        // Absorb the round message with the engine's byte format (the
+        // DEEP layer's draws are bound to it).
+        let mut buf = Vec::with_capacity(msg.0.len() * 16);
+        for cf in &msg.0 {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*cf));
+        }
+        t.absorb_bytes("ring-eval", &buf);
+        let r = if let Some(ch) = chain.as_mut() {
+            let (answers, dmsg, r, _zetas, nonce) = ch.round(
+                t,
+                &cw.values,
+                params.deep.samples,
+                params.deep.fold_grind,
+                "ring",
+            );
+            deep_proof.rounds.push(vec![dmsg]);
+            deep_proof.answers.push(vec![answers]);
+            deep_proof.nonces.push(nonce);
+            r
+        } else {
+            t.challenge_field("ring-eval")
+        };
+        prover.fold_msg(&msg, r);
+        challenges.push(r);
+        cw = cw.fold(0, r);
+        values.push(cw.values.clone());
     }
     let (claims, _) = prover.finish();
     let terminal_claim = claims[0];
     t.absorb_field("ring-terminal", &[terminal_claim]);
-    // ---- 4. The main codeword's own fold chain at the same challenges
-    //     (levels 1..=n fresh; level 0 is the commitment).
-    let mut cw = main_codeword.clone();
+    // ---- 4. The fold chain's trees (levels 1..=n; level 0 is the
+    //     commitment).
     let mut trees = Vec::with_capacity(n);
-    let mut values = Vec::with_capacity(n + 1);
-    values.push(cw.values.clone());
-    for (i, &rc) in challenges.iter().enumerate() {
-        cw = cw.fold(0, rc);
+    for (i, _) in challenges.iter().enumerate() {
         trees.push(MerkleTree::build_batched(
             &level_domain(&params.domain, i + 1),
-            &cw.values,
-            crate::eval::fold_tree_width(cw.values.len()),
+            &values[i + 1],
+            crate::eval::fold_tree_width(values[i + 1].len()),
         ));
-        values.push(cw.values.clone());
     }
     let level_roots: Vec<[u8; DIGEST]> = trees.iter().map(|tr| tr.root()).collect();
     for (i, root) in level_roots.iter().enumerate() {
         t.absorb_digest(&format!("ring-root-{}", i + 1), root);
     }
-    // Correlated queries (level 0 opens against the commitment's tree).
+    // Correlated queries (level 0 opens against the commitment's tree),
+    // drawn behind the query-grind proof of work when the DEEP layer is on.
+    let query_nonce = if deep_on {
+        t.grind_pow("ring-query-pow", params.deep.query_grind.threshold())
+    } else {
+        0
+    };
     let base_leaves = main_tree.n_leaves() as u64;
     let mut queries = Vec::with_capacity(params.queries);
     for qi in 0..params.queries {
@@ -301,6 +357,8 @@ pub fn prove_ring_switch(
         terminal_claim,
         queries,
         tail,
+        deep: deep_on.then_some(deep_proof),
+        query_nonce,
     }
 }
 
@@ -424,9 +482,56 @@ pub fn verify_ring_switch(
     }];
     let mut verifier = SumcheckVerifier::new(n, sigma, &public, terms, BindOrder::Increasing);
     let mut challenges = Vec::with_capacity(n);
-    for msg in &proof.rounds {
+    // The BEEP layer's mirror (one DEEP chain on the main codeword).
+    let deep_on = params.deep.is_on();
+    if deep_on != proof.deep.is_some() {
+        return Err("ring: deep layer presence mismatch");
+    }
+    let mut dv = deep_on.then(|| DeepVerify::new(n, params.k));
+    if let (Some(dv), Some(dp)) = (dv.as_mut(), proof.deep.as_ref()) {
+        if dp.bind_answers.len() > 1 {
+            return Err("ring: deep bind answer chain count mismatch");
+        }
+        if !dp.bind_answers.is_empty() {
+            if !dv.bind(
+                t,
+                &dp.bind_answers[0],
+                dp.bind_nonce,
+                params.deep.bind_grind,
+                "ring",
+            ) {
+                return Err("ring: deep bind nonce invalid");
+            }
+        }
+    }
+    for (i, msg) in proof.rounds.iter().enumerate() {
         let round_msg = magnetar_sumcheck::RoundMsg(msg.clone());
-        challenges.push(verifier.round_capturing(&round_msg, t, "ring-eval")?);
+        // Absorb with the engine's byte format, then run the DEEP layer's
+        // draws before the challenge (the BEEP ordering).
+        let mut buf = Vec::with_capacity(msg.len() * 16);
+        for cf in msg {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*cf));
+        }
+        t.absorb_bytes("ring-eval", &buf);
+        let r = if let (Some(dv), Some(dp)) = (dv.as_mut(), proof.deep.as_ref()) {
+            let answers = dp
+                .answers
+                .get(i)
+                .and_then(|a| a.first())
+                .ok_or("ring: deep answers missing")?;
+            let dmsg = dp
+                .rounds
+                .get(i)
+                .and_then(|m| m.first().copied())
+                .ok_or("ring: deep round message missing")?;
+            let nonce = dp.nonces.get(i).copied().unwrap_or(0);
+            let (r, _zetas) = dv.round(t, dmsg, answers, nonce, params.deep.fold_grind, "ring")?;
+            r
+        } else {
+            t.challenge_field("ring-eval")
+        };
+        verifier.round_external(&round_msg, r)?;
+        challenges.push(r);
     }
     verifier.finish(&[proof.terminal_claim])?;
     t.absorb_field("ring-terminal", &[proof.terminal_claim]);
@@ -435,6 +540,16 @@ pub fn verify_ring_switch(
         t.absorb_digest(&format!("ring-root-{}", i + 1), root);
     }
     let leaves_at = |lvl: usize| -> u64 { 1u64 << (n - lvl + params.k) };
+    // ---- 4b. The query-grind mirror.
+    if deep_on {
+        if !t.verify_pow(
+            "ring-query-pow",
+            proof.query_nonce,
+            params.deep.query_grind.threshold(),
+        ) {
+            return Err("ring: query grind nonce invalid");
+        }
+    }
     // ---- 5. Correlated queries against the main commitment's chain.
     for (qi, q) in proof.queries.iter().enumerate() {
         let pos = t.challenge_index(&format!("ring-query-{qi}"), leaves_at(0)) as usize;
@@ -554,12 +669,23 @@ pub fn verify_ring_switch(
     if proof.tail[0].0[0] != proof.terminal_claim {
         return Err("ring: tail terminal entry mismatch");
     }
+    // ---- 7. The BEEP layer's final check: the DEEP chain's accumulated
+    //     weight against the fully revealed tail.
+    if let Some(dv) = dv.as_ref() {
+        let tail_values: Vec<Gf128> = proof
+            .tail
+            .iter()
+            .flat_map(|(vals, _)| vals.iter().copied())
+            .collect();
+        dv.final_check(&tail_values)?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deep::DeepParams;
 
     fn rg(rng: &mut impl rand::Rng) -> Gf128 {
         Gf128(rand::RngExt::random::<u128>(rng))
@@ -575,14 +701,101 @@ mod tests {
 
     #[test]
     fn ring_roundtrip_and_tamper() {
-        use magnetar_field::eq_table;
+        ring_case(PcsParams {
+            k: 2,
+            queries: 10,
+            deep: DeepParams::off(),
+            domain: "test-ring".into(),
+        });
+    }
 
+    /// The same case on the BEEP path: the DEEP layer's answers, round
+    /// messages, nonces, and the final tail check.
+    #[test]
+    fn ring_deep_roundtrip_and_tamper() {
+        ring_case(PcsParams {
+            k: 2,
+            queries: 10,
+            deep: DeepParams {
+                samples: 3,
+                bind_points: 2,
+                fold_grind: crate::deep::Grind::bits(4),
+                bind_grind: crate::deep::Grind::bits(2),
+                query_grind: crate::deep::Grind::bits(4),
+                target_bits: 128.0,
+            },
+            domain: "test-ring-deep".into(),
+        });
+        // Extra tamper classes on the DEEP layer itself (the base classes
+        // are covered by `ring_case` via the shared prover path).
+        use crate::deep::Grind;
         let mut rng = rand::rng();
         let params = PcsParams {
             k: 2,
             queries: 10,
-            domain: "test-ring".into(),
+            deep: DeepParams {
+                samples: 3,
+                bind_points: 2,
+                fold_grind: Grind::bits(4),
+                bind_grind: Grind::bits(2),
+                query_grind: Grind::bits(4),
+                target_bits: 128.0,
+            },
+            domain: "test-ring-deep".into(),
         };
+        let n = 4;
+        let (bits, packed) = pack_random_bits(&mut rng, 1 << n);
+        let r_a: Vec<Gf128> = (0..n).map(|_| rg(&mut rng)).collect();
+        let r_b: [Gf128; 7] = std::array::from_fn(|_| rg(&mut rng));
+        let eq_a = magnetar_field::EqBits::build(&r_a).values;
+        let mut y = Gf128(0);
+        for u in 0..(1 << n) {
+            for b in 0..128usize {
+                let b_bits: Vec<bool> = (0..7).map(|j| (b >> j) & 1 == 1).collect();
+                let eb = magnetar_field::eq_table(&r_b, &b_bits);
+                y += magnetar_field::mul(
+                    eq_a[u],
+                    magnetar_field::mul(eb, Gf128(bits[u * 128 + b] as u128)),
+                );
+            }
+        }
+        let (main_cw, main_tree, stmt) = crate::eval::commit_table(&params, &packed);
+        let mut t = Transcript::new("ring", &[b"t"]);
+        let proof =
+            prove_ring_switch(&params, &main_cw, &main_tree, &packed, &r_a, &r_b, y, &mut t);
+        // A lied DEEP answer must fail the final check.
+        let mut p = proof.clone();
+        p.deep.as_mut().unwrap().answers[0][0][1] += Gf128(1);
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+        // A lied DEEP round message must fail the final check.
+        let mut p = proof.clone();
+        p.deep.as_mut().unwrap().rounds[0][0][0] += Gf128(1);
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+        // A wrong fold-grind nonce must fail.
+        let mut p = proof.clone();
+        p.deep.as_mut().unwrap().nonces[0] += 1;
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+        // A wrong query-grind nonce must fail.
+        let mut p = proof.clone();
+        p.query_nonce += 1;
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+        // A lied bind answer must fail.
+        let mut p = proof.clone();
+        p.deep.as_mut().unwrap().bind_answers[0][0] += Gf128(1);
+        let mut tv = Transcript::new("ring", &[b"t"]);
+        assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &p, &mut tv).is_err());
+    }
+
+    /// One full ring-switch case at `params`, with the standard tamper
+    /// classes.
+    fn ring_case(params: PcsParams) {
+        use magnetar_field::eq_table;
+
+        let mut rng = rand::rng();
         let n = 4;
         let (bits, packed) = pack_random_bits(&mut rng, 1 << n);
         // Random claim point.
@@ -609,7 +822,6 @@ mod tests {
         );
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(verify_ring_switch(&stmt, &params, &r_a, &r_b, y, &proof, &mut tv).is_ok());
-        // Wrong y must fail.
         let mut tv = Transcript::new("ring", &[b"t"]);
         assert!(
             verify_ring_switch(&stmt, &params, &r_a, &r_b, y + Gf128(1), &proof, &mut tv).is_err()
@@ -656,6 +868,7 @@ mod tests {
         let params = PcsParams {
             k: 1,
             queries: 4,
+            deep: DeepParams::off(),
             domain: "test-ring-id".into(),
         };
         let n = 5;

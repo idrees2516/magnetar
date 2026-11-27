@@ -47,7 +47,7 @@ materialize deleted; the pass now dominates), `3-prove_inner`
 344.8 → 256.0 ms, the eq suffix table replacing a 32 MiB resident
 table per windowed outer.
 
-## 0.13.0 — the discharge-and-memory pass: the Δ* pair-cube kernel, the Canopy-class batched multi-open, and the paper-retrieval audit
+## 0.14.0 — the discharge-and-memory pass: the Δ* pair-cube kernel, the Canopy-class batched multi-open, and the paper-retrieval audit
 
 Three items from the deep-research-II queue, each landing with the
 repo's byte-identity discipline (messages/roots byte-identical to the
@@ -136,6 +136,60 @@ in the interim.
 
 # Changelog
 d3f318a (perf: the 0.13.0 discharge-and-memory pass - the Δ* pair-cube kernel (the 587 many-multilinear-products discipline, char-2: the eq factor weight-hoisted per round, the fresh-trinomial cube at ~12 CLMULs/position, byte-identical messages, the verifier unchanged; tw-onehot 24.7 -> 7.9 ms at 2^12, 3.1x on the sub-protocol), the Canopy-class batched multi-open (the wrap's consistency spot-checks through the union copath, digest-only, verifier-recomputed positions; the wrapped artifact 23312 -> 20560 B, -11.8%, the consistency block -42%, three new tamper classes), the discharge lockstep τ-hoist (below the e2e noise floor, kept as strictly less work), and the paper-retrieval audit record (the five gated papers - 2025/105 rev 8, 2026/587, 2026/2790, 2025/753, 2024/1843 - all held at the Cloudflare managed challenge; the partial char-2 audit: the fresh trinomial and the Frobenius refinement are already the corrected forms, tamper-pinned))
+
+
+## 0.15.0 — The BEEP layer: m DEEP samples per fold round, threshold proofs of work
+
+*BEEP* (*Better Elimination of Pretenders*, the worldfnd/BEEP artifact of
+2026 — the paper, the Ligerito implementation on Flock's code, and the Lean
+formalization of Theorems 3.4/5.3) integrated into both ring switches: every
+fold round now takes **`m` DEEP samples before its challenge** (the two
+halves' multilinear extensions at `m` verifier-sampled points), the level-0
+committed table is bound out-of-domain, and every squeeze — the fold
+challenge `(ρ, ζs)`, the bind batch, the query and anchor draws — runs
+behind a **threshold proof of work** (BEEP's `Grind`/`exact_at`:
+`numerator·T < 2^(64+128−target)`).
+
+The fold rounds' soundness then rests on the code's **list decodability**
+with exponentially small error (falling exponentially in `m`; folding error
+`(δn+1)/|F|`) — not on MCA-style analyses — and the round-by-round ladder
+(`deep_ladder`, the ported `sample_bits`/`least_threshold`/`select_fold`)
+derives the least-work `(m, t, grind)` for the 128-bit target at every
+profile rate.
+
+### Where
+
+- `magnetar-pcs::deep` (new): `Grind`, `deep_ladder`, `DeepChain`,
+  `DeepVerify`, the two-chain `DeepPair`/`DeepPairVerify`, `DeepLayerProof`.
+- `magnetar_hash::Transcript`: `pow_probe`/`grind_pow`/`verify_pow` — a
+  detached probe digest (failed candidates leave no trace), the prover and
+  verifier mirror exactly.
+- `ring` (the wrap path): the fold chain runs inside the sum-check round
+  loop (the DEEP answers precede the challenge draw); the verifier rebuilds
+  `W_final` over the `2^k` tail and checks `<tail, W_final> = v_final`.
+- `ring_split` (the streaming root): the same protocol over the **shadow
+  chain** — the full combined `(P, C)` codeword tables folded in place per
+  round, the per-segment encodes reused (no second encode pass).
+- `PcsParams.deep`: `off()` is the legacy protocol, byte-identical proofs;
+  the default is on (`m = 3`, 2 binding points).
+
+### Also fixed
+
+- **`ring_split`'s anchor positions are now draw-checked** — the verifier
+  never mirrored the `ring-anchor-{ai}` draws, so anchor positions were
+  effectively prover-chosen; they are now drawn and compared (queries, then
+  anchors, mirroring the prover's order).
+
+### Research notes (2025/2026)
+
+DKT26 (2026/2056 — RS beyond Johnson, the MCA bound BEEP's DKT ladder uses),
+CWYZ26/affine combiners (2026/2863 — degree-1 folding challenges, the
+`2/|F|` affine error), Polygero (2026/2481 — polynomial challenges),
+Krachun (2026/782) and Crites–Stewart (CRYPTO 2026) — proximity gaps fail
+near capacity (the negative register), Flock (2026/1329), Twist and Shout
+(2025/105 rev., fetched through the Cloudflare challenge with cfsolve),
+TensorSwitch (CRYPTO 2026), Akita (2026/1983). Full map:
+`docs/BEEP_INTEGRATION.md`.
 
 ## 0.12.0 — BinarySpartan on the Mikros stack: the production SNARK path for R1CS
 
@@ -1056,7 +1110,6 @@ at cpi 8 the per-segment inner/m_combo constants already eat it.
   encode register-indirect targets (see `docs/STATUS.md`).
 
 
-=======
 ## 0.3.0 (unreleased)
 
 ### GPU proving program, Phase 1: the bitsliced sum-check (`magnetar-bitsum`)
@@ -1189,7 +1242,6 @@ at cpi 8 the per-segment inner/m_combo constants already eat it.
 - 16 new tests: cross-chunk RAM + register carryover, the public-input
   pin, single-chunk compatibility, a five-chunk fibonacci, two write-log
   consistency regressions, the cost model, and ten tamper classes.
->>>>>>> c5531013623f249f8b96155d4e6ddb1bf4d8819c
 
 ## 0.2.0 (unreleased)
 

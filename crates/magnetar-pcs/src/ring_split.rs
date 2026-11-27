@@ -55,8 +55,9 @@
 //! is inside a transcript-bound root layer before the queries are
 //! drawn.
 
+use crate::deep::{DeepLayerProof, DeepPair, DeepPairVerify};
 use crate::code::{CodeParams, Codeword};
-use magnetar_field::{eq_coefficients, mul, phi_c, Gf128};
+use magnetar_field::{eq_coefficients, mul, phi_c, Gf128, ZERO};
 use magnetar_hash::{leaf_digest_of_pair, leaf_digest_of_raw, MerkleTree, Transcript, DIGEST};
 use magnetar_sumcheck::{
     engine::{SumcheckProver, SumcheckVerifier},
@@ -237,6 +238,10 @@ pub struct SplitRingProof {
     pub tail: Vec<PairPath>,
     /// The φ anchors tying the C component to the P component.
     pub anchors: Vec<SplitAnchor>,
+    /// The BEEP layer (present iff the DEEP parameters are on).
+    pub deep: Option<DeepLayerProof>,
+    /// The proof-of-work nonce gating the query draws (0 when off).
+    pub query_nonce: u64,
 }
 
 /// One segment's derived chain: the per-level cell digests (its column
@@ -273,6 +278,100 @@ fn fold_values_in_place(v: &mut Vec<Gf128>, r: Gf128) {
         v[j] = a + mul(r, a + b);
     }
     v.truncate(n);
+}
+
+/// The parallel variant of [`fold_values_in_place`] for the full-size
+/// shadow tables (one write per pair, chunked).
+fn fold_values_in_place_par(v: &mut Vec<Gf128>, r: Gf128) {
+    let n = v.len() / 2;
+    v.par_chunks_mut(1 << 11).for_each(|chunk| {
+        let mut i = 0usize;
+        while i + 1 < chunk.len() {
+            let a = chunk[i];
+            let b = chunk[i + 1];
+            chunk[i / 2] = a + mul(r, a + b);
+            i += 2;
+        }
+    });
+    v.truncate(n);
+}
+
+/// Build the BEEP layer's **shadow tables**: the full combined `(P, C)`
+/// codewords over the combined layout `[ε][s][x_loc]` (little-endian: the
+/// `x_loc` bits at the low end, matching the fold order), plus the
+/// per-segment encodes for the chain derivations to reuse.
+///
+/// This is the DEEP layer's one full-table state: the answers and round
+/// messages of every fold round are computed from it, and it folds in
+/// place alongside the chain. With the DEEP layer on, the prover's
+/// envelope grows by the two shadow tables and the pair's two weight
+/// tables (`4·2^{n_total+k}` values ≈ 512 MiB at 2^22+k=2) — the tree
+/// streaming envelope is unchanged.
+fn build_shadow(
+    geo: &SplitGeometry,
+    base: &str,
+    packed: &[Gf128],
+    c: &[Gf128; 128],
+) -> (Vec<Gf128>, Vec<Gf128>, Vec<(Vec<Gf128>, Vec<Gf128>)>) {
+    let (n_s, sigma, k) = (geo.n_s, geo.sigma, geo.k);
+    let segments = 1usize << sigma;
+    let total = 1usize << (n_s + sigma + k);
+    let local_params = CodeParams::derive(n_s, k, base);
+    let per_seg: Vec<(Vec<Gf128>, Vec<Gf128>)> = (0..segments)
+        .into_par_iter()
+        .map(|s| {
+            let slice = &packed[s << n_s..(s + 1) << n_s];
+            let pv = Codeword::encode(&local_params, slice).values;
+            let c_s: Vec<Gf128> = slice.iter().map(|&p| phi_c(p, c)).collect();
+            let cv = Codeword::encode(&local_params, &c_s).values;
+            (pv, cv)
+        })
+        .collect();
+    let mut shadow_p = vec![ZERO; total];
+    let mut shadow_c = vec![ZERO; total];
+    for (s, (pv, cv)) in per_seg.iter().enumerate() {
+        for eps in 0..(1usize << k) {
+            for x in 0..(1usize << n_s) {
+                let src = (eps << n_s) | x;
+                let dst = (eps << (sigma + n_s)) | (s << n_s) | x;
+                shadow_p[dst] = pv[src];
+                shadow_c[dst] = cv[src];
+            }
+        }
+    }
+    (shadow_p, shadow_c, per_seg)
+}
+
+/// Derive one segment's chain from **pre-encoded** component codewords
+/// (the shadow builder's per-segment encodes — no second encode pass).
+fn derive_segment_chain_preencoded(
+    geo: &SplitGeometry,
+    base: &str,
+    pv: &[Gf128],
+    cv: &[Gf128],
+    rho: &[Gf128],
+) -> SegChain {
+    let n_s = geo.n_s;
+    let k = geo.k;
+    let mut pv = pv.to_vec();
+    let mut cv = cv.to_vec();
+    let mut cells: Vec<[u8; DIGEST]> = Vec::with_capacity((n_s + 1) << k);
+    for i in 0..=n_s {
+        let cell_size = 1usize << (n_s - i);
+        for eps in 0..(1usize << k) {
+            let lo = eps * cell_size;
+            let pairs: Vec<(Gf128, Gf128)> =
+                (0..cell_size).map(|j| (pv[lo + j], cv[lo + j])).collect();
+            let tree = MerkleTree::build_pairs(&geo.cell_domain(base, i), &pairs);
+            cells.push(tree.root());
+        }
+        if i < n_s {
+            fold_values_in_place(&mut pv, rho[i]);
+            fold_values_in_place(&mut cv, rho[i]);
+        }
+    }
+    let tail: Vec<(Gf128, Gf128)> = (0..(1usize << k)).map(|eps| (pv[eps], cv[eps])).collect();
+    SegChain { cells, tail }
 }
 
 /// Derive one segment's chain (cell digests + the tail) — the streaming
@@ -473,10 +572,71 @@ pub fn prove_ring_switch_split(
     let mut prover = SumcheckProver::new(&spec, BindOrder::Increasing);
     let mut rounds = Vec::with_capacity(n_total);
     let mut challenges = Vec::with_capacity(n_total);
+    // 3b. The BEEP layer's state: the full-shadow pair (built once, folded
+    //     in place per round — the answers and round messages of every
+    //     fold round are computed from it), bound out-of-domain before
+    //     round 0.
+    let deep_on = params.deep.is_on();
+    let (mut shadow_p, mut shadow_c, per_seg) = if deep_on {
+        let _pt_shadow = STimer::new("split-shadow");
+        split_rss("shadow-start");
+        let (p, c, segs) = build_shadow(&geo, &base, packed, &c);
+        split_rss("shadow-done");
+        drop(_pt_shadow);
+        (p, c, segs)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
+    let mut pair = deep_on.then(|| DeepPair::new(shadow_p.len()));
+    let mut deep_proof = if deep_on {
+        let mut dlp = DeepLayerProof::default();
+        if params.deep.bind_points > 0 {
+            let (answers, _zetas, nonce) = pair.as_mut().unwrap().bind(
+                t,
+                &shadow_p,
+                &shadow_c,
+                params.deep.bind_points,
+                params.deep.bind_grind,
+                "ring",
+            );
+            dlp.bind_answers = answers;
+            dlp.bind_nonce = nonce;
+        }
+        dlp
+    } else {
+        DeepLayerProof::default()
+    };
     for _ in 0..n_total {
         let msg = prover.message();
         rounds.push(msg.0.clone());
-        challenges.push(prover.absorb_and_fold(t, "ring-eval"));
+        // Absorb with the engine's byte format; the DEEP layer's draws
+        // (points → answers → round messages → grind → challenge) sit
+        // between the message and the challenge (the BEEP ordering).
+        let mut buf = Vec::with_capacity(msg.0.len() * 16);
+        for cf in &msg.0 {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*cf));
+        }
+        t.absorb_bytes("ring-eval", &buf);
+        let r = if let Some(pair) = pair.as_mut() {
+            let (answers, msgs, r, _zetas, nonce) = pair.round(
+                t,
+                &shadow_p,
+                &shadow_c,
+                params.deep.samples,
+                params.deep.fold_grind,
+                "ring",
+            );
+            deep_proof.rounds.push(msgs.to_vec());
+            deep_proof.answers.push(answers);
+            deep_proof.nonces.push(nonce);
+            fold_values_in_place_par(&mut shadow_p, r);
+            fold_values_in_place_par(&mut shadow_c, r);
+            r
+        } else {
+            t.challenge_field("ring-eval")
+        };
+        prover.fold_msg(&msg, r);
+        challenges.push(r);
     }
     let (claims, _) = prover.finish();
     drop(_pt_sc);
@@ -484,14 +644,21 @@ pub fn prove_ring_switch_split(
     t.absorb_field("ring-terminal", &[terminal_claim]);
 
     // 4. The per-segment chains (rayon; each worker holds one segment's
-    //    two local codewords at a time — the O(segment) envelope).
+    //    two local codewords at a time — the O(segment) envelope). With
+    //    the DEEP layer on, the shadow builder's per-segment encodes are
+    //    reused (no second encode pass).
     let _pt_chain = STimer::new("split-chains");
     split_rss("chains-start");
     let chains: Vec<SegChain> = (0..segments)
         .into_par_iter()
         .map(|s| {
-            let slice = &packed[s << n_s..(s + 1) << n_s];
-            derive_segment_chain(&geo, &base, slice, &c, &challenges)
+            if deep_on {
+                let (pv, cv) = &per_seg[s];
+                derive_segment_chain_preencoded(&geo, &base, pv, cv, &challenges)
+            } else {
+                let slice = &packed[s << n_s..(s + 1) << n_s];
+                derive_segment_chain(&geo, &base, slice, &c, &challenges)
+            }
         })
         .collect();
     split_rss("chains-done");
@@ -528,12 +695,18 @@ pub fn prove_ring_switch_split(
 
     // 5. Draw ALL opening positions up front (the transcript's draw
     //    order is queries, then anchors — nothing between them consumes
-    //    a challenge), then answer the openings **in waves of kept
+    //    a challenge), behind the query-grind proof of work when the
+    //    DEEP layer is on, then answer the openings **in waves of kept
     //    chains**: each touched segment's chain is re-derived ONCE, but
     //    at most `wave` segments' kept trees are resident at a time —
     //    the opening phase's memory stays `O(wave × one segment's
     //    chain)` regardless of the segment count (the 2^21+ envelope).
     let _pt_q = STimer::new("split-openings");
+    let query_nonce = if deep_on {
+        t.grind_pow("ring-query-pow", params.deep.query_grind.threshold())
+    } else {
+        0
+    };
     let base_leaves = 1u64 << (n_total + params.k);
     let positions: Vec<usize> = (0..params.queries)
         .map(|qi| t.challenge_index(&format!("ring-query-{qi}"), base_leaves) as usize)
@@ -721,6 +894,16 @@ pub fn prove_ring_switch_split(
         .collect();
     drop(_pt_tail);
 
+    // The BEEP shadow's tail must equal the chains' tail (the DEEP final
+    // check runs against the opened tail).
+    if deep_on {
+        debug_assert_eq!(shadow_p.len(), tail.len());
+        debug_assert_eq!(shadow_c.len(), tail.len());
+        for (eps, ((pv, cv), _)) in tail.iter().enumerate() {
+            debug_assert_eq!(shadow_p[eps], *pv, "shadow P tail mismatch");
+            debug_assert_eq!(shadow_c[eps], *cv, "shadow C tail mismatch");
+        }
+    }
     SplitRingProof {
         rounds,
         terminal_claim,
@@ -728,6 +911,8 @@ pub fn prove_ring_switch_split(
         queries,
         tail,
         anchors,
+        deep: deep_on.then_some(deep_proof),
+        query_nonce,
     }
 }
 
@@ -764,9 +949,61 @@ pub fn verify_ring_switch_split(
     }];
     let mut verifier = SumcheckVerifier::new(n_total, y, &public, terms, BindOrder::Increasing);
     let mut challenges = Vec::with_capacity(n_total);
-    for msg in &proof.rounds {
+    // The BEEP layer's mirror (the merged (P, C) pair as one DEEP pair).
+    let deep_on = params.deep.is_on();
+    if deep_on != proof.deep.is_some() {
+        return Err("split ring: deep layer presence mismatch");
+    }
+    let mut dpv = deep_on.then(|| DeepPairVerify::new(n_total, params.k));
+    if let (Some(dpv), Some(dp)) = (dpv.as_mut(), proof.deep.as_ref()) {
+        if !dp.bind_answers.is_empty() {
+            if dp.bind_answers.len() != 2 {
+                return Err("split ring: deep bind chain count mismatch");
+            }
+            if !dpv.bind(
+                t,
+                &dp.bind_answers,
+                dp.bind_nonce,
+                params.deep.bind_grind,
+                "ring",
+            ) {
+                return Err("split ring: deep bind nonce invalid");
+            }
+        }
+    }
+    for (i, msg) in proof.rounds.iter().enumerate() {
         let round_msg = RoundMsg(msg.clone());
-        challenges.push(verifier.round_capturing(&round_msg, t, "ring-eval")?);
+        // Absorb with the engine's byte format, then run the DEEP pair's
+        // draws before the challenge (the BEEP ordering).
+        let mut buf = Vec::with_capacity(msg.len() * 16);
+        for cf in msg {
+            buf.extend_from_slice(&magnetar_hash::fe_to_bytes(*cf));
+        }
+        t.absorb_bytes("ring-eval", &buf);
+        let r = if let (Some(dpv), Some(dp)) = (dpv.as_mut(), proof.deep.as_ref()) {
+            let answers = dp.answers.get(i).ok_or("split ring: deep answers missing")?;
+            let msgs_v = dp
+                .rounds
+                .get(i)
+                .ok_or("split ring: deep round message missing")?;
+            let msgs = [
+                msgs_v
+                    .first()
+                    .copied()
+                    .ok_or("split ring: deep round message missing")?,
+                msgs_v
+                    .get(1)
+                    .copied()
+                    .ok_or("split ring: deep round message missing")?,
+            ];
+            let nonce = dp.nonces.get(i).copied().unwrap_or(0);
+            let (r, _zetas) = dpv.round(t, msgs, answers, nonce, params.deep.fold_grind, "ring")?;
+            r
+        } else {
+            t.challenge_field("ring-eval")
+        };
+        verifier.round_external(&round_msg, r)?;
+        challenges.push(r);
     }
     verifier.finish(&[proof.terminal_claim])?;
     t.absorb_field("ring-terminal", &[proof.terminal_claim]);
@@ -803,6 +1040,16 @@ pub fn verify_ring_switch_split(
         }
         Ok(())
     };
+    // ---- 1b. The query-grind mirror.
+    if deep_on {
+        if !t.verify_pow(
+            "ring-query-pow",
+            proof.query_nonce,
+            params.deep.query_grind.threshold(),
+        ) {
+            return Err("split ring: query grind nonce invalid");
+        }
+    }
     // ---- 2. The correlated queries.
     let base_leaves = 1u64 << (n_total + params.k);
     for (qi, q) in proof.queries.iter().enumerate() {
@@ -844,8 +1091,16 @@ pub fn verify_ring_switch_split(
     if proof.tail[0].0 .1 != proof.terminal_claim {
         return Err("split ring: tail terminal entry mismatch");
     }
-    // ---- 4. The anchors: one merged path + the exact φ_c check.
-    for anchor in &proof.anchors {
+    // ---- 4. The anchors: the positions are drawn after the queries
+    //     (mirroring the prover's draw order — queries, then anchors),
+    //     then one merged path + the exact φ_c check per anchor.
+    let want_anchor_xs: Vec<usize> = (0..params.queries)
+        .map(|ai| t.challenge_index(&format!("ring-anchor-{ai}"), 1u64 << n_total) as usize)
+        .collect();
+    for (anchor, &want_x) in proof.anchors.iter().zip(&want_anchor_xs) {
+        if anchor.x != want_x {
+            return Err("split ring: anchor position mismatch");
+        }
         if anchor.x >= (1usize << n_total) {
             return Err("split ring: anchor index out of range");
         }
@@ -869,6 +1124,13 @@ pub fn verify_ring_switch_split(
             return Err("split ring: anchor phi_c mismatch");
         }
     }
+    // ---- 5. The BEEP layer's final checks: the DEEP pair's accumulated
+    //     weights against the fully revealed tail components.
+    if let Some(dpv) = dpv.as_ref() {
+        let tail_p: Vec<Gf128> = proof.tail.iter().map(|((pv, _), _)| *pv).collect();
+        let tail_c: Vec<Gf128> = proof.tail.iter().map(|((_, cv), _)| *cv).collect();
+        dpv.final_check(&tail_p, &tail_c)?;
+    }
     Ok(())
 }
 
@@ -891,60 +1153,127 @@ mod tests {
             let params = crate::eval::PcsParams {
                 k,
                 queries: 10,
+                deep: crate::deep::DeepParams::off(),
                 domain: format!("test-split-{n_s}-{sigma}-{k}"),
             };
-            let n_total = geo.n_total();
-            let packed: Vec<Gf128> = (0..(1 << n_total)).map(|_| rg(&mut rng)).collect();
-            let r_a: Vec<Gf128> = (0..n_total).map(|_| rg(&mut rng)).collect();
-            let r_b: [Gf128; 7] = std::array::from_fn(|_| rg(&mut rng));
-            // y = Σ eq(r_a,x)·C(x) with C = φ_c(packed).
-            let c = eq_coefficients(&r_b);
-            let eq_a = magnetar_field::EqBits::build(&r_a).values;
-            let mut y = Gf128(0);
-            for (u, &p) in packed.iter().enumerate() {
-                y += magnetar_field::mul(eq_a[u], phi_c(p, &c));
+            split_ring_case(&mut rng, &geo, &params);
+        }
+    }
+
+    /// The same geometries on the BEEP path: the DEEP pair on the
+    /// shadow chain, the ground challenges, and the final tail checks.
+    #[test]
+    fn split_ring_deep_roundtrip_and_tamper() {
+        let mut rng = rand::rng();
+        for (n_s, sigma, k) in [(4usize, 1usize, 1usize), (5, 2, 1), (4, 3, 2), (6, 1, 1)] {
+            let geo = SplitGeometry::new(n_s, sigma, k);
+            let params = crate::eval::PcsParams {
+                k,
+                queries: 10,
+                deep: crate::deep::DeepParams {
+                    samples: 2,
+                    bind_points: 1,
+                    fold_grind: crate::deep::Grind::bits(3),
+                    bind_grind: crate::deep::Grind::bits(2),
+                    query_grind: crate::deep::Grind::bits(3),
+                    target_bits: 128.0,
+                },
+                domain: format!("test-split-deep-{n_s}-{sigma}-{k}"),
+            };
+            split_ring_case(&mut rng, &geo, &params);
+        }
+    }
+
+    /// One split-ring case at `geo`/`params`: the honest roundtrip plus
+    /// the tamper classes.
+    fn split_ring_case(
+        rng: &mut impl rand::Rng,
+        geo: &SplitGeometry,
+        params: &crate::eval::PcsParams,
+    ) {
+        let n_total = geo.n_total();
+        let k = geo.k;
+        let packed: Vec<Gf128> = (0..(1 << n_total)).map(|_| rg(rng)).collect();
+        let r_a: Vec<Gf128> = (0..n_total).map(|_| rg(rng)).collect();
+        let r_b: [Gf128; 7] = std::array::from_fn(|_| rg(rng));
+        // y = Σ eq(r_a,x)·C(x) with C = φ_c(packed).
+        let c = eq_coefficients(&r_b);
+        let eq_a = magnetar_field::EqBits::build(&r_a).values;
+        let mut y = Gf128(0);
+        for (u, &p) in packed.iter().enumerate() {
+            y += magnetar_field::mul(eq_a[u], phi_c(p, &c));
+        }
+        let mut t = Transcript::new("split-ring", &[b"t"]);
+        let proof = prove_ring_switch_split(params, *geo, &packed, &r_a, &r_b, y, &mut t);
+        let mut tv = Transcript::new("split-ring", &[b"t"]);
+        let vres = verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &proof, &mut tv);
+        assert!(
+            vres.is_ok(),
+            "n_s={} sigma={} k={}: {:?}",
+            geo.n_s,
+            geo.sigma,
+            k,
+            vres.err()
+        );
+        // Wrong y.
+        let mut tv = Transcript::new("split-ring", &[b"t"]);
+        assert!(
+            verify_ring_switch_split(params, *geo, &r_a, &r_b, y + Gf128(1), &proof, &mut tv)
+                .is_err()
+        );
+        // Tampered terminal.
+        let mut p = proof.clone();
+        p.terminal_claim += Gf128(1);
+        let mut tv = Transcript::new("split-ring", &[b"t"]);
+        assert!(
+            verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &p, &mut tv).is_err()
+        );
+        // Tampered anchor pair (phi_c mismatch).
+        let mut p = proof.clone();
+        p.anchors[0].pair.1 += Gf128(1);
+        let mut tv = Transcript::new("split-ring", &[b"t"]);
+        assert!(
+            verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &p, &mut tv).is_err()
+        );
+        // Tampered anchor position (not the drawn one).
+        let mut p = proof.clone();
+        p.anchors[0].x ^= 1;
+        let mut tv = Transcript::new("split-ring", &[b"t"]);
+        assert!(
+            verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &p, &mut tv).is_err()
+        );
+        // Tampered query value (fold relation).
+        let mut p = proof.clone();
+        p.queries[0].levels[0].a.value.0 += Gf128(1);
+        let mut tv = Transcript::new("split-ring", &[b"t"]);
+        assert!(
+            verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &p, &mut tv).is_err()
+        );
+        // Tampered level root.
+        let mut p = proof.clone();
+        p.level_roots[0] = [7u8; DIGEST];
+        let mut tv = Transcript::new("split-ring", &[b"t"]);
+        assert!(
+            verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &p, &mut tv).is_err()
+        );
+        // The DEEP-layer tamper classes (when the layer is on).
+        if let Some(dp) = proof.deep.as_ref() {
+            if !dp.answers.is_empty() {
+                let mut p = proof.clone();
+                p.deep.as_mut().unwrap().answers[0][0][0] += Gf128(1);
+                let mut tv = Transcript::new("split-ring", &[b"t"]);
+                assert!(
+                    verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &p, &mut tv).is_err()
+                );
             }
-            let mut t = Transcript::new("split-ring", &[b"t"]);
-            let proof = prove_ring_switch_split(&params, geo, &packed, &r_a, &r_b, y, &mut t);
-            let mut tv = Transcript::new("split-ring", &[b"t"]);
-            let vres = verify_ring_switch_split(&params, geo, &r_a, &r_b, y, &proof, &mut tv);
-            assert!(
-                vres.is_ok(),
-                "n_s={n_s} sigma={sigma} k={k}: {:?}",
-                vres.err()
-            );
-            // Wrong y.
-            let mut tv = Transcript::new("split-ring", &[b"t"]);
-            assert!(verify_ring_switch_split(
-                &params,
-                geo,
-                &r_a,
-                &r_b,
-                y + Gf128(1),
-                &proof,
-                &mut tv
-            )
-            .is_err());
-            // Tampered terminal.
-            let mut p = proof.clone();
-            p.terminal_claim += Gf128(1);
-            let mut tv = Transcript::new("split-ring", &[b"t"]);
-            assert!(verify_ring_switch_split(&params, geo, &r_a, &r_b, y, &p, &mut tv).is_err());
-            // Tampered anchor pair (phi_c mismatch).
-            let mut p = proof.clone();
-            p.anchors[0].pair.1 += Gf128(1);
-            let mut tv = Transcript::new("split-ring", &[b"t"]);
-            assert!(verify_ring_switch_split(&params, geo, &r_a, &r_b, y, &p, &mut tv).is_err());
-            // Tampered query value (fold relation).
-            let mut p = proof.clone();
-            p.queries[0].levels[0].a.value.0 += Gf128(1);
-            let mut tv = Transcript::new("split-ring", &[b"t"]);
-            assert!(verify_ring_switch_split(&params, geo, &r_a, &r_b, y, &p, &mut tv).is_err());
-            // Tampered level root.
-            let mut p = proof.clone();
-            p.level_roots[0] = [7u8; DIGEST];
-            let mut tv = Transcript::new("split-ring", &[b"t"]);
-            assert!(verify_ring_switch_split(&params, geo, &r_a, &r_b, y, &p, &mut tv).is_err());
+            if !dp.rounds.is_empty() {
+                let mut p = proof.clone();
+                p.deep.as_mut().unwrap().rounds[0][0][0] += Gf128(1);
+                let mut tv = Transcript::new("split-ring", &[b"t"]);
+                assert!(
+                    verify_ring_switch_split(params, *geo, &r_a, &r_b, y, &p, &mut tv).is_err()
+                );
+            }
         }
     }
 }

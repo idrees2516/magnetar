@@ -50,6 +50,8 @@ fn level_width(n: usize, k: usize, level: usize) -> usize {
     fold_width(1usize << (n - level + k))
 }
 
+use crate::deep::DeepParams;
+
 /// Tunable PCS parameters. Defaults target ≥ 120-bit security at the test
 /// scale: `k = 2` (rate 1/4, distance ≈ 1 at generic γ) and `q = 40`
 /// correlated queries.
@@ -59,6 +61,9 @@ pub struct PcsParams {
     pub k: usize,
     /// Correlated query paths.
     pub queries: usize,
+    /// The BEEP layer: DEEP samples, binding, and grinding (off = the
+    /// legacy protocol, byte-identical proofs).
+    pub deep: DeepParams,
     /// Domain-separation label.
     pub domain: String,
 }
@@ -74,6 +79,7 @@ impl Default for PcsParams {
         PcsParams {
             k: 1,
             queries: 40,
+            deep: DeepParams::default(),
             domain: "magnetar/pcs/default".to_string(),
         }
     }
@@ -116,6 +122,7 @@ impl PcsProfile {
         PcsParams {
             k,
             queries,
+            deep: DeepParams::default(),
             domain: format!("magnetar/pcs/{self:?}").to_lowercase(),
         }
     }
@@ -557,6 +564,7 @@ mod tests {
         let params = PcsParams {
             k,
             queries,
+            deep: DeepParams::off(),
             domain: format!("test-pcs-{n}-{k}"),
         };
         let table: Vec<Gf128> = (0..(1 << n)).map(|_| rg(&mut rng)).collect();
@@ -583,6 +591,7 @@ mod tests {
         let params = PcsParams {
             k: 2,
             queries: 12,
+            deep: DeepParams::off(),
             domain: "test-pcs-tamper".into(),
         };
         let n = 5;
